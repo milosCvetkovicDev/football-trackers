@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <!--
+      Content-Security-Policy — script-injection / exfiltration backstop.
+      The payload is children's live GPS, so the policy is deny-by-default and as
+      tight as the app allows. See docs/frontend/improvement-plan.md (Phase 1,
+      "Strict CSP + self-hosted assets (SRI)") and ADR-0015 (frontend auth transport).
+
+      DEPLOYMENT NOTE (strongest form): the authoritative CSP should be set as a real
+      `Content-Security-Policy` *response header* at the reverse-proxy / Caddy edge
+      (ADR-0009 — Caddy terminates TLS and owns security headers). This <meta> is the
+      in-document fallback so the policy still applies when served directly (e.g. dev,
+      or any path that bypasses the edge). A header can also express directives <meta>
+      cannot (e.g. frame-ancestors is honoured from a header, and report-to/reporting).
+
+      No third-party assets: the app uses only system fonts and self-hosted JS/CSS, so
+      there are zero cross-origin requests. SRI (subresource integrity) is therefore moot
+      today — it only applies if/when a third-party asset is ever added. The current
+      posture ("no third-party assets at all") is strictly stronger than SRI on remote ones.
+
+      connect-src 'self' — the app is served SAME-ORIGIN with the server (ADR-0015): the API fetches,
+        the /live WebSocket, and Vite's dev HMR socket all target the page's own origin, so a single
+        'self' covers every connection in dev, e2e, and production. In dev the Vite dev-proxy
+        (vite.config.ts) forwards /live, /auth, /sessions to the Bun server; in production Caddy serves
+        the SPA and the same paths from one origin. No cross-origin WS exists, so no host needs listing.
+
+      frame-ancestors is intentionally NOT in this <meta>: browsers IGNORE frame-ancestors when it
+        is delivered via <meta> (it only works as a real response header), and including it just
+        emits a console error. It belongs on the Caddy edge header (ADR-0009), alongside the
+        authoritative copy of this whole policy.
+
+      style-src 'self' 'unsafe-inline' — WHY 'unsafe-inline':
+        React inline `style={{…}}` props set the DOM element's `.style` property directly;
+        those are NOT governed by CSP and do NOT need 'unsafe-inline'. The reason it is
+        present is that Vite injects a <style> tag for CSS / HMR in dev, which IS an inline
+        stylesheet and would otherwise be blocked. In production this can be tightened: if
+        CSS is externalized to a hashed file, drop 'unsafe-inline' (or pin specific style
+        hashes) — left in here to keep one policy that works in both dev and build.
+
+      script-src 'self' — Vite emits a same-origin module script: /src/main.tsx in dev and
+        a hashed /assets/*.js bundle in build. Both are same-origin, so no 'unsafe-inline'
+        and no nonce are required.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="
+        default-src 'none';
+        script-src 'self';
+        style-src 'self' 'unsafe-inline';
+        connect-src 'self';
+        img-src 'self' data:;
+        font-src 'self';
+        base-uri 'none';
+        form-action 'none';
+        object-src 'none'
+      "
+    />
+
+    <!-- Do not leak the (possibly session-identifying) URL to any navigation target. -->
+    <meta name="referrer" content="no-referrer" />
+
+    <title>football-trackers · live</title>
+  </head>
+  <body style="margin: 0">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

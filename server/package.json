@@ -1,0 +1,36 @@
+{
+  "name": "football-trackers-server",
+  "private": true,
+  "type": "module",
+  "module": "src/server.ts",
+  "scripts": {
+    "start": "bun run src/server.ts",
+    "dev": "bun --watch src/server.ts",
+    "purge-player": "bun run purge-player.ts",
+    "roster": "bun run roster-user.ts",
+    "config": "bun run session-config.ts",
+    "sim": "bun run test/simulate.ts",
+    "test:e2e": "bun run test/e2e.ts",
+    "test:auth": "bun run test/auth-e2e.ts",
+    "test:ws-origin": "bun run test/ws-origin.ts",
+    "test:retention": "bun run test/retention.ts",
+    "test:roster-loader": "bun run test/roster-loader.ts",
+    "test:roster-cli": "bun run test/roster-cli.ts",
+    "test:roster-e2e": "bun run test/roster-e2e.ts",
+    "test:erasure": "bun run test/erasure-e2e.ts",
+    "test:history": "bun run test/history.ts",
+    "test:history-e2e": "bun run test/history-e2e.ts",
+    "test:device-health": "bun run test/device-health-e2e.ts",
+    "test:session-config-loader": "bun run test/session-config-loader.ts",
+    "test:session-config-cli": "bun run test/session-config-cli.ts",
+    "test:config-e2e": "bun run test/config-e2e.ts"
+  },
+  "dependencies": {
+    "elysia": "^1.4.28",
+    "mqtt": "^5.15.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^6.0.3"
+  }
+}

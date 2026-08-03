@@ -1,0 +1,155 @@
+#!/usr/bin/env bun
+/**
+ * auth-user.ts — provision coach/admin accounts for /auth/login (Phase 2; ADR-0008/0015).
+ *
+ * Accounts are argon2id-hashed (Bun-native) into the JSON file the server loads and periodically reloads
+ * (AUTH_ACCOUNTS_FILE, default ./auth-accounts.json). The running server picks up add/remove/sessions
+ * edits within AUTH_ACCOUNTS_RELOAD_SECONDS — so this is also the revocation path (remove a coach → their
+ * live sockets are closed and their cookie stops resolving). Passwords are read from stdin (piped) or a
+ * hidden TTY prompt; they are NEVER echoed, logged, or passed as a process argument.
+ *
+ *   bun run auth-user.ts add coach-amy --role coach --sessions u12-sat,u12-sun
+ *   bun run auth-user.ts add club-admin --role admin
+ *   echo 's3cret' | bun run auth-user.ts add coach-bo --role coach --sessions u10   # non-interactive
+ *   bun run auth-user.ts remove coach-amy
+ *   bun run auth-user.ts list
+ *
+ * Exit 0 on success; non-zero with a clear message on error. Mirrors purge-player.ts.
+ */
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+
+type Role = 'coach' | 'admin';
+interface Account {
+  username: string;
+  hash: string;
+  role: Role;
+  sessions: string[];
+}
+
+const FILE = process.env.AUTH_ACCOUNTS_FILE ?? './auth-accounts.json';
+
+const argv = process.argv.slice(2);
+const cmd = argv[0];
+const flag = (name: string): string | undefined => {
+  const i = argv.indexOf(`--${name}`);
+  return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : undefined;
+};
+
+function fail(msg: string): never {
+  console.error(`❌ ${msg}`);
+  process.exit(1);
+}
+
+function load(): Account[] {
+  if (!existsSync(FILE)) return [];
+  try {
+    const parsed = JSON.parse(readFileSync(FILE, 'utf8')) as { accounts?: Account[] };
+    return Array.isArray(parsed.accounts) ? parsed.accounts : [];
+  } catch {
+    fail(`accounts file is not valid JSON: ${FILE} (fix or delete it before re-running)`);
+  }
+}
+
+function save(accounts: Account[]): void {
+  writeFileSync(FILE, JSON.stringify({ accounts }, null, 2) + '\n', { mode: 0o600 });
+}
+
+/** Read a password without echoing it. Piped stdin → first line; a TTY → hidden raw-mode read. */
+async function readPassword(): Promise<string> {
+  if (!process.stdin.isTTY) {
+    const txt = await new Response(Bun.stdin.stream()).text();
+    return (txt.split('\n')[0] ?? '').replace(/\r$/, '');
+  }
+  process.stderr.write('Password: ');
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  return await new Promise<string>((resolve) => {
+    let pw = '';
+    process.stdin.on('data', (buf: Buffer) => {
+      for (const ch of buf.toString('utf8')) {
+        const code = ch.charCodeAt(0);
+        if (ch === '\n' || ch === '\r') {
+          process.stdin.setRawMode(false);
+          process.stdin.pause();
+          process.stderr.write('\n');
+          return resolve(pw);
+        }
+        if (code === 3) process.exit(1); // Ctrl-C (ETX)
+        else if (code === 127 || code === 8) pw = pw.slice(0, -1); // DEL / Backspace
+        else pw += ch;
+      }
+    });
+  });
+}
+
+async function cmdAdd(): Promise<void> {
+  const username = argv[1];
+  if (!username || username.startsWith('--')) fail('usage: add <username> --role <coach|admin> [--sessions a,b,c]');
+  if (username.length > 64) fail('username too long (max 64)');
+  const role = (flag('role') ?? 'coach') as Role;
+  if (role !== 'coach' && role !== 'admin') fail(`invalid --role "${role}" (coach|admin)`);
+  const sessions = (flag('sessions') ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (role === 'coach' && sessions.length === 0) {
+    console.error('⚠️  coach with no --sessions can read nothing until assigned one. Continuing.');
+  }
+
+  const pw = await readPassword();
+  if (!pw) fail('empty password');
+  if (pw.length > 256) fail('password too long (max 256)');
+  const hash = await Bun.password.hash(pw, { algorithm: 'argon2id' });
+
+  const accounts = load();
+  const i = accounts.findIndex((a) => a.username === username);
+  const entry: Account = { username, hash, role, sessions };
+  if (i >= 0) accounts[i] = entry;
+  else accounts.push(entry);
+  save(accounts);
+  console.log(
+    `✅ ${i >= 0 ? 'updated' : 'added'} ${role} "${username}"` +
+      (role === 'admin' ? ' (all sessions)' : ` (sessions: ${sessions.join(', ') || 'none'})`) +
+      ` → ${FILE}`,
+  );
+}
+
+function cmdRemove(): void {
+  const username = argv[1];
+  if (!username) fail('usage: remove <username>');
+  const accounts = load();
+  const next = accounts.filter((a) => a.username !== username);
+  if (next.length === accounts.length) fail(`no such account: "${username}"`);
+  save(next);
+  console.log(`✅ removed "${username}" → ${FILE} (the server revokes it within AUTH_ACCOUNTS_RELOAD_SECONDS)`);
+}
+
+function cmdList(): void {
+  const accounts = load();
+  if (accounts.length === 0) {
+    console.log(`(no accounts in ${FILE})`);
+    return;
+  }
+  console.log(`${accounts.length} account(s) in ${FILE}:`);
+  for (const a of accounts) {
+    console.log(`  - ${a.username} [${a.role}]${a.role === 'coach' ? ` sessions: ${a.sessions.join(', ') || '(none)'}` : ''}`);
+  }
+}
+
+switch (cmd) {
+  case 'add':
+    await cmdAdd();
+    break;
+  case 'remove':
+    cmdRemove();
+    break;
+  case 'list':
+    cmdList();
+    break;
+  default:
+    console.error('usage: bun run auth-user.ts <add|remove|list> …');
+    console.error('  add <username> --role <coach|admin> [--sessions a,b,c]   (password via stdin or hidden prompt)');
+    console.error('  remove <username>');
+    console.error('  list');
+    process.exit(cmd ? 1 : 0);
+}

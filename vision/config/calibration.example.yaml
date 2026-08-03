@@ -1,0 +1,4 @@
+# vision/config/calibration.example.yaml — template; the real calibration.yaml is gitignored (v2).
+# pixel point -> pitch point (cm, SoccerPitchConfiguration 12000x7000). Filled by footballcv.calibrate in v2.
+image_points: []   # [[px, py], ...]  >= 6 well-separated, non-collinear
+pitch_points: []   # [[x_cm, y_cm], ...] same order

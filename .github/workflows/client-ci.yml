@@ -1,0 +1,119 @@
+# Client CI — coach live view (client/).
+#
+# ┌─ NOT-YET-ON-GITHUB ────────────────────────────────────────────────────────────┐
+# │ This repo is a local hobby project and is NOT under git/GitHub yet (no remote,   │
+# │ no Actions runner). This workflow is written and ready for when it is: `git init`│
+# │ + push to a GitHub repo and it runs as-is. Until then, run the same gates locally │
+# │ — see the commands mirrored in each step's `run:` and in client/playwright.config.ts.│
+# └────────────────────────────────────────────────────────────────────────────────┘
+#
+# Gate order (fail fast, cheapest first): install -> typecheck -> lint -> unit test
+# -> build -> e2e (Playwright, driven by the hardware-free simulator). The e2e job
+# needs mosquitto on the runner (the simulator spawns it, exactly like server/test/e2e.ts).
+#
+# Actions are SHA-pinned per the repo CI convention (tag in a trailing comment).
+name: client-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'client/**'
+      - 'server/**' # the e2e gate drives the real server via the simulator
+      - '.github/workflows/client-ci.yml'
+  pull_request:
+    paths:
+      - 'client/**'
+      - 'server/**'
+      - '.github/workflows/client-ci.yml'
+  workflow_dispatch:
+
+# PRs cancel in-progress (save runner time); main runs to completion.
+concurrency:
+  group: client-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege: this workflow only reads the repo.
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  # Static + unit gates: fast, no broker needed.
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          filter: tree:0 # treeless clone — faster for CI
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Unit tests
+        # `bun run test` (scoped to the src unit suites) — NOT bare `bun test`, which would
+        # also try to execute the Playwright .spec.ts files in e2e/ and fail.
+        run: bun run test
+
+      - name: Build
+        run: bun run build
+
+  # E2E + frame-budget gate: needs a browser + mosquitto (the simulator spawns the
+  # broker + the real server, hardware-free — see server/test/simulate.ts).
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [check]
+    defaults:
+      run:
+        working-directory: client
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          filter: tree:0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Install mosquitto broker
+        # The simulator spawns its own mosquitto for the standalone stack; the binary
+        # must exist on the runner. (Same dependency as the server e2e test.)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mosquitto
+
+      - name: Install client deps (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Install server deps (the e2e gate drives the real server)
+        working-directory: server
+        run: bun install --frozen-lockfile
+
+      - name: Install Playwright Chromium (+ OS deps)
+        run: bunx playwright install --with-deps chromium
+
+      - name: E2E (smoke + a11y + failure-state + 50-player frame budget)
+        run: bun run e2e
+
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-report
+          path: client/playwright-report/
+          retention-days: 7

@@ -1,0 +1,14 @@
+# Keep the build context small + never bake footage/weights/venv into an image.
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+models/
+samples/
+out/
+*.mp4
+*.mov
+*.360
+*.pt
+*.engine
+.git/

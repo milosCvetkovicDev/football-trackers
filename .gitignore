@@ -1,0 +1,70 @@
+# football-trackers/.gitignore — the repo-wide safety net.
+#
+# ┌─ WHY THIS FILE IS LOAD-BEARING ─────────────────────────────────────────────────┐
+# │ This project tracks CHILDREN. `roster.json` is the only place their real names   │
+# │ live at rest; `auth-accounts.json` holds the coaches' argon2id password hashes;  │
+# │ `ft.passwd` holds the broker credentials every wearable authenticates with.      │
+# │                                                                                  │
+# │ Git history is APPEND-ONLY. Once any of these is committed, `git rm` removes it  │
+# │ from the working tree but NOT from history — recovery means rewriting every       │
+# │ commit that followed. So this file has to be correct BEFORE the first `git add`,  │
+# │ not after the first mistake.                                                      │
+# └──────────────────────────────────────────────────────────────────────────────────┘
+#
+# The per-directory .gitignore files (server/ client/ vision/ firmware/) remain the local
+# authority and are deliberately NOT folded in here — vision/.gitignore in particular is a
+# scoped privacy firewall (ADR-0023 §3). A few patterns below duplicate them on purpose:
+# duplication costs nothing in a .gitignore, and a rule that lives only in a subdirectory
+# stops protecting the moment the same file is created one level up.
+#
+# Enforced by server/test/gitignore-guard.ts (`bun run test:gitignore`), which asserts both
+# directions — sensitive paths ARE ignored, and required paths are NOT.
+
+# ── Personal data & secrets: never commit ────────────────────────────────────────────
+# Child names, per session. AUTH_ROSTER_FILE, default ./roster.json (server/roster-user.ts).
+roster.json
+# argon2id coach password hashes. AUTH_ACCOUNTS_FILE (server/auth-user.ts).
+auth-accounts.json
+# Per-session config incl. age band. SESSION_CONFIG_FILE (server/session-config.ts).
+session-config.json
+# mosquitto credential DB: `mosquitto_passwd -c ft.passwd ingest` (server/mosquitto/README.md).
+# NOTE: ft.acl is intentionally NOT ignored — it maps pseudonymous player ids to topic scopes
+# and carries no secret, so it stays reviewable in the diff.
+*.passwd
+# Anything env-shaped: ROBOFLOW_API_KEY (vision/docker-compose.yml), MQTT/AUTH overrides.
+.env
+.env.*
+!.env.example
+# Local Claude Code permissions — machine-specific and may name local paths.
+.claude/settings.local.json
+
+# ── Data at rest (telemetry is children's positions, timestamped) ────────────────────
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+# `VACUUM INTO` backups and the containerised store's bind-mount target.
+*.db.bak
+/server/data/
+
+# ── Dependencies & build output ──────────────────────────────────────────────────────
+node_modules/
+dist/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# PlatformIO build tree + downloaded libdeps.
+.pio/
+
+# ── Test / report artifacts ──────────────────────────────────────────────────────────
+test-results/
+playwright-report/
+playwright/.cache/
+
+# ── OS & editor cruft ────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*~

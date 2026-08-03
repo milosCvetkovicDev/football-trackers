@@ -1,0 +1,80 @@
+# vision/Dockerfile — everything runs in Docker; nothing on the host directly.
+# Two targets:
+#   cpu  — the 24-test suite + --selftest. No torch (the ML wrappers are lazy/guarded),
+#          so it builds + runs ANYWHERE, including Apple Silicon. Used on the Mac.
+#   gpu  — the real pipeline on the RTX 3060 desktop. torch+CUDA come from the pytorch base.
+#          Build + run ONLY on a CUDA host with nvidia-container-toolkit (NOT on the Mac).
+# Pinned tags (no :latest), multi-stage, non-root — per the repo's CI/CD docker guardrails.
+# syntax=docker/dockerfile:1
+
+###############################################################################
+# CPU target — tests + dev (Mac/any). Light deps only.
+###############################################################################
+FROM python:3.11-slim-bookworm AS cpu
+# OpenCV (cv2) needs libGL + glib at import; ffmpeg for video read/write.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements-test.txt .
+RUN pip install --no-cache-dir -r requirements-test.txt
+RUN useradd -m -u 1001 app && chown app /app
+USER app
+ENV PYTHONPATH=/app PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX=/tmp/pyc
+COPY --chown=app:app . .
+# Default: the test suite (overridden per compose service). Caches go to /tmp (mount stays read-only-ish).
+CMD ["python", "-m", "pytest", "test", "-q", "-o", "cache_dir=/tmp/pytest_cache"]
+
+###############################################################################
+# GPU target — RTX 3060 desktop only. torch+torchvision+CUDA are in the base image.
+# VERIFY the base tag exists for your CUDA/driver on the desktop before building
+# (e.g. `docker pull pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime`); adjust if needed.
+###############################################################################
+FROM pytorch/pytorch:2.5.1-cuda12.1-cudnn9-runtime AS gpu
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 ffmpeg git \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+# torch/torchvision already present in the base; install the rest (ultralytics pulls its deps).
+# gdown + yt-dlp are the setup tools the runbook uses IN-CONTAINER (public weight + clip fetch),
+# so model/clip download never runs on the host either.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt gdown yt-dlp
+# HF_HOME under bind-mounted, gitignored models/ so SigLIP (pre-fetched by fetch_models.py at
+# setup) persists across container runs and the OFFLINE runtime finds it locally.
+ENV PYTHONPATH=/app PYTHONDONTWRITEBYTECODE=1 HF_HOME=/app/models/hf
+COPY . .
+# Default: the offline selftest; the compose `run` service overrides with the real pipeline.
+CMD ["python", "-m", "footballcv.pipeline", "--selftest"]
+
+###############################################################################
+# CPU-RUN target — the Mac-runnable REAL-inference image (Apple Silicon arm64).
+# Same slim base as `cpu`, but with the FULL ML stack (torch+torchvision+ultralytics)
+# installed from the CPU wheel index — so the real pipeline can actually run a short
+# clip on the Mac for a dev / smoke test, the closest we get to the 3060 without a GPU.
+# This is NOT the acceptance run: the real acceptance run uses the `gpu` image on the
+# RTX 3060. CPU inference here is SLOW (fine for a short, low-fps clip; do not expect
+# 3060 throughput). Build + run ANYWHERE, including the Mac.
+###############################################################################
+FROM python:3.11-slim-bookworm AS cpurun
+# cv2 needs libGL + glib at import; ffmpeg for video read/write; git for any VCS-based pip dep.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 ffmpeg git \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+# CPU torch + torchvision from the CPU wheel index (linux/arm64 CPU wheels exist there).
+# Installed FIRST so ultralytics sees an existing torch and does NOT pull CUDA wheels.
+RUN pip install --no-cache-dir torch torchvision \
+        --index-url https://download.pytorch.org/whl/cpu
+# Then the rest of the stack + the in-container setup tools (gdown + yt-dlp).
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt gdown yt-dlp
+RUN useradd -m -u 1001 app && chown app /app
+USER app
+# HF_HOME under bind-mounted, gitignored models/ so SigLIP (pre-fetched by fetch_models.py at
+# setup) persists across container runs and the OFFLINE runtime finds it locally.
+ENV PYTHONPATH=/app PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX=/tmp/pyc HF_HOME=/app/models/hf
+COPY --chown=app:app . .
+# Default: a harmless import check (NOT the pipeline). The compose `cpu-run` service /
+# the caller overrides this with fetch_models.py then the real pipeline --device cpu.
+CMD ["python", "-c", "import torch;print('cpurun image OK',torch.__version__)"]

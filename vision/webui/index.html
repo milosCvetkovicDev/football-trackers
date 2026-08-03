@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="sr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>footballcv — obrada snimka</title>
+<style>
+  :root{
+    --bg:#0b0f14;--bg2:#11161d;--bg3:#161d26;--line:#243040;--line2:#2f3e52;
+    --ink:#e6edf3;--mut:#8b9bb0;--mut2:#5f7088;--cv:#fbbf24;--ok:#34d399;--bad:#f87171;--priv:#f472b6;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(900px 500px at 85% -10%,rgba(251,191,36,.06),transparent 60%),var(--bg);
+    color:var(--ink);font-family:var(--sans);line-height:1.55}
+  .wrap{max-width:840px;margin:0 auto;padding:28px 20px 70px}
+  h1{font-size:24px;letter-spacing:-.02em;margin:0 0 2px;display:flex;align-items:center;gap:10px}
+  h1 .d{width:11px;height:11px;border-radius:50%;background:var(--cv);box-shadow:0 0 12px var(--cv)}
+  .sub{color:var(--mut);font-size:14px;margin:0 0 22px}
+  code{font-family:var(--mono);font-size:.88em;color:var(--ink)}
+  label{display:block;font-size:13px;color:var(--mut);font-weight:600;margin:0 0 6px}
+  input[type=text],input[type=number]{width:100%;background:#0c1117;border:1px solid var(--line);border-radius:10px;
+    color:var(--ink);padding:11px 13px;font-size:15px;font-family:var(--mono)}
+  input:focus{outline:none;border-color:var(--cv)}
+  .card{background:var(--bg2);border:1px solid var(--line);border-radius:14px;padding:20px;margin:0 0 16px}
+  .row{display:flex;gap:14px;flex-wrap:wrap}.row>div{flex:1;min-width:140px}
+  .privacy{border:1px solid #83365f;background:linear-gradient(180deg,rgba(244,114,182,.08),var(--bg2));
+    border-left:4px solid var(--priv);border-radius:14px;padding:18px;margin:0 0 16px}
+  .privacy h2{color:var(--priv);font-size:15px;margin:0 0 8px;display:flex;align-items:center;gap:8px}
+  .att{display:flex;gap:10px;align-items:flex-start;margin:10px 0 0;cursor:pointer}
+  .att input{margin-top:3px;width:17px;height:17px;accent-color:var(--priv);flex:0 0 auto}
+  .att span{font-size:13.5px;color:var(--ink)}
+  .kindsel{margin-top:12px;display:none}
+  .kindsel.on{display:block}
+  select{background:#0c1117;border:1px solid var(--line);border-radius:9px;color:var(--ink);padding:8px 11px;font-size:14px}
+  .levels{display:flex;flex-direction:column;gap:8px;margin-top:4px}
+  .lvl{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:10px;cursor:pointer}
+  .lvl input{margin-top:3px;accent-color:var(--cv)}
+  .lvl.disabled{opacity:.5;cursor:not-allowed}
+  .lvl b{font-size:14px}.lvl .n{font-size:12px;color:var(--mut2)}
+  button.go{all:unset;cursor:pointer;background:var(--cv);color:#1c1404;font-weight:750;font-size:15px;
+    padding:13px 22px;border-radius:11px;text-align:center;display:inline-block;margin-top:6px}
+  button.go[disabled]{opacity:.4;cursor:not-allowed}
+  .hint{font-size:12px;color:var(--mut2);margin-top:8px}
+  .err{color:var(--bad);font-size:13.5px;margin-top:10px;min-height:1em}
+  /* progress */
+  .prog{display:none}.prog.on{display:block}
+  .bar{height:10px;background:#0c1117;border:1px solid var(--line);border-radius:99px;overflow:hidden;margin:6px 0 4px}
+  .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--cv),#f59e0b);transition:width .5s}
+  .stage{font-size:14px;font-weight:600}
+  .logbox{font-family:var(--mono);font-size:11.5px;color:var(--mut);background:#0c1117;border:1px solid var(--line);
+    border-radius:10px;padding:10px 12px;max-height:170px;overflow:auto;white-space:pre-wrap;margin-top:10px}
+  .results{display:none}.results.on{display:block}
+  video{width:100%;border-radius:12px;border:1px solid var(--line);background:#000;margin-top:6px}
+  .dl{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
+  .dl a{font-size:13px;font-family:var(--mono);background:var(--bg3);border:1px solid var(--line);border-radius:8px;
+    padding:6px 11px;color:var(--cv)}
+  .badge{display:inline-block;font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:99px;border:1px solid var(--line2);color:var(--mut)}
+  .badge.ok{color:var(--ok);border-color:#155e48}.badge.bad{color:var(--bad);border-color:#7f2222}
+  footer{color:var(--mut2);font-size:12px;margin-top:24px;border-top:1px solid var(--line);padding-top:14px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span class="d"></span>footballcv — obrada snimka</h1>
+  <p class="sub">Nalepi YouTube link → izaberi obradu → dobiješ anotirani snimak. Sve se vrti lokalno u Dockeru; ništa ne odlazi napolje.</p>
+
+  <!-- PRIVACY GATE -->
+  <div class="privacy">
+    <h2>🔒 Pre obrade — obavezna potvrda</h2>
+    <p class="sub" style="margin:0;color:var(--ink);font-size:13.5px">Ovaj alat sme da obrađuje <b>javne snimke odraslih/profi</b> utakmica. Snimci <b>dece</b> su lični podaci maloletnika i traže <b>saglasnost roditelja</b> — i kad su na javnom linku. Bez potvrde, obrada ne kreće.</p>
+    <label class="att">
+      <input type="checkbox" id="attest">
+      <span>Potvrđujem da je ovaj snimak <b>javni (odrasli/profi)</b> — ili <b>dečji uz saglasnost roditelja</b> — i da smem da ga obradim.</span>
+    </label>
+    <div class="kindsel" id="kindsel">
+      <label for="attest_kind">Vrsta:</label>
+      <select id="attest_kind">
+        <option value="public_adult">Javni odrasli / profi snimak</option>
+        <option value="consented_youth">Dečji — imam saglasnost roditelja</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- INPUT -->
+  <div class="card">
+    <label for="url">YouTube link</label>
+    <input type="text" id="url" placeholder="https://www.youtube.com/watch?v=…" autocomplete="off">
+    <div class="row" style="margin-top:14px">
+      <div>
+        <label for="seconds">Koliko sekundi od početka</label>
+        <input type="number" id="seconds" value="60" min="1" max="600">
+        <div class="hint">Kraće = brže. Na CPU-u računaj par minuta obrade po minutu snimka.</div>
+      </div>
+    </div>
+
+    <label style="margin-top:16px">Obrada</label>
+    <div class="levels">
+      <label class="lvl"><input type="radio" name="level" value="v1" checked>
+        <div><b>Igrači + timovi + anotirani snimak</b> <span class="badge ok">radi automatski</span><div class="n">Detekcija igrača, praćenje (stabilni ID), podela na 2 tima, snimak sa kutijama i bojama timova.</div></div></label>
+      <label class="lvl disabled"><input type="radio" name="level" value="v2" disabled>
+        <div><b>+ Lopta, radar, statistika</b> <span class="badge">treba kalibracija terena</span><div class="n">Posed, pređeno rastojanje, radar odozgo — zahteva da se jednom obeleži teren (sledeći korak).</div></div></label>
+    </div>
+
+    <div style="margin-top:18px">
+      <button class="go" id="go" disabled>Obradi snimak</button>
+      <div class="err" id="err"></div>
+    </div>
+  </div>
+
+  <!-- PROGRESS -->
+  <div class="card prog" id="prog">
+    <div class="stage" id="stage">…</div>
+    <div class="bar"><i id="barfill"></i></div>
+    <div class="logbox" id="logbox"></div>
+  </div>
+
+  <!-- RESULTS -->
+  <div class="card results" id="results">
+    <div class="stage" style="color:var(--ok)">Gotovo ✓</div>
+    <video id="vid" controls playsinline></video>
+    <div class="dl" id="dl"></div>
+  </div>
+
+  <footer>Privacy: svaka obrada se beleži (link + potvrda + vreme) u lokalni log <code>out/_attestations.jsonl</code>. Pravilo se proverava i na serveru, ne samo ovde. · ADR-0023.</footer>
+</div>
+
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var attest=$('attest'), kindsel=$('kindsel'), url=$('url'), go=$('go'), err=$('err');
+
+  function refresh(){
+    kindsel.classList.toggle('on', attest.checked);
+    go.disabled = !(attest.checked && url.value.trim().length>0);
+  }
+  attest.addEventListener('change', refresh);
+  url.addEventListener('input', refresh);
+
+  function poll(id){
+    fetch('/api/jobs/'+id).then(function(r){return r.json();}).then(function(j){
+      $('stage').textContent = j.stage || j.state;
+      $('barfill').style.width = (j.pct||0)+'%';
+      $('logbox').textContent = (j.log||[]).join('\n');
+      $('logbox').scrollTop = $('logbox').scrollHeight;
+      if(j.state==='done'){
+        $('prog').classList.remove('on');
+        $('results').classList.add('on');
+        if(j.outputs && j.outputs['annotated.mp4']){
+          $('vid').src = j.outputs['annotated.mp4'];
+        }
+        var dl=$('dl'); dl.innerHTML='';
+        Object.keys(j.outputs||{}).forEach(function(k){
+          var a=document.createElement('a'); a.href=j.outputs[k]; a.textContent='⬇ '+k; a.setAttribute('download',''); dl.appendChild(a);
+        });
+        go.disabled=false; go.textContent='Obradi novi snimak';
+        return;
+      }
+      if(j.state==='error'){
+        $('stage').innerHTML = '<span class="badge bad">greška</span> '+(j.error||'Nepoznata greška');
+        go.disabled=false; go.textContent='Pokušaj ponovo';
+        return;
+      }
+      setTimeout(function(){ poll(id); }, 1500);
+    }).catch(function(){ setTimeout(function(){ poll(id); }, 2500); });
+  }
+
+  go.addEventListener('click', function(){
+    err.textContent='';
+    var level = (document.querySelector('input[name=level]:checked')||{}).value || 'v1';
+    var body = {
+      url: url.value.trim(),
+      level: level,
+      seconds: parseInt($('seconds').value,10)||60,
+      attest: attest.checked,
+      attest_kind: $('attest_kind').value
+    };
+    go.disabled=true; go.textContent='Šaljem…';
+    $('results').classList.remove('on'); $('logbox').textContent=''; $('barfill').style.width='0%';
+    fetch('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+      .then(function(r){ return r.json().then(function(j){ return {ok:r.ok,j:j}; }); })
+      .then(function(res){
+        if(!res.ok){ err.textContent = res.j.error || 'Zahtev odbijen.'; go.disabled=false; go.textContent='Obradi snimak'; return; }
+        $('prog').classList.add('on'); $('stage').textContent='U redu…';
+        poll(res.j.id);
+      })
+      .catch(function(){ err.textContent='Server nije dostupan.'; go.disabled=false; go.textContent='Obradi snimak'; });
+  });
+
+  refresh();
+})();
+</script>
+</body>
+</html>

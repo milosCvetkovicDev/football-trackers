@@ -1,0 +1,21 @@
+# vision/.gitignore — privacy firewall (ADR-0023 §3). MUST be in force before any clip lands.
+# Footage and weights NEVER enter version control.
+# `models/*`, NOT `models/` — git never descends into an excluded DIRECTORY, so the
+# `!models/MANIFEST.json` re-include below is dead under `models/`. Excluding the
+# directory's *contents* individually keeps the weights out while letting the negation
+# apply. (`*.pt` below is the belt-and-braces second line.)
+models/*
+samples/
+out/
+config/calibration.yaml
+*.360
+*.mp4
+*.mov
+*.pt
+*.engine
+.venv/
+__pycache__/
+*.pyc
+# Committed despite the above (carry no footage/weights/keys):
+!models/MANIFEST.json
+!samples.manifest.jsonl

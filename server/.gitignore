@@ -1,0 +1,5 @@
+node_modules/
+# bun:sqlite data + WAL sidecars
+*.db
+*.db-wal
+*.db-shm

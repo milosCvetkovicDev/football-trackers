@@ -1,0 +1,12 @@
+# football-trackers MQTT ACL.
+#
+# The server's read-only ingest account sees all telemetry + status.
+user ingest
+topic read football-trackers/#
+
+# Every wearable authenticates with username == its PLAYER_ID (e.g. "01") and may publish
+# ONLY to its own player's telemetry/status topics. %u expands to the username, so device
+# "01" can write .../player/01/... and nothing else — it cannot forge another player's data.
+# (The server also rejects body/topic id mismatches as `dropped{reason="id_mismatch"}`.)
+pattern write football-trackers/session/+/player/%u/telemetry
+pattern write football-trackers/session/+/player/%u/status

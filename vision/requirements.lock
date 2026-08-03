@@ -1,0 +1,20 @@
+# vision/requirements.lock — TARGET-ENV lock (Python 3.11 + CUDA cu12x on the RTX 3060).
+# REGENERATE on the target box: `pip install -r requirements.txt && pip freeze > requirements.lock`
+# (or `uv lock`). The dev box here is macOS/py3.14 — its freeze is NOT this lock.
+# The cu12x torch index is the part most likely to break a reinstall, so it is pinned explicitly:
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# --- pin exact versions below once resolved on the 3.11/CUDA target ---
+# torch and torchvision MUST come from the cu121 index above (not the PyPI CPU wheels):
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+ultralytics==8.4.60
+supervision==0.29.0
+opencv-python==4.13.0.92
+transformers==4.44.2
+scikit-learn==1.9.0
+numpy==2.4.6
+PyYAML==6.0.3
+pytest==9.1.1
+# NOTE: the +cu121 torch pins are placeholders — confirm the exact patch available on the
+# cu121 index for py3.11 at build time and freeze the real resolved set here.

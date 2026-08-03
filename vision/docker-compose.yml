@@ -1,0 +1,116 @@
+# vision/docker-compose.yml — the CV subproject runs ENTIRELY in Docker. Nothing on the host.
+# From the vision/ directory:
+#
+#     docker compose run --rm test       # the 24-test suite (CPU image; works on the Mac too)
+#     docker compose run --rm selftest   # pipeline --selftest (offline guards + no-network)
+#     docker compose --profile gpu run --rm run   # the real pipeline — RTX 3060 desktop ONLY
+#
+# Source is bind-mounted so code edits need no rebuild; deps live in the image. Pinned base
+# images (no :latest); the `run` service is gated behind the `gpu` profile so it is never built
+# or started on a machine without an NVIDIA GPU (e.g. the Mac).
+
+services:
+  test:
+    build:
+      context: .
+      target: cpu
+    image: ft-vision-cpu
+    container_name: ft-vision-test
+    volumes:
+      - .:/app
+    command: ["python", "-m", "pytest", "test", "-q", "-o", "cache_dir=/tmp/pytest_cache"]
+
+  selftest:
+    build:
+      context: .
+      target: cpu
+    image: ft-vision-cpu
+    container_name: ft-vision-selftest
+    volumes:
+      - .:/app
+    command: ["python", "-m", "footballcv.pipeline", "--selftest"]
+
+  # --- RTX 3060 desktop ONLY (needs nvidia-container-toolkit). Not built/started without --profile gpu. ---
+  run:
+    profiles: ["gpu"]
+    build:
+      context: .
+      target: gpu
+    image: ft-vision-gpu
+    container_name: ft-vision-run
+    volumes:
+      - .:/app                         # source + samples/ out/ models/ (gitignored) come along
+    environment:
+      ROBOFLOW_API_KEY: ${ROBOFLOW_API_KEY:-}   # for fetch_models (run that once, separately)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+    command: >
+      python -m footballcv.pipeline
+      --input samples/clip.mp4 --device cuda --sample-fps 5 --imgsz 1280 --out out/clip/
+
+  # --- Mac-runnable CPU REAL-inference image (Apple Silicon arm64). NO gpu profile, so it
+  # builds + runs on the Mac. The full ML stack (CPU torch) is in the image; this is the
+  # closest to the 3060 acceptance run without the GPU. CPU inference is slow — short clips only.
+  # The default command is the image's import check; the owner overrides it like so:
+  #   docker compose run --rm cpu-run python fetch_models.py                # one-time weight fetch
+  #   docker compose run --rm cpu-run python -m footballcv.pipeline \
+  #       --input samples/clip.mp4 --device cpu --sample-fps 2 --out out/clip/   # smoke run
+  cpu-run:
+    build:
+      context: .
+      target: cpurun
+    image: ft-vision-cpurun
+    container_name: ft-vision-cpurun
+    volumes:
+      - .:/app                         # source + samples/ out/ models/ (gitignored) come along
+    environment:
+      ROBOFLOW_API_KEY: ${ROBOFLOW_API_KEY:-}   # for fetch_models (run that once, separately)
+
+  # --- The "drop a YouTube link → process" web UI (webui/). Mac/CPU image; open it in a browser
+  # at http://localhost:8077. yt-dlp + the pipeline run inside the container — nothing on the host.
+  # The privacy gate (public-adult OR consented-youth attestation) is enforced server-side.
+  #   docker compose up webui        # start it; Ctrl-C to stop
+  webui:
+    build:
+      context: .
+      target: cpurun
+    image: ft-vision-cpurun
+    container_name: ft-vision-webui
+    ports:
+      - "8077:8077"
+    volumes:
+      - .:/app
+    environment:
+      FT_DEVICE: "cpu"
+      ROBOFLOW_API_KEY: ${ROBOFLOW_API_KEY:-}
+    command: ["python", "-m", "webui.server"]
+
+  # --- Same web UI on the RTX 3060 (fast). gpu profile only; needs nvidia-container-toolkit.
+  #   docker compose --profile gpu up webui-gpu
+  webui-gpu:
+    profiles: ["gpu"]
+    build:
+      context: .
+      target: gpu
+    image: ft-vision-gpu
+    container_name: ft-vision-webui-gpu
+    ports:
+      - "8077:8077"
+    volumes:
+      - .:/app
+    environment:
+      FT_DEVICE: "cuda"
+      ROBOFLOW_API_KEY: ${ROBOFLOW_API_KEY:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: ["gpu"]
+    command: ["python", "-m", "webui.server"]

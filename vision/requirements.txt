@@ -1,0 +1,12 @@
+# vision/requirements.txt — range pins; exact versions frozen in requirements.lock (Task 11)
+# torch/torchvision: install from the CUDA cu12x index on the RTX 3060, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+ultralytics>=8.4.60,<8.5
+lapx>=0.5.11           # provides `import lap` — BoT-SORT/`model.track` linear-assignment (prebuilt arm64 wheels)
+supervision==0.29.*
+opencv-python>=4.9,<5
+transformers>=4.44
+scikit-learn>=1.4
+numpy
+PyYAML
+pytest

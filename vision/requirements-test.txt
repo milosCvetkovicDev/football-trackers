@@ -1,0 +1,9 @@
+# vision/requirements-test.txt — deps for the CPU test image (docker compose `test`/`selftest`).
+# The 24-test suite needs ONLY these: torch/ultralytics/transformers are lazy/guarded in the code,
+# so the suite runs without them (they live in the GPU image's requirements.txt instead).
+pytest
+PyYAML
+numpy
+opencv-python
+scikit-learn
+supervision==0.29.*
