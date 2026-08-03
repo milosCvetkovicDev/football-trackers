@@ -6,6 +6,17 @@
       "runtimeExecutable": "python3",
       "runtimeArgs": ["-m", "http.server", "4178", "--directory", "docs/architecture"],
       "port": 4178
+    },
+    {
+      "name": "coach-view",
+      "runtimeExecutable": "bun",
+      "runtimeArgs": ["run", "dev"],
+      "cwd": "client",
+      "port": 5173,
+      "env": {
+        "VITE_PROXY_TARGET": "http://127.0.0.1:3007",
+        "VITE_DEFAULT_SESSION": "test"
+      }
     }
   ]
 }

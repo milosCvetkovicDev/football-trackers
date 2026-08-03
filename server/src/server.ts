@@ -7,13 +7,15 @@
  *   bun --watch src/server.ts      # dev (reload on change)
  *
  * Env: PORT (default 3000; public /live + /auth + /sessions), METRICS_PORT (default 9464; loopback
- *      /health + /metrics), MQTT_URL, MQTT_USERNAME/MQTT_PASSWORD (broker auth), DB_PATH, LOG_LEVEL,
+ *      /health + /metrics), PUBLIC_HOST (bind interface — see BIND INTERFACE below), MQTT_URL,
+ *      MQTT_USERNAME/MQTT_PASSWORD (broker auth), DB_PATH, LOG_LEVEL,
  *      APP_VERSION, RETENTION_DAYS (see retention.ts / ADR-0010).
  *      Auth (Phase 2 — see docs/frontend/phase-2-auth-contract.md, ADR-0015/0008): AUTH_ACCOUNTS_FILE,
  *      AUTH_SESSION_TTL_SECONDS, AUTH_COOKIE_SECURE, AUTH_ACCOUNTS_RELOAD_SECONDS, ANON_SESSIONS,
  *      MAX_INFLIGHT_LOGINS / AUTH_LOGIN_BURST / AUTH_LOGIN_WINDOW_S (login DoS controls),
  *      ALLOWED_ORIGINS (CSWSH allow-list — STRICT: absent Origin is rejected on /auth + /live),
- *      ALLOW_ANONYMOUS_LIVE (+ ANON_SESSIONS) for an isolated-LAN bypass.
+ *      ALLOW_ANONYMOUS_LIVE (+ ANON_SESSIONS) for an isolated-LAN bypass — LIVE PITCH ONLY, see
+ *      sessionGetGate: names and bulk history always require a real login.
  *
  * Observability: structured JSON logs (log.ts), Prometheus metrics (metrics.ts), readiness on /health.
  */
@@ -61,6 +63,19 @@ import {
 const PORT = Number(process.env.PORT ?? 3000);
 const METRICS_PORT = Number(process.env.METRICS_PORT ?? 9464);
 const VERSION = process.env.APP_VERSION ?? 'dev';
+
+// --- BIND INTERFACE (§4.1) ---------------------------------------------------------------------------
+// ANON_MODE means "the live feed needs no login". A feed of children's live positions that needs no login
+// must not ALSO be reachable from the LAN, so anon mode defaults the bind to LOOPBACK. This is structural
+// on purpose: the Origin allow-list is CSWSH defence and carries no authorization weight (an absent Origin
+// — what every non-browser client sends — cannot be authenticated), so it must never be the only thing
+// standing between a subnet and a child's position.
+//
+// PUBLIC_HOST overrides it, and a CONTAINER legitimately needs to: inside its own network namespace
+// 0.0.0.0 reaches only the compose network, and the real exposure boundary is the Docker port publish
+// (docker-compose.yml pins that to 127.0.0.1). The override is deliberately loud — see the boot warning.
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
+const PUBLIC_HOST = process.env.PUBLIC_HOST ?? (ANON_MODE ? '127.0.0.1' : '0.0.0.0');
 const MAX_BODY_BYTES = 4096; // /auth POST bodies are tiny; reject anything bigger BEFORE parse/hash.
 
 // --- CSWSH / CSRF Origin allow-list (children's live location must never be world-readable) ----------
@@ -147,12 +162,26 @@ async function readJsonBody(
 // principal on a 403 (authed-but-wrong-session) — null where we don't yet have one (origin / 401).
 type GateOk = { ok: true; principal: Principal };
 type GateReject = { ok: false; status: number; result: string; username: string | null };
-function sessionGetGate(request: Request, id: string): GateOk | GateReject {
+/**
+ * @param allowAnonymous  opt THIS endpoint out of the anon-scope rule below. Default `false` (deny) so a
+ *                        new session-scoped endpoint is closed to the anon principal unless someone
+ *                        deliberately decides it carries nothing worth a login.
+ */
+function sessionGetGate(request: Request, id: string, allowAnonymous = false): GateOk | GateReject {
   const origin = request.headers.get('origin') ?? undefined;
   // Lenient: a same-origin browser GET omits Origin (allowed); a present cross-origin Origin must match.
   if (!originOkLenient(origin)) return { ok: false, status: 403, result: 'forbidden_origin', username: null };
   const p = currentPrincipal(request.headers.get('cookie') ?? undefined);
   if (!p) return { ok: false, status: 401, result: 'unauthorized', username: null };
+  // ANON SCOPE (Phase 2 §4.1): ALLOW_ANONYMOUS_LIVE exists so the LIVE PITCH VIEW needs no login on an
+  // isolated LAN — which is not a reason to hand out child NAMES (/roster) or a bulk raw location export
+  // (/history), nor the review series built from them (/events). Those need a real, named account, so an
+  // access to them is always attributable to a person in the audit log. 403, not 401: the anon caller IS
+  // authenticated, just not permitted — and a 401 would look like an expired cookie to a client that has
+  // none. Runs BEFORE validSessionId, like the 401 above, so the reject leaks no session-id oracle.
+  if (p.anonymous && !allowAnonymous) {
+    return { ok: false, status: 403, result: 'login_required', username: null };
+  }
   if (!validSessionId(id)) return { ok: false, status: 400, result: 'bad_session', username: p.username };
   if (!authorizedFor(p, id)) return { ok: false, status: 403, result: 'forbidden', username: p.username };
   return { ok: true, principal: p };
@@ -277,8 +306,12 @@ export function createApp() {
       // --- session config: the age band → youth speed-zone thresholds (Phase 4, ADR-0019). The band is NOT a
       // name/location, so no rate-limit / no-store is needed; it is still session-scoped + authed for uniformity
       // and so live zone colour matches what the server uses for the review breakdown. ----
+      // allowAnonymous: THE ONE session-scoped read the anon principal keeps. It carries a single enum (the
+      // age band) and its thresholds — no name, no position, nothing per-child — and the LIVE pitch needs it
+      // to colour speed zones, which is exactly what anon mode is for. Denying it would leave the anon live
+      // view silently mis-colouring speeds against the U14 client-side fallback.
       .get('/sessions/:id/config', ({ request, set, params }) => {
-        const g = sessionGetGate(request, params.id);
+        const g = sessionGetGate(request, params.id, true);
         if (!g.ok) {
           metrics.configRequests.inc({ result: g.result });
           log.warn('config rejected', { reason: g.result, session: params.id, username: g.username });
@@ -497,7 +530,7 @@ await initRoster();
 // Session config (Phase 4) — the per-session age band; load + start its reload before serving.
 await initSessionConfig();
 
-const app = createApp().listen(PORT);
+const app = createApp().listen({ port: PORT, hostname: PUBLIC_HOST });
 const server = app.server;
 if (!server) throw new Error('Elysia server failed to start');
 
@@ -506,6 +539,13 @@ createInternalApp().listen({ port: METRICS_PORT, hostname: '127.0.0.1' });
 metrics.buildInfo.set({ version: VERSION, runtime: `bun-${Bun.version}` }, 1);
 
 // Make the access-control posture loud — never let a children's-location feed be quietly mis-secured.
+// The bind is the one control that cannot be recovered from downstream: once the socket is on a LAN
+// interface with anon mode on, every request is already unauthenticated by design.
+if (ANON_MODE && !LOOPBACK_HOSTS.has(PUBLIC_HOST)) {
+  log.warn(
+    `ALLOW_ANONYMOUS_LIVE=true AND the listener is bound to ${PUBLIC_HOST} (not loopback) — the live feed of children's positions is reachable without any login by anything that can route to this port. This is correct ONLY when something else confines it (a container whose published port is pinned to 127.0.0.1, or a trusted reverse proxy). If you did not deliberately arrange that, unset PUBLIC_HOST.`,
+  );
+}
 if (!ANON_MODE && ALLOWED_ORIGINS.length === 0) {
   log.warn(
     'ALLOWED_ORIGINS is empty and anonymous mode is off — cookie-authenticated /live and /auth will reject ALL browser clients (a present Origin is required). Set ALLOWED_ORIGINS to your app origin (prod: https://relay.example; dev: http://localhost:5173).',
@@ -532,9 +572,11 @@ startIngest({
 startRetention();
 
 log.info('http listening', {
+  host: PUBLIC_HOST, // logged so "which interface is this on" is answerable from the log alone
   port: PORT,
   metricsPort: METRICS_PORT,
   version: VERSION,
+  anonMode: ANON_MODE,
   public: ['/live', '/auth/login', '/auth/logout', '/auth/me', '/sessions'],
   internalLoopback: ['/health', '/metrics'],
 });

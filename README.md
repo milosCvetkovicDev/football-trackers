@@ -94,8 +94,18 @@ Security env:
   boot warning), `AUTH_SESSION_TTL_SECONDS` (default 43200 = 12 h, absolute).
 - `ALLOWED_ORIGINS` — **strict** comma-separated browser-Origin allow-list (CSWSH/CSRF defence): an **absent**
   Origin is now rejected on `/auth` + `/live`; empty + non-anon ⇒ loud boot warning (rejects all browser clients).
-- `ALLOW_ANONYMOUS_LIVE=true` + `ANON_SESSIONS` (comma list) — isolated-LAN bypass only: skips login, but the anon
-  principal can read **only** the listed sessions (never wildcard). Loud boot warning + `ft_anon_mode_active=1`.
+- `ALLOW_ANONYMOUS_LIVE=true` + `ANON_SESSIONS` (comma list) — isolated-LAN bypass only: skips login for the
+  **live pitch**, and only for the listed sessions (never wildcard). It is **not** a general read bypass:
+  `/roster` (names), `/history` (bulk raw location) and `/events` answer **403 `login_required`** to the anon
+  principal — only `/live`, `/sessions`, `/auth/me` and `/config` (one age-band enum) are open. Signing in on
+  such a stack is optional and still works: `currentPrincipal` resolves the cookie first and falls back to the
+  anon principal, so a coach who logs in gets their real identity and is named in the audit log. Loud boot
+  warning + `ft_anon_mode_active=1`.
+- `PUBLIC_HOST` — the bind interface. Defaults to `0.0.0.0`, but to **`127.0.0.1` whenever
+  `ALLOW_ANONYMOUS_LIVE=true`**: a feed that needs no login must not also be LAN-reachable, and an Origin
+  allow-list cannot substitute (it is CSWSH defence, and an absent Origin — what every non-browser client sends
+  — can't be authenticated). Override it where something else confines the port, such as a container whose
+  published port is pinned to loopback; that combination logs a loud warning.
 - Login DoS controls: `AUTH_LOGIN_BURST` (5) / `AUTH_LOGIN_WINDOW_S` (30) per-IP bucket, `MAX_INFLIGHT_LOGINS` (4)
   concurrent-hash cap, `AUTH_MAX_SESSIONS_PER_USER` (8) per-account session cap (so one principal can't evict
   another's sessions), `AUTH_MAX_SESSIONS` (1000) global backstop. The per-username failure soft-lock is
@@ -196,9 +206,11 @@ In `--standalone` it prints the exact same-origin `VITE_PROXY_TARGET=… bun run
 against the spawned stack. On stop it scrapes `/metrics` and reports what the server actually saw (received /
 published / drops-by-reason / p99 / RSS). `--secure` provisions per-player MQTT accounts (username ==
 `playerId`) + topic ACLs exactly like the e2e (confirming the broker blocks cross-player spoofing) **and** a
-named coach login (`coach` / `sim-coach-pw`, assigned to the run session) so the coach view exercises the real
-Phase-2 cookie auth; otherwise `/live` runs in the isolated-LAN anonymous posture scoped to `ANON_SESSIONS`
-(dev only, no login). `--record`/`--replay` reproduce an identical run for repeatable debugging.
+named coach login so the coach view exercises the real Phase-2 cookie auth; otherwise `/live` runs in the
+isolated-LAN anonymous posture scoped to `ANON_SESSIONS` (dev only, no login). The coach account
+(`coach` / `sim-coach-pw`, assigned to the run session) is provisioned in **both** postures — under `--secure`
+it is the only way in; in the anonymous posture it is optional and buys names + Review, which the anon
+principal no longer receives. `--record`/`--replay` reproduce an identical run for repeatable debugging.
 
 ## Client (coach live view)
 Bun + Vite + React. Connects a plain WebSocket to `/live?sessionId=...`, keeps the
@@ -232,13 +244,26 @@ One command brings up the device-facing backend (MQTT broker + ingest/WS server)
 the host. Full walkthrough + troubleshooting: [docs/dev/local-bench-runbook.md](docs/dev/local-bench-runbook.md)
 ([ADR-0021](docs/decisions/0021-local-dev-docker-stack.md)).
 ```
-docker compose up -d            # broker (1883) + server (published on 3007)
-cd client && VITE_PROXY_TARGET=http://localhost:3007 bun run dev   # coach view -> http://localhost:5173
+./server/mosquitto/dev-provision.sh 01   # ONCE: broker accounts + .env (ft.passwd is gitignored)
+docker compose up -d                     # broker (1883, authenticated) + server (127.0.0.1:3007)
+cd client && VITE_PROXY_TARGET=http://127.0.0.1:3007 bun run dev   # coach view -> http://localhost:5173
 ```
 - A real wearable connects to **this Mac's Wi-Fi IP** on 1883 — set the firmware `MQTT_HOST` to it; the device and
   the Mac must be on the **same Wi-Fi** (a wired dock Ethernet was found to be isolated from the Wi-Fi).
 - The coach view runs on the **host**, not in the stack — Vite's `/live` WebSocket proxy doesn't relay the upgrade
-  from a container. The broker is anonymous and the server runs in anon live mode: **isolated-LAN dev only.**
+  from a container.
+- **The broker is authenticated** — it mounts the same `allow_anonymous false` config + per-device ACLs the field
+  broker uses, so `docker compose up` fails loudly until `dev-provision.sh` has created the accounts, and every
+  bench run exercises the real auth path. Re-running provisioning rotates credentials; follow it with
+  `docker compose up -d`, because `restart` does not re-read `.env`.
+- **The server is published on `127.0.0.1` only.** It runs in anon live mode (no login for the pitch view), and a
+  no-login feed of children's positions must not also be reachable from the Wi-Fi. That makes the coach view
+  this-machine-only; a pitch-side tablet is the Caddy + real-auth deployment, not this stack. Use
+  `http://127.0.0.1:3007` (not `localhost`) as the proxy target — the bind is IPv4-only.
+- **Names and Review still need a real login here.** `/roster`, `/history` and `/events` answer 403
+  `login_required` for the anonymous principal; the anon view shows pseudonymous ids and a "Sign in for names &
+  review" button. Provision a coach with
+  `cd server && AUTH_ACCOUNTS_FILE=./auth-accounts.json bun run auth-user.ts add coach --role coach --sessions test`.
 
 ## Status / next
 - [x] Hardware ordered (1-2 prototype sets)

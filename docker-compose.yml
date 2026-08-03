@@ -7,7 +7,7 @@
 #
 # THE COACH VIEW (Vite) RUNS ON THE HOST, not in a container:
 #
-#     cd client && VITE_PROXY_TARGET=http://localhost:3007 bun run dev   # -> http://localhost:5173
+#     cd client && VITE_PROXY_TARGET=http://127.0.0.1:3007 bun run dev   # -> http://localhost:5173
 #
 # Why: Vite's /live WebSocket proxy does not reliably relay the upgrade when Vite runs inside Docker
 # (the server accepts the upgrade but the browser hangs at "connecting"). Running Vite on the host fixes
@@ -17,9 +17,24 @@
 # The wearable connects to THIS MAC'S Wi-Fi IP on 1883 (published below) — set the firmware MQTT_HOST to
 # that IP (e.g. 192.168.1.7). The device and the Mac must be on the SAME Wi-Fi (see the runbook).
 #
-# LOCAL/ISOLATED dev only: the broker is anonymous and the server runs in isolated-LAN anon mode
-# (ANON_SESSIONS). Production runs behind the field AP + Caddy with real auth. Pinned image tags
-# (no :latest), per the repo's CI/CD docker guardrails.
+# RUN THIS ONCE BEFORE THE FIRST `docker compose up`:
+#
+#     ./server/mosquitto/dev-provision.sh
+#
+# It creates the broker accounts (server/mosquitto/ft.passwd) and the .env this file reads. Without it
+# compose stops with "MQTT_PASSWORD is not set" — deliberately, because the alternative used to be a
+# broker that accepted anybody.
+#
+# WHAT IS EXPOSED, AND TO WHOM (audit §4.1 / §4.6 — both were PROVEN LIVE against this stack):
+#   - 1883 is published on the LAN because the wearable has to reach it, and is now AUTHENTICATED with
+#     per-device ACLs (server/mosquitto/), not `allow_anonymous true`. An anonymous subscriber used to
+#     be able to read every child's 10 Hz feed from any host on the Wi-Fi.
+#   - 3007 is published on 127.0.0.1 ONLY. The server runs in isolated-LAN anon mode (no login for the
+#     live view), and a no-login feed of children's positions must not also be LAN-reachable; the only
+#     consumer is the Vite proxy on this machine. Names (/roster) and bulk history need a real login
+#     even here.
+# Production runs behind the field AP + Caddy with real auth. Pinned image tags (no :latest), per the
+# repo's CI/CD docker guardrails.
 
 services:
   mosquitto:
@@ -29,7 +44,12 @@ services:
     ports:
       - "1883:1883"            # published on the host LAN so the wearable (on Wi-Fi) can reach it
     volumes:
-      - ./deploy/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      # The SAME authenticated config the field broker uses (allow_anonymous false + per-device ACL),
+      # not the anonymous dev one — so every bench run exercises the real auth path, which is also how
+      # the prod-only-auth-never-tested class of bug stops existing. Mounted as a DIRECTORY because the
+      # conf reads ft.passwd + ft.acl from alongside itself; ft.passwd is a secret and is gitignored,
+      # so dev-provision.sh must have run (a missing file makes mosquitto exit loudly, not run open).
+      - ./server/mosquitto:/mosquitto/config:ro
 
   server:
     image: oven/bun:1.3
@@ -39,11 +59,23 @@ services:
     command: sh -c "bun install && bun run src/server.ts"
     environment:
       MQTT_URL: mqtt://mosquitto:1883      # broker by compose service name
+      # Broker credentials for the read-only 'ingest' account (ft.acl: read football-trackers/#).
+      # `:?` on purpose: if .env is missing, compose REFUSES to start rather than bringing the server
+      # up anonymous against an authenticated broker — which would look like a broker fault (endless
+      # reconnects, /health mqtt:false) instead of "you skipped provisioning".
+      MQTT_USERNAME: ${MQTT_USERNAME:?run ./server/mosquitto/dev-provision.sh first (writes .env)}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:?run ./server/mosquitto/dev-provision.sh first (writes .env)}
       PORT: "3000"                         # public: /live + /auth + /sessions
       METRICS_PORT: "9464"                 # loopback inside the container: /health + /metrics
       DB_PATH: /data/telemetry.db          # persisted in a named volume, not the bind mount
       ALLOW_ANONYMOUS_LIVE: "true"         # isolated-LAN bypass so the browser can view without login
       ANON_SESSIONS: test                  # the anon principal may view ONLY this session (== firmware SESSION_ID)
+      # In anon mode the server defaults its bind to 127.0.0.1. Inside a container that would make the
+      # published port unreachable (Docker forwards to the container's IP, not its loopback), so we opt
+      # out — safely, because the exposure boundary here is the `127.0.0.1:3007` publish below, and
+      # 0.0.0.0 inside this namespace reaches only the compose network. The server logs a loud warning
+      # for this combination; that warning is expected HERE and nowhere else.
+      PUBLIC_HOST: 0.0.0.0
       ALLOWED_ORIGINS: http://localhost:5173   # the host Vite origin (proxy forwards it; server allow-lists it)
       AUTH_COOKIE_SECURE: "false"          # http://localhost dev
       LOG_LEVEL: info
@@ -53,7 +85,12 @@ services:
       - server_data:/data                  # telemetry.db lives here
     ports:
       # Host port the on-host Vite dev server proxies to (3000 is held by other host containers → map to 3007).
-      - "3007:3000"
+      # BOUND TO 127.0.0.1 (audit §4.1): anon mode means no login, and the only consumer is the Vite proxy
+      # on this machine, so nothing on the Wi-Fi has any business reaching it. Dropping the "127.0.0.1:"
+      # here re-opens a named child's live position to every device on the subnet — the runbook has you
+      # disable Wi-Fi client isolation for the wearable, so "the LAN" includes guest phones.
+      # Point Vite at http://127.0.0.1:3007 (not localhost — this is an IPv4-only bind).
+      - "127.0.0.1:3007:3000"
     depends_on:
       - mosquitto
 

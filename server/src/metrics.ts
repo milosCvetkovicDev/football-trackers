@@ -264,13 +264,13 @@ export const metrics = {
   rosterRequests: registry.register(
     new Counter(
       'ft_roster_requests_total',
-      'GET /sessions/:id/roster requests by result (ok|rate_limited|unauthorized|forbidden|bad_session|forbidden_origin)',
+      'GET /sessions/:id/roster requests by result (ok|rate_limited|unauthorized|login_required|forbidden|bad_session|forbidden_origin)',
     ),
   ),
   historyRequests: registry.register(
     new Counter(
       'ft_history_requests_total',
-      'GET /sessions/:id/history requests by result (ok|rate_limited|busy|unauthorized|forbidden|bad_session|bad_params|forbidden_origin|internal)',
+      'GET /sessions/:id/history requests by result (ok|rate_limited|busy|unauthorized|login_required|forbidden|bad_session|bad_params|forbidden_origin|internal)',
     ),
   ),
   historyReadSeconds: registry.register(
@@ -298,7 +298,7 @@ export const metrics = {
   eventsRequests: registry.register(
     new Counter(
       'ft_events_requests_total',
-      'GET /sessions/:id/events requests by result (ok|rate_limited|busy|unauthorized|forbidden|bad_session|bad_params|forbidden_origin|internal)',
+      'GET /sessions/:id/events requests by result (ok|rate_limited|busy|unauthorized|login_required|forbidden|bad_session|bad_params|forbidden_origin|internal)',
     ),
   ),
   eventsReadSeconds: registry.register(

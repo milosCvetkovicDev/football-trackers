@@ -19,10 +19,18 @@ import { apiUrl } from './config';
  *   (b) it aborts the in-flight fetch and sets a `disposed` flag on cleanup so a late resolve from the
  *       old session is a no-op — the same defensive pattern as `useLiveTelemetry`.
  *
+ * Stale-PRINCIPAL guard (Phase 2, audit §4.1 — must never keep showing names to someone who just
+ * stopped being entitled to them): the effect also depends on `identity`. Names now require a real
+ * login, and on the isolated-LAN anon stack signing out does NOT unmount this component (the shell
+ * stays mounted, the principal just becomes anonymous) — so keying only on sessionId left the previous
+ * coach's roster rendered on the pitch until a page reload. Observed in the browser, not theorised.
+ *
  * @param sessionId  the match session whose roster to fetch. Falsy → empty map, no fetch (idle).
+ * @param identity   who is asking — any value that changes when the principal does (username, or a
+ *                   sentinel for anonymous). Changing it re-runs the fetch and clears the old names.
  * @returns          a playerId → displayName Map (empty when there's no roster / on any failure).
  */
-export function useRoster(sessionId: string): Map<string, string> {
+export function useRoster(sessionId: string, identity: string): Map<string, string> {
   const [roster, setRoster] = useState<Map<string, string>>(new Map());
 
   useEffect(() => {
@@ -71,7 +79,7 @@ export function useRoster(sessionId: string): Map<string, string> {
       disposed = true;
       controller.abort();
     };
-  }, [sessionId]);
+  }, [sessionId, identity]);
 
   return roster;
 }

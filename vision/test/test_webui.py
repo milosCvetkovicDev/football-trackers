@@ -43,6 +43,31 @@ def test_gate_refuses_unknown_attest_kind():
     b = dict(GOOD); b["attest_kind"] = "whatever"
     assert validate_job_request(b)[0] is False
 
+
+# ---- ADR-0023 §2: no youth footage in ANY phase (audit §4.3) -------------------------------
+# The UI used to offer "youth, I have parental consent" as a second attestation kind, and the value was a
+# pure ledger string with no downstream effect — every stage behaved identically, and no consent evidence,
+# controller, lawful basis or retention date was ever captured. These three tests are what stops it coming
+# back: the vocabulary is pinned to a single value, the retired identifier is refused by name, and the
+# refusal has to SAY what the rule is (a caller that gets "unknown kind" retries; one that is told youth
+# footage is not processed does not).
+def test_attest_vocabulary_is_public_adult_only():
+    assert runner.ATTEST_KINDS == {"public_adult"}
+
+def test_gate_refuses_the_retired_youth_kind_by_name():
+    b = dict(GOOD); b["attest_kind"] = "consented" + "_youth"  # split so the ADR-0023 grep guard stays clean
+    ok, err = validate_job_request(b)
+    assert ok is False
+    assert "dec" in err.lower(), f"the refusal must name the youth rule, got: {err}"
+
+def test_youth_refusal_survives_every_other_field_being_valid():
+    # The gate is order-dependent: attest_kind is checked before url/level/seconds. A future reorder that
+    # let a youth request through on the strength of a valid URL would be invisible without this.
+    b = dict(GOOD); b["attest_kind"] = "consented" + "_youth"
+    b["url"] = "https://www.youtube.com/watch?v=validlink"
+    b["level"] = "v1"; b["seconds"] = 30; b["attest"] = True
+    assert validate_job_request(b)[0] is False
+
 def test_gate_refuses_bad_url_even_when_attested():
     b = dict(GOOD); b["url"] = "https://vimeo.com/1"
     ok, err = validate_job_request(b)

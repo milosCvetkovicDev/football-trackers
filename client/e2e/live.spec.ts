@@ -8,16 +8,18 @@
  * session via ANON_SESSIONS. No token, no cross-origin WS. The tests below need no code change for
  * that — the proxy is transparent to the page.
  *
- * ┌─ PHASE 3 (this file's additions) ──────────────────────────────────────────────┐
- * │ The standalone stack now ALWAYS provisions a throwaway roster (simulate.ts §7):  │
- * │ each sim player id "01".."NN" maps to a DEV display name "Player 01".."Player NN" │
- * │ in a temp AUTH_ROSTER_FILE the spawned server reads — so the live view renders    │
- * │ NAMES, not bare ids (these are dev fixtures, NOT real children — §0.1 untouched). │
- * │ The new cases assert: (a) the A11yMirror shows a name not the id; (b) the         │
- * │ device-health columns POPULATE (battery/signal cells leave "—") once a status     │
- * │ frame arrives (the sim publishes .../status ~every 5 s); (c) AFTER names render,   │
- * │ neither localStorage nor sessionStorage holds any roster-name value — making the   │
- * │ "names are never persisted" invariant observable, not just declared.              │
+ * ┌─ PHASE 3 NAMES, AS PHASE 2 LEFT THEM (audit §4.1) ─────────────────────────────┐
+ * │ Both stacks provision the same throwaway roster ("01".."NN" → "Player 01".."NN", │
+ * │ dev fixtures, NOT real children). What differs is who may read it: the anonymous  │
+ * │ principal now gets 403 login_required from /sessions/:id/roster, because anon      │
+ * │ mode exists so the LIVE PITCH needs no login — not so names are handed out.       │
+ * │ So the two halves are asserted on opposite stacks, and each is a real probe        │
+ * │ because the names exist server-side in both:                                      │
+ * │   - ANON stack: ids only, and the roster fetch is refused (this file, top).        │
+ * │   - AUTH stack: a signed-in coach sees NAMES, and neither localStorage nor         │
+ * │     sessionStorage holds any of them (this file, bottom).                          │
+ * │ Also here: the device-health columns POPULATE (battery/signal cells leave "—")     │
+ * │ once a status frame arrives — the sim publishes .../status ~every 5 s.             │
  * └──────────────────────────────────────────────────────────────────────────────┘
  *
  * ┌─ WHAT THE INTEGRATOR MUST WIRE FOR THIS TO GO GREEN ───────────────────────────┐
@@ -96,19 +98,66 @@ test.describe('coach live view — smoke + a11y (anonymous simulator stack)', ()
     await expect(playerRows(page).filter({ hasText: /\b0?1\b/ }).first()).toBeVisible();
   });
 
-  // ── Phase 3 (ADR-0016): the standalone stack now provisions a roster, so the mirror renders NAMES.
-  test('the mirror shows player NAMES (ADR-0016), not bare ids', async ({ page }) => {
-    // Wait for the feed to go live and at least one row to appear (the name join is render-only:
-    // displayName ?? playerId — A11yMirror.tsx — so a populated roster turns "01" into "Player 01").
+  // ── Phase 2 / audit §4.1: this stack is ANONYMOUS, and anon is now the live pitch and nothing else.
+  // The stack still provisions a roster (simulate.ts §7 maps "01".."NN" → "Player 01".."Player NN"), so
+  // this is a real negative: the names EXIST server-side and the anon principal still must not get them.
+  // The name-rendering path itself moved to the authenticated stack at the bottom of this file.
+  test('the anon live view shows IDS ONLY — names need a real login (§4.1)', async ({ page }) => {
     const liveRegion = page.locator('[aria-live="polite"], [role="status"]').first();
     await expect(liveRegion).toContainText(/live/i, { timeout: 20_000 });
     await expect
       .poll(async () => playerRows(page).count(), { timeout: 20_000, intervals: [500] })
       .toBeGreaterThanOrEqual(1);
 
-    // The sim maps id "01".."NN" → "Player 01".."Player NN" (simulate.ts §7). At least one dev name
-    // must show in the mirror — proving the roster fetch + render-only join landed (NOT just the id).
-    await expect(page.getByText(/Player 0\d/).first()).toBeVisible({ timeout: 20_000 });
+    // The roster fetch is refused for the anon principal, and useRoster degrades to ids-only rather
+    // than surfacing an error (names are an ENHANCEMENT, not a gate — useRoster.ts).
+    const refused = await page.evaluate(async (session) => {
+      const res = await fetch(`/sessions/${session}/roster`, { credentials: 'same-origin' });
+      return { status: res.status, body: await res.text() };
+    }, SESSION);
+    expect(refused.status).toBe(403);
+    expect(refused.body).toContain('login_required');
+
+    // And nothing on the page renders a name. Rows are present (asserted above), so this is not vacuous:
+    // the mirror is showing the pseudonymous id it falls back to.
+    await expect(page.getByText(/Player \d\d/)).toHaveCount(0);
+    await expect(playerRows(page).filter({ hasText: /\b0?1\b/ }).first()).toBeVisible();
+  });
+
+  // ── Phase 2 (§4.1): the sign-in ⇄ sign-out ROUND TRIP, which only this stack can drive.
+  //
+  // Found in the browser, not in review. useRoster keyed its effect on sessionId alone. Here — and only
+  // here — signing out does NOT unmount the shell: the principal merely drops back to anonymous while
+  // the session stays the same, so the effect never re-ran and the previous coach's names stayed painted
+  // over a live feed until someone reloaded. Client-side cache quietly undoing the server's authz. On the
+  // auth-ON stack this is invisible, because sign-out swaps in <Login> and unmounts everything anyway.
+  //
+  // It also pins the other half of the fix: currentPrincipal used to return the anon principal BEFORE
+  // reading the cookie, so on this stack logging in did nothing at all.
+  test('sign in ⇄ sign out round trip: names appear, then leave with the principal (§4.1)', async ({ page }) => {
+    const liveRegion = page.locator('[aria-live="polite"], [role="status"]').first();
+    await expect(liveRegion).toContainText(/live/i, { timeout: 20_000 });
+    await expect(page.getByText(/Player \d\d/)).toHaveCount(0); // anon: ids only
+
+    // The anon shell offers a login rather than requiring one (App.tsx) — that button is the only route
+    // to names here, and simulate.ts provisions the coach account in this posture too.
+    await page.getByRole('button', { name: /sign in for names/i }).click();
+    await page.getByLabel(/username/i).fill('coach');
+    await page.getByLabel(/password/i).fill('sim-coach-pw');
+    await page.getByRole('button', { name: /^sign in$/i }).click();
+
+    // Signed in: names render and Review becomes available.
+    await expect(page.getByText(/Player \d\d/).first()).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByRole('button', { name: /^review$/i })).toBeVisible();
+
+    await page.getByRole('button', { name: /sign out/i }).click();
+
+    // Back to the anonymous live pitch — NOT stranded on a login form — with the names gone and the
+    // Review toggle withdrawn. THIS is the assertion the stale-roster bug failed.
+    await expect(page.getByRole('button', { name: /sign in for names/i })).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByText(/Player \d\d/)).toHaveCount(0);
+    await expect(page.getByRole('button', { name: /^review$/i })).toHaveCount(0);
+    await expect(liveRegion).toContainText(/live|connected/i);
   });
 
   // ── Phase 3 (§2): the second /live envelope ({event:'status'}) populates the device-health columns.
@@ -181,35 +230,6 @@ test.describe('coach live view — smoke + a11y (anonymous simulator stack)', ()
       .toBe(true);
   });
 
-  // ── Phase 3 (§0.1): names render, but are NEVER persisted (localStorage/sessionStorage scrape).
-  test('rendered names are NEVER persisted to local/session storage (§0.1)', async ({ page }) => {
-    const liveRegion = page.locator('[aria-live="polite"], [role="status"]').first();
-    await expect(liveRegion).toContainText(/live/i, { timeout: 20_000 });
-
-    // First PROVE a name actually rendered — otherwise the scrape below would pass vacuously (no name
-    // could leak if no name was ever resolved). The roster fetch + render-only join must have happened.
-    await expect(page.getByText(/Player 0\d/).first()).toBeVisible({ timeout: 20_000 });
-
-    // Now scrape EVERY localStorage + sessionStorage value the page holds and assert no roster-name
-    // value is in any of it. useRoster keeps the map in memory (useState) ONLY — §1.5/ADR-0016 — so a
-    // "Player 0…" substring anywhere in client persistence is a leak of a child-name surface.
-    const persisted = await page.evaluate(() => {
-      const dump = (s: Storage) => {
-        const out: Record<string, string> = {};
-        for (let i = 0; i < s.length; i++) {
-          const k = s.key(i);
-          if (k !== null) out[k] = s.getItem(k) ?? '';
-        }
-        return out;
-      };
-      return JSON.stringify({ l: dump(localStorage), s: dump(sessionStorage) });
-    });
-    // The dev fixture names all share the "Player 0" prefix (Player 01..09) and "Player 1" (10..12);
-    // the canonical leak probe in the contract is the "Player 0" substring — assert it's absent. Also
-    // assert the broader "Player " prefix is absent so a two-digit name (Player 10+) can't slip through.
-    expect(persisted).not.toContain('Player 0');
-    expect(persisted).not.toContain('Player 1');
-  });
 });
 
 test.describe('explicit failure state — auth-on server, no session/login', () => {
@@ -250,4 +270,44 @@ test.describe('explicit failure state — auth-on server, no session/login', () 
     await expect(page.getByText(/^connecting/i)).toHaveCount(0);
     await expect(page.locator('canvas')).toHaveCount(0);
   });
+
+  // ── Phase 3 (ADR-0016) + Phase 2 (§4.1): names render for a REAL login — and are never persisted.
+  // This pair used to run on the anonymous stack. It moved here because anon no longer receives names
+  // at all, which would have made the storage scrape vacuous: nothing can leak if nothing resolved.
+  test('a signed-in coach sees NAMES, and they are NEVER persisted to storage (§0.1)', async ({ page }) => {
+    test.skip(!stack, 'auth stack not started');
+    await page.goto(stack!.baseURL);
+
+    // Real login through the real form — this is the only way to a name now.
+    await page.getByLabel(/username/i).fill(stack!.creds.username);
+    await page.getByLabel(/password/i).fill(stack!.creds.password);
+    await page.getByRole('button', { name: /sign in/i }).click();
+
+    const liveRegion = page.locator('[aria-live="polite"], [role="status"]').first();
+    await expect(liveRegion).toContainText(/live/i, { timeout: 30_000 });
+
+    // PROVE a name actually rendered before scraping — the roster fetch + the render-only join
+    // (displayName ?? playerId — A11yMirror.tsx) must both have happened, or the scrape proves nothing.
+    await expect(page.getByText(/Player \d\d/).first()).toBeVisible({ timeout: 30_000 });
+
+    // Scrape EVERY localStorage + sessionStorage value and assert no roster-name value is in any of it.
+    // useRoster keeps the map in component memory (useState) ONLY — §1.5/ADR-0016 — so a "Player 0…"
+    // substring anywhere in client persistence is a leak of a child-name surface.
+    const persisted = await page.evaluate(() => {
+      const dump = (s: Storage) => {
+        const out: Record<string, string> = {};
+        for (let i = 0; i < s.length; i++) {
+          const k = s.key(i);
+          if (k !== null) out[k] = s.getItem(k) ?? '';
+        }
+        return out;
+      };
+      return JSON.stringify({ l: dump(localStorage), s: dump(sessionStorage) });
+    });
+    // Dev fixture names are "Player 01".."Player 12": check both the "Player 0" prefix (01..09) and
+    // "Player 1" (10..12) so a two-digit name can't slip through the probe.
+    expect(persisted).not.toContain('Player 0');
+    expect(persisted).not.toContain('Player 1');
+  });
+
 });

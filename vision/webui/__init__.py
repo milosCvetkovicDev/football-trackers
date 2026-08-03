@@ -4,7 +4,9 @@ Runs INSIDE the cpu-run / gpu Docker image (which ship yt-dlp + the footballcv s
 never on the host. It shells out (yt-dlp, then `python -m footballcv.pipeline`) — it does
 NOT import torch/ultralytics itself, so it stays importable in the light CPU test image.
 
-PRIVACY GATE (ADR-0023 §3/§14): processing is refused unless the caller attests the footage
-is PUBLIC adult/pro — OR youth footage with parental consent. The attestation is enforced
-server-side (not just in the browser) and written to a local ledger.
+PRIVACY GATE (ADR-0023 §2/§3/§14): processing is refused unless the caller attests the footage is
+PUBLIC adult/pro. That is the ONLY accepted kind — youth footage is not processed in any phase, with
+or without a claim of parental consent, because ADR-0023 defers that to a future ADR requiring a DPIA,
+verified consent and a documented lawful basis. The attestation is enforced server-side (not just in
+the browser) and written to a local ledger.
 """

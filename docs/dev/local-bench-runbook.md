@@ -23,14 +23,31 @@ ESP32+M8N               docker compose:  mosquitto (1883)  ->  Bun server (3000,
 - **PlatformIO** to flash firmware: `brew install platformio` (`pio --version`).
 
 ## 1. Start the backend (Docker Compose)
+
+**First, provision the broker accounts (once).** The dev broker is **authenticated** — the same config
+and per-device ACLs as the field broker ([ADR-0007](../decisions/0007-mqtt-security.md)). It used to be
+anonymous, which meant any host on the Wi-Fi could subscribe to every child's 10 Hz feed, or publish
+forged telemetry the server accepted, server-stamped and persisted as authoritative (audit §4.6, proven
+live). `ft.passwd` is a secret, so it is gitignored and you generate it locally:
+```sh
+./server/mosquitto/dev-provision.sh 01        # server account + wearable "01"; add more ids as needed
+```
+It prints each wearable's password **once** — that is the value you put into the device over serial
+(§3), so copy it now. It also writes the repo-root `.env` that compose reads for the server's `ingest`
+credentials.
+
 ```sh
 docker compose up -d            # broker + server (first run installs server deps in the container)
 docker compose ps               # both Up?
 docker compose logs -f server   # expect "http listening" + "mqtt connected"
 ```
-Smoke-test the broker → server path without hardware (anonymous broker, so no creds needed):
+> `MQTT_PASSWORD is not set` from compose means the provisioning step above hasn't run. That is on
+> purpose — the alternative used to be a broker that accepted anybody.
+
+Smoke-test the broker → server path without hardware. Publishing now needs credentials — use a
+wearable account from the provisioning step (its ACL allows exactly its own player topic):
 ```sh
-mosquitto_pub -h 127.0.0.1 -p 1883 \
+mosquitto_pub -h 127.0.0.1 -p 1883 -u 01 -P '<player 01 password>' \
   -t 'football-trackers/session/test/player/01/telemetry' \
   -m '{"id":"trk-01","pl":"01","ts":1,"lat":44.8125,"lon":20.4612,"spd":3.2,"hdg":90,"fix":3,"sats":11,"pdop":1.2}'
 # the server's /metrics (loopback inside the container) should show received + published rise:
@@ -85,7 +102,7 @@ pio device monitor -d firmware     # 115200 baud
 enroll> set ssid <your 2.4 GHz SSID>
 enroll> set wifipass <its password>
 enroll> set player 01                 # == MQTT username; matches SESSION_ID "test" topic
-enroll> set mqttpass anything         # the local broker is anonymous, so any non-empty value works
+enroll> set mqttpass <player 01 password>   # the password dev-provision.sh printed for THIS id in §1
 enroll> save                          # writes NVS + reboots
 ```
 After reboot you should see `[gps] configured @10Hz UBX-PVT` (GPS wiring OK) and **no** `[mqtt] connect failed`
@@ -93,11 +110,24 @@ once it reaches the broker.
 
 ## 5. Start the coach view (Vite **on the host**)
 ```sh
-cd client && VITE_PROXY_TARGET=http://localhost:3007 bun run dev    # -> http://localhost:5173
+cd client && VITE_PROXY_TARGET=http://127.0.0.1:3007 bun run dev    # -> http://localhost:5173
 ```
 Open `http://localhost:5173`. **Do not** run Vite inside the Docker stack for this — its `/live` WebSocket proxy
 does not relay the upgrade from a container (the browser hangs at "connecting" while the server logs `ws open`).
 On the host it works. The server is published on `3007` precisely so the host Vite can proxy to it.
+
+`127.0.0.1:3007`, not `localhost:3007`: the server's port is published on the **IPv4 loopback only**
+(audit §4.1 — this stack needs no login for the live view, so it must not be reachable from the Wi-Fi),
+and `localhost` can resolve to `::1` first. Two consequences worth knowing before they confuse you:
+- The coach view is **this Mac only**. A second tablet on the Wi-Fi cannot open it any more. That is the
+  point; if you need one on the pitch, that is the Caddy + real-auth deployment, not this stack.
+- **Names and Review need a real login.** The anonymous bypass is now scoped to the live pitch: with no
+  account you get moving dots labelled by pseudonymous id, no Review toggle, and `/roster` + `/history`
+  answer 403 `login_required`. Provision a coach to see names:
+  ```sh
+  cd server && AUTH_ACCOUNTS_FILE=./auth-accounts.json bun run auth-user.ts add coach --role coach --sessions test
+  ```
+  (both files are gitignored; the server picks them up on its reload timer).
 
 ## 6. Verify end to end
 - **Connected, but "waiting for players" (indoors):** correct and expected. The device is connected and sending
@@ -105,9 +135,12 @@ On the host it works. The server is published on `3007` precisely so the host Vi
   dropped (`ft_telemetry_dropped_total{reason="no_fix"}` climbs) — the system refuses to draw a fake position.
 - **Prove the view renders** without going outside — publish a synthetic `fix=3` packet and watch a dot appear:
   ```sh
-  mosquitto_pub -h 127.0.0.1 -p 1883 -t 'football-trackers/session/test/player/01/telemetry' \
+  mosquitto_pub -h 127.0.0.1 -p 1883 -u 01 -P '<player 01 password>' \
+    -t 'football-trackers/session/test/player/01/telemetry' \
     -m '{"id":"trk-01","pl":"01","ts":1,"lat":44.8125,"lon":20.4612,"spd":3.2,"hdg":90,"fix":3,"sats":11,"pdop":1.2}'
   ```
+  A dot appears for ~10 s and then drops (the view refuses to show a fix older than that), so loop the publish
+  if you want to watch it for longer.
 - **Real moving dot:** take the laptop + device **outside** (or to a window) with sky view; ~30–60 s for the first
   cold fix; the dot then tracks the real position. Out of Wi-Fi range, the device buffers fixes to LittleFS and
   replays them on reconnect (no data lost).
@@ -125,9 +158,14 @@ On the host it works. The server is published on `3007` precisely so the host Vi
 | Coach view stuck at "connecting"; server logs `ws open` | Vite WS proxy in Docker doesn't relay the `/live` upgrade | Run Vite **on the host** (§5), server published on 3007 |
 | `Bind for 0.0.0.0:3000 failed: port is already allocated` | Another host service holds 3000 (e.g. other Docker stacks) | The server is intentionally published on **3007**, not 3000 — leave it |
 | `ft_device_battery_percent 0` / `battery_volts ~0` | No LiPo connected (running on USB) | Expected on the bench; the battery is a later step (verify polarity first) |
+| Compose exits: `MQTT_PASSWORD is not set` | The broker accounts were never created | Run `./server/mosquitto/dev-provision.sh 01` (§1) — it writes `.env` and `ft.passwd` |
+| Server logs `mqtt error` in a loop; `/health` shows `"mqtt":false` | The server's broker password doesn't match `ft.passwd` — usually after re-running provisioning followed by `docker compose restart`, which does **not** re-read `.env` | `docker compose up -d` (recreates the container with the new env) |
+| `mosquitto_pub` → `Connection Refused: not authorised` | The dev broker is authenticated now | Pass `-u <playerId> -P <password>` from §1; the ACL allows only that player's own topic |
+| Coach view unreachable from another device on the Wi-Fi | Deliberate: the server is published on `127.0.0.1` only, because this stack needs no login | This-machine-only is the posture; a pitch-side tablet is the Caddy + real-auth deployment |
+| Live view shows ids (`01`) instead of names; no Review toggle | You are the anonymous principal — names + Review need a real login | Click **Sign in for names & review** and log in with a coach account (§5) |
 
 ## Related
 - [`firmware/README.md`](../../firmware/README.md) — wiring, enrollment console, credential rotation.
-- [`docker-compose.yml`](../../docker-compose.yml), [`deploy/mosquitto/`](../../deploy/) — the stack.
+- [`docker-compose.yml`](../../docker-compose.yml), [`server/mosquitto/`](../../server/mosquitto/README.md) — the stack + its broker auth.
 - [observability](../architecture/observability.md) — the `ft_*` metrics referenced above.
 - [hardware BOM](../architecture/hardware-bom.md) — parts, the LiPo polarity warning, the vest.

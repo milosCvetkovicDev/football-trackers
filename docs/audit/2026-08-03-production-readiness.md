@@ -487,6 +487,37 @@ phase closes (maker ≠ checker). Out-of-scope discoveries go to a triage list, 
 
 **Accept:** `lsof` shows no non-loopback listener on 3007 · anonymous `mosquitto_sub` refused · `! grep -r consented_youth`.
 
+> **✅ DONE 2026-08-03.** All four items, including #4 (the "consider" one — the user chose to gate them).
+> Acceptance, all by execution against the running stack: `curl http://<LAN-IP>:3007/...` → connection refused,
+> `lsof` shows `127.0.0.1:3007` only · anonymous `mosquitto_sub -t 'football-trackers/#'` → `Connection Refused:
+> not authorised`, from both loopback and the LAN address · the `consented_youth` grep is clean · anon `/roster`,
+> `/history`, `/events` → 403 `login_required` while `/live` still opens. Gates: **23** server suites (2 new:
+> `anon-scope.ts`, `deploy-posture.ts`), **21** Playwright specs, 104 vision tests, client typecheck/lint/units.
+>
+> Four defects in this phase's own work, each found by running it rather than reading it:
+> - **The gate made names unreachable for everyone.** `currentPrincipal` returned the anon principal *before*
+>   parsing the cookie (this document says so at §4.1), so a coach who logged in was silently downgraded to the
+>   shared anon identity — and could never reach the endpoints the login was for. Cookie first, anon as fallback;
+>   audit lines now name the coach instead of `username: null`.
+> - **Signing out left the names on screen.** `useRoster` keyed its effect on `sessionId` alone, and on the anon
+>   stack sign-out does not unmount the shell — so the previous coach's roster stayed painted over a live feed
+>   until a page reload. Client cache quietly undoing the server's authz. Caught in the browser; the e2e that
+>   pins it fails with 12 stale names against the old code.
+> - **No way to log in at all** on the anon stack: `/auth/me` answers 200-anonymous, so the app never showed a
+>   login form. Added a "Sign in for names & review" affordance, and `simulate.ts` now provisions the coach
+>   account in both postures.
+> - **`docker compose restart` does not re-read `.env`**, so rotating broker credentials left the server
+>   authenticating with the old password — which presents as a broker fault. Documented in three places.
+>
+> Also closed, beyond the letter of the scope: `deploy/mosquitto/mosquitto.conf` (the anonymous config that
+> caused §4.6) is **deleted** rather than left one copy-paste from being remounted, and `deploy-posture.ts` —
+> in the unfiltered `repo-guard` workflow, because a revert edits root-level files no path filter covers —
+> statically pins the loopback publish, the authenticated mount, the required credentials and the absolute
+> broker paths. All five of its checks were mutation-tested: each caught, guard green again after restore.
+>
+> **Known consequence, stated plainly:** the bench coach view is now this-machine-only. A second tablet on the
+> Wi-Fi cannot reach it — that is the point, and a pitch-side tablet is the Caddy + real-auth deployment.
+
 ### Phase 2b — Repair erasure *(GDPR-load-bearing; do not defer)*
 1. `journal_size_limit = 0` + `wal_checkpoint(TRUNCATE)` after purge.
 2. Permissive read-modify-write in `purgeRosterPlayer`; throw on unreadable file.

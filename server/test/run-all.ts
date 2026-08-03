@@ -48,6 +48,7 @@ const DRAIN_GRACE_MS = 5_000;
 const SUITES: Array<[file: string, proves: string]> = [
   // --- no broker, no ports: fail here in seconds rather than after ten stack spin-ups ---
   ['gitignore-guard.ts', 'no personal data or secret can enter git'],
+  ['deploy-posture.ts', 'the dev stack stays loopback-published with an authenticated broker'],
   ['auth-loader.ts', 'account file parsing + fail-closed posture'],
   ['roster-loader.ts', 'roster parsing; names never leave the loader'],
   ['session-config-loader.ts', 'session config parsing + reload'],
@@ -62,6 +63,7 @@ const SUITES: Array<[file: string, proves: string]> = [
   // --- spawn mosquitto + the real server ---
   ['e2e.ts', 'MQTT -> ingest -> WS fan-out -> sqlite, and /metrics'],
   ['ws-origin.ts', 'the /live Origin allow-list'],
+  ['anon-scope.ts', 'anon mode binds loopback and is live-pitch-only (no names, no bulk history)'],
   ['auth-e2e.ts', 'login, cookies, CSRF, session scoping'],
   ['auth-dos.ts', 'rate buckets, soft-lock, concurrent-hash cap'],
   ['roster-e2e.ts', 'GET /sessions/:id/roster is authenticated + session-scoped'],

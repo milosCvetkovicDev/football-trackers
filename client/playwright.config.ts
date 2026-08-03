@@ -136,7 +136,11 @@ export default defineConfig({
         // Same-origin model: the browser hits the Vite origin and Vite's dev proxy forwards /live +
         // /auth + /sessions to the server. VITE_PROXY_TARGET is the proxy upstream (NOT a client var —
         // the app never sees it). No VITE_WS_URL / VITE_SESSION_ID / VITE_LIVE_TOKEN any more.
-        VITE_PROXY_TARGET: `http://localhost:${SERVER_PORT}`,
+        // 127.0.0.1, NOT localhost: the standalone stack runs in anon mode, and anon mode now defaults
+        // the server's bind to the IPv4 loopback (audit §4.1). `localhost` can resolve to ::1 first, and
+        // the proxy would then fail to connect to a server that is demonstrably up — which surfaces as a
+        // blank feed rather than a connection error.
+        VITE_PROXY_TARGET: `http://127.0.0.1:${SERVER_PORT}`,
         // Prefill for the admin-wildcard session picker only; coaches/anon get their sessions from
         // the principal / ANON_SESSIONS. Kept aligned with the session the standalone stack streams.
         VITE_DEFAULT_SESSION: SESSION,

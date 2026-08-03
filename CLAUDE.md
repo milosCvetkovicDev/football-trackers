@@ -27,7 +27,7 @@ Server (from `server/`):
 bun install
 bun start          # run; bun --watch for dev (bun run dev)
 bun run typecheck  # bunx tsc --noEmit (Bun does not typecheck at runtime)
-bun run test       # THE GATE: all 21 suites, sequential, ~20 s (test/run-all.ts)
+bun run test       # THE GATE: all 23 suites, sequential, ~20 s (test/run-all.ts)
 bun run test:e2e   # one suite; every suite also has its own test:* script
 bun run test/mosquitto-pub-demo.ts   # the README's literal mosquitto_pub -> WS path
 ```
@@ -47,14 +47,18 @@ bun run lint       # eslint .
 bun run test       # unit suites (homography, interpolate, ws/validate, zones)
 bun run e2e        # Playwright, driven by the hardware-free simulator
 ```
-The e2e gate binds **twelve** ports across three stacks: the shared happy-path one
-(:3000/:9464/:1884/:5173) plus two dedicated stacks spun up inside specs — auth
-(:3201/:9466/:1885/:5273) and the 50-player frame-budget run (:3210/:9474/:1894/:5283).
+The e2e gate binds **sixteen** ports across four stacks: the shared happy-path one
+(:3000/:9464/:1884/:5173) plus three dedicated stacks spun up inside specs — auth
+(:3201/:9466/:1885/:5273), review (:3202/:9476/:1896/:5274) and the 50-player frame-budget run
+(:3210/:9474/:1894/:5283).
 Only the happy-path four are env-overridable, which is enough in practice because :3000 is the
 one that collides. If something else holds it, move the block rather than shutting that down:
 `PW_SERVER_PORT=3300 PW_HEALTH_PORT=9564 PW_BROKER_PORT=1984 PW_VITE_PORT=5373 bun run e2e`
 — see [client/e2e/ports.ts](client/e2e/ports.ts), the single source both the config and the
-specs read (the other eight are hardcoded in `e2e/fixtures.ts`).
+specs read (the other twelve are hardcoded in `e2e/fixtures.ts` and the review spec).
+Review needs its own **auth-ON** stack because Phase 2 scoped the anonymous principal to the live
+pitch: `/roster`, `/history` and `/events` answer 403 without a real login, so the review specs
+sign in.
 
 Firmware (from `firmware/`):
 ```
@@ -70,9 +74,19 @@ console, so one image flashes to every device ([ADR-0014](docs/decisions/0014-fi
 Local dev stack (Docker Compose) — broker + server with one command; the coach view (Vite) runs on the **host**
 (its `/live` WS proxy doesn't relay the upgrade from inside a container):
 ```
-docker compose up -d            # mosquitto (1883) + server (published on 3007)
-cd client && VITE_PROXY_TARGET=http://localhost:3007 bun run dev   # http://localhost:5173
+./server/mosquitto/dev-provision.sh 01   # ONCE: broker accounts + .env (ft.passwd is gitignored)
+docker compose up -d                     # mosquitto (1883, authenticated) + server (127.0.0.1:3007)
+cd client && VITE_PROXY_TARGET=http://127.0.0.1:3007 bun run dev   # http://localhost:5173
 ```
+The broker mounts `server/mosquitto/` — the **same authenticated config + per-device ACLs as the field
+broker**, not an anonymous dev one — so `docker compose up` fails loudly until provisioning has run, and every
+bench run exercises the real auth path. The server's port is published on **127.0.0.1 only** (the stack needs
+no login for the live view, so it must not be LAN-reachable — hence `127.0.0.1`, not `localhost`, in the proxy
+target: the bind is IPv4-only). Re-running provisioning rotates the credentials, so follow it with
+`docker compose up -d` — `restart` does **not** re-read `.env`.
+Names and Review need a real login even here (`/roster`, `/history`, `/events` → 403 `login_required`); the
+anon view offers a "Sign in for names & review" button. Provision a coach with
+`cd server && AUTH_ACCOUNTS_FILE=./auth-accounts.json bun run auth-user.ts add coach --role coach --sessions test`.
 A real wearable connects to this Mac's **Wi-Fi** IP on 1883 (set firmware `MQTT_HOST` to it); device + Mac must be
 on the same Wi-Fi (a wired dock Ethernet was found isolated from the Wi-Fi). Full runbook +
 troubleshooting: [docs/dev/local-bench-runbook.md](docs/dev/local-bench-runbook.md)

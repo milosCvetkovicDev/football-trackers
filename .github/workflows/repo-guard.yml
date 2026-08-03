@@ -6,8 +6,12 @@
 # none of those paths, so no workflow would have run and the leak would have sailed through green.
 #
 # A guard with a path filter is a guard that is absent exactly when the unexpected happens. There is
-# no path filter here and there should never be one. It costs a few seconds: the guard shells out to
-# git and needs no dependency install.
+# no path filter here and there should never be one. It costs a few seconds: the guards shell out to
+# git / read a couple of files, and need no dependency install.
+#
+# The same argument put the deploy-posture guard here: a commit that re-publishes the server on
+# 0.0.0.0 or re-points the broker at an anonymous config edits docker-compose.yml at the repo ROOT,
+# which no path filter in this repo covers.
 name: repo-guard
 
 on:
@@ -41,3 +45,10 @@ jobs:
         # runs against a bare checkout. Fewer moving parts between a leak and the red X.
         working-directory: server
         run: bun run test/gitignore-guard.ts
+
+      - name: The dev stack stays loopback-published with an authenticated broker
+        # Also dependency-free (node:fs + node:path). Runs even when the guard above fails is NOT the
+        # intent — `if: always()` is deliberately omitted: a leak is the more urgent signal and there
+        # is no value in a second red check underneath it.
+        working-directory: server
+        run: bun run test/deploy-posture.ts

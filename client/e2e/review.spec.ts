@@ -1,17 +1,26 @@
 /**
  * review.spec.ts — Phase-3 review/replay e2e gate (ADR-0017 + ADR-0016 names in the aggregate table).
  *
- * SAME-ORIGIN model (ADR-0015): runs against the SHARED ANONYMOUS standalone stack started in
- * playwright.config.ts (the very stack the 'live' project uses) — the browser hits the Vite origin and
- * Vite's dev proxy forwards /sessions/:id/history (cookie-auto-attached) to the server, whose anon
- * principal is scoped to this session via ANON_SESSIONS. We deliberately reuse that stack because the
- * simulator has been streaming + PERSISTING fixes into the server's SQLite for the whole run, so the
- * review query reads real recorded rows for SESSION — no separate fixture seeding needed.
+ * SAME-ORIGIN model (ADR-0015): runs against a DEDICATED AUTH-ON stack (fixtures.ts withAuthStack) —
+ * the browser hits the Vite origin and Vite's dev proxy forwards /sessions/:id/history and /events
+ * (cookie-auto-attached) to the server.
+ *
+ * WHY NOT THE SHARED ANONYMOUS STACK, which this spec used to use: Phase 2 (audit §4.1) scoped the
+ * anonymous principal to the LIVE PITCH. /history is a bulk export of raw child location and /roster
+ * hands out names, so both now answer 403 login_required without a real account — and App.tsx hides
+ * the Review toggle entirely for an anonymous principal, because offering a control that can only
+ * fail reads as a broken app. Review is therefore a signed-in surface, and this spec logs in.
+ *
+ * The stack's attach-mode simulator streams + PERSISTS fixes into its own SQLite for the whole run, so
+ * the review query still reads real recorded rows for SESSION — no separate fixture seeding needed. It
+ * also provisions the same throwaway roster + age band the anonymous standalone writes for itself, so
+ * the ADR-0016 name join and the Phase-4 provenance header have real data behind them.
  *
  * ┌─ WHAT THIS DRIVES ──────────────────────────────────────────────────────────────┐
  * │ App.tsx exposes a Live ⇄ Review toggle (role="group" aria-label="View mode") once │
- * │ a session is selected (the anon principal auto-selects its single ANON_SESSIONS    │
- * │ session, so the toggle is present on load). Clicking "Review" mounts <ReviewView>: │
+ * │ a session is selected (the fixture coach is assigned exactly one session, so it    │
+ * │ auto-selects and the toggle is present after login). Clicking "Review" mounts      │
+ * │ <ReviewView>:                                                                      │
  * │   - a per-player AGGREGATE TABLE (rows: [data-testid="aggregate-row"]) whose Player │
  * │     column is the render-only name join (displayName ?? playerId — §1.5); the sim   │
  * │     roster maps "01".."NN" → "Player 01".."Player NN", so a NAME must show.          │
@@ -27,7 +36,7 @@
  * Browsers: `bunx playwright install chromium` once before running (see playwright.config.ts header).
  */
 import { test, expect, type Locator, type Page } from '@playwright/test';
-import { SESSION } from './fixtures';
+import { SESSION, withAuthStack, type AuthStack } from './fixtures';
 
 /** The Live ⇄ Review toggle group (App.tsx renders role="group" aria-label="View mode"). */
 function viewModeGroup(page: Page): Locator {
@@ -58,16 +67,41 @@ function zoneBreakdown(page: Page): Locator {
   return page.getByRole('img', { name: /zone distance breakdown/i });
 }
 
-test.describe('coach review/replay — aggregate table + heatmap (anonymous simulator stack)', () => {
+test.describe('coach review/replay — aggregate table + heatmap (signed-in coach)', () => {
+  let stack: AuthStack | undefined;
+
+  test.beforeAll(async () => {
+    try {
+      // Dedicated ports so this stack can never collide with the shared happy path (3000/9464/1884/5173),
+      // the auth stack live.spec.ts uses (3201/9466/1885/5273), or the frame-budget one (3210/9474/1894/5283).
+      stack = await withAuthStack({ serverPort: 3202, healthPort: 9476, brokerPort: 1896, vitePort: 5274 });
+    } catch (err) {
+      // mosquitto/bun not available in this sandbox -> skip honestly rather than false-fail.
+      test.skip(true, `auth stack unavailable: ${(err as Error).message}`);
+    }
+  });
+
+  test.afterAll(() => {
+    stack?.stop();
+  });
+
   test.beforeEach(async ({ page }) => {
-    await page.goto('/');
-    // Wait for the live shell to settle (the anon principal auto-selects SESSION, so the View-mode
-    // toggle is present). The header names the live session — a cheap "the app is up" gate.
-    await expect(page.getByText(SESSION, { exact: false }).first()).toBeVisible({ timeout: 20_000 });
+    test.skip(!stack, 'auth stack not started');
+    await page.goto(stack!.baseURL);
+
+    // Review needs a REAL login now (audit §4.1): /history and /roster refuse the anon principal, and
+    // the toggle this whole spec drives is hidden without a named account. Log in through the real form.
+    await page.getByLabel(/username/i).fill(stack!.creds.username);
+    await page.getByLabel(/password/i).fill(stack!.creds.password);
+    await page.getByRole('button', { name: /sign in/i }).click();
+
+    // Wait for the live shell to settle (the fixture coach has exactly one session, so it auto-selects
+    // and the View-mode toggle is present). The header names the live session — a cheap "app is up" gate.
+    await expect(page.getByText(SESSION, { exact: false }).first()).toBeVisible({ timeout: 30_000 });
     // Give the simulator a beat to publish + PERSIST some fixes before we read them back (the review
     // query reads the same SQLite the sim is writing). The live region going "live" proves fixes flow.
     const liveRegion = page.locator('[aria-live="polite"], [role="status"]').first();
-    await expect(liveRegion).toContainText(/live/i, { timeout: 20_000 });
+    await expect(liveRegion).toContainText(/live/i, { timeout: 30_000 });
   });
 
   test('the Live ⇄ Review toggle is present once a session is selected', async ({ page }) => {
@@ -105,8 +139,10 @@ test.describe('coach review/replay — aggregate table + heatmap (anonymous simu
       .poll(async () => aggregateRows(page).count(), { timeout: 30_000, intervals: [1_000] })
       .toBeGreaterThanOrEqual(1);
 
-    // The Player column is the render-only name join (displayName ?? playerId — §1.5). The sim roster
+    // The Player column is the render-only name join (displayName ?? playerId — §1.5). The fixture roster
     // maps id "01".."NN" → "Player 01".."Player NN", so a DEV name must show in a row, not a bare id.
+    // This is now also the positive half of the Phase-2 rule: the SAME roster is invisible to the anon
+    // principal (live.spec.ts asserts the 403), and visible here because this coach signed in.
     await expect(
       aggregateRows(page).filter({ hasText: /Player 0\d/ }).first(),
     ).toBeVisible({ timeout: 30_000 });

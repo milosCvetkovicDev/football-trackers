@@ -141,11 +141,16 @@ export function useAuth(): UseAuth {
       // Best-effort: even if the network call fails, we drop the local principal below so the UI
       // returns to the login gate. (The server token may linger until its TTL, but the client forgets it.)
     }
-    // Flip to anonymous regardless of the server result, and bump the seq so a late /auth/me probe
-    // that was in flight can't resurrect the authed state after we've intentionally signed out.
+    // Bump the seq FIRST so a late /auth/me probe that was already in flight can't resurrect the authed
+    // state after we've intentionally signed out. Then ASK the server what we are now, rather than
+    // asserting 'anonymous': on the isolated-LAN anon stack (ALLOW_ANONYMOUS_LIVE) /auth/me still
+    // answers 200 with the shared anonymous principal, so signing out should drop back to the ids-only
+    // live pitch — asserting 'anonymous' stranded the operator on a login form with no way back to the
+    // feed short of a page reload. probeMe fails closed to 'anonymous' on a 401 or a network error, so
+    // every other deployment behaves exactly as before.
     meSeq.current++;
-    if (mounted.current) setAuth({ status: 'anonymous' });
-  }, [auth]);
+    if (mounted.current) await probeMe();
+  }, [auth, probeMe]);
 
   const refresh = useCallback<UseAuth['refresh']>(async () => {
     // Re-check /auth/me: 200 → authed, 401 → anonymous (cookie expired/revoked mid-session → <Login>).

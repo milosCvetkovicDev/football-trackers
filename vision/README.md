@@ -58,8 +58,13 @@ docker compose up webui            # http://localhost:8077  (CPU; Ctrl-C / `dock
 docker compose --profile gpu up webui-gpu   # the RTX 3060 (fast)
 ```
 Paste a YouTube link, tick the **privacy attestation**, click *Obradi*. **The gate is enforced
-server-side** (`webui/runner.py::validate_job_request`): no job starts without confirming the
-footage is **public adult/pro — OR youth with parental consent**; every attestation is logged to
+server-side** (`webui/runner.py::validate_job_request`): no job starts without confirming the footage
+is **public adult/pro**, which is the only kind accepted — **youth footage is not processed in any
+phase** (ADR-0023 §2), with or without a claim of parental consent. The UI used to offer a
+youth-with-consent option; it was removed because the value had no downstream effect whatsoever and
+captured no consent evidence, controller, lawful basis or retention date, so it could not discharge
+GDPR Art. 7(1) — a checkbox that unlocked processing children's faces and wrote a word in a log
+(audit §4.3). It returns only through the §14 ADR. Every attestation is logged to
 `out/_attestations.jsonl`. Only **v1** (players + teams + annotated video) runs automatically — v2/v3
 need a pitch calibration step. Verified end-to-end on a public CC adult match (real player boxes,
 e.g. `#37 T1`); detection on amateur/wide footage is sparse — the documented "fine-tune for your

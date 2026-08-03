@@ -7,6 +7,12 @@ interface Props {
   login: UseAuth['login'];
   /** High-contrast sunlight palette for pitch-side tablets, matching App's outdoor toggle. */
   theme?: 'normal' | 'outdoor';
+  /**
+   * When present, renders a "Back to the live view" escape hatch. Set ONLY on the isolated-LAN anon
+   * stack, where signing in is optional (it buys names + Review) rather than the way in — without it a
+   * coach who opens the form has no way back to the pitch but a page reload.
+   */
+  onCancel?: () => void;
 }
 
 /**
@@ -20,7 +26,7 @@ interface Props {
  * read it. The submit button is disabled while the request is in flight to prevent a double-submit (which
  * would also trip the server's per-IP throttle).
  */
-export function Login({ login, theme = 'normal' }: Props) {
+export function Login({ login, theme = 'normal', onCancel }: Props) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -159,6 +165,25 @@ export function Login({ login, theme = 'normal' }: Props) {
         >
           {submitting ? 'Signing in…' : 'Sign in'}
         </button>
+
+        {onCancel ? (
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={submitting}
+            style={{
+              cursor: 'pointer',
+              fontSize: 13,
+              padding: '8px 14px',
+              borderRadius: 8,
+              border: `1px solid ${pal.border}`,
+              background: 'transparent',
+              color: pal.muted,
+            }}
+          >
+            Back to the live view
+          </button>
+        ) : null}
       </form>
     </div>
   );

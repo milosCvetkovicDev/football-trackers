@@ -33,6 +33,11 @@ export function App() {
   const { auth, login, logout, refresh } = useAuth();
   const reducedMotion = useReducedMotion();
   const [theme, setTheme] = useState<Theme>('normal');
+  // Anon-stack opt-in login (Phase 2, audit §4.1). On the isolated-LAN stack /auth/me answers 200 with
+  // the anonymous principal, so the gate below never shows <Login> and there would be no way to reach a
+  // named account at all — while names and Review now REQUIRE one. This flag is how the shell asks for
+  // the form; it is irrelevant everywhere else, because a non-anon deployment starts at 'anonymous'.
+  const [wantLogin, setWantLogin] = useState(false);
 
   if (auth.status === 'loading') {
     return (
@@ -46,14 +51,26 @@ export function App() {
     return <Login login={login} theme={theme} />;
   }
 
+  // Signing in is OPTIONAL here (the live pitch already works), so this form gets a way back out.
+  if (auth.principal.anonymous && wantLogin) {
+    return <Login login={login} theme={theme} onCancel={() => setWantLogin(false)} />;
+  }
+
   return (
     <AuthedShell
       principal={auth.principal}
       theme={theme}
       setTheme={setTheme}
       reducedMotion={reducedMotion}
-      logout={logout}
+      // Clear the "show me the form" flag as part of signing out. Without this it survives the whole
+      // session — a coach who signed in via the form and then signed out on the anon stack would land
+      // straight back on the login form instead of the ids-only pitch they asked to return to.
+      logout={async () => {
+        setWantLogin(false);
+        await logout();
+      }}
       refresh={refresh}
+      onRequestLogin={() => setWantLogin(true)}
     />
   );
 }
@@ -65,6 +82,8 @@ interface AuthedShellProps {
   reducedMotion: boolean;
   logout: () => Promise<void>;
   refresh: () => Promise<boolean>;
+  /** Show the login form (anon stack only — signing in there buys names + Review, ADR-0016/0017). */
+  onRequestLogin: () => void;
 }
 
 /**
@@ -89,6 +108,7 @@ function AuthedShell({
   reducedMotion,
   logout,
   refresh,
+  onRequestLogin,
 }: AuthedShellProps) {
   // Initial selection: admins start on the prefill; a single-session coach auto-selects; otherwise the
   // operator must pick (empty until they choose). Memoised on the principal so it's stable per identity.
@@ -111,9 +131,11 @@ function AuthedShell({
   const [mode, setMode] = useState<'live' | 'review'>('live');
 
   // Player names for THIS session (ADR-0016): an authenticated, in-memory-only roster fetched once per
-  // session. The map is the render-only playerId→displayName join passed to the canvas + mirror + review;
-  // it is NEVER written into the pseudonymous telemetry store and NEVER persisted. Empty ⇒ ids-only.
-  const roster = useRoster(session);
+  // (session, identity). The map is the render-only playerId→displayName join passed to the canvas +
+  // mirror + review; it is NEVER written into the pseudonymous telemetry store and NEVER persisted.
+  // Empty ⇒ ids-only. The identity half matters because signing out on the anon stack does not unmount
+  // this shell — without it the previous coach's names stayed on the pitch for the anonymous principal.
+  const roster = useRoster(session, principal.username ?? 'anon');
 
   // Speed-zone thresholds for THIS session (Phase 4, ADR-0019): resolved from GET /sessions/:id/config.
   // Like the roster it's an ENHANCEMENT, never a gate — `null` until the first load (or on a pre-Phase-4
@@ -146,6 +168,11 @@ function AuthedShell({
   const outdoor = theme === 'outdoor';
   const showPicker = principal.wildcard || principal.sessions.length > 1;
   const showSignOut = !principal.anonymous;
+  // Review is a REAL-LOGIN surface (Phase 2, audit §4.1): it reads /sessions/:id/history, a bulk export of
+  // raw child location, and the server now answers 403 login_required for the anonymous principal. Hiding
+  // the toggle rather than letting it 403 keeps the UI honest — an offered control that always fails reads
+  // as a broken app. Anon keeps the live pitch, which is the whole reason the bypass exists.
+  const showReview = !principal.anonymous;
 
   return (
     <div style={shellStyle(theme)}>
@@ -183,7 +210,14 @@ function AuthedShell({
           <button type="button" onClick={() => void logout()} style={toggleStyle(false)}>
             Sign out
           </button>
-        ) : null}
+        ) : (
+          // Anonymous principal: the live pitch already works without a login, so this is an OFFER, not
+          // a gate. It is the only route to the surfaces that now need a named account — the label says
+          // which ones, so nobody has to discover it by finding the Review toggle missing.
+          <button type="button" onClick={onRequestLogin} style={toggleStyle(false)}>
+            Sign in for names &amp; review
+          </button>
+        )}
       </header>
 
       {/* Session picker — only for admins (wildcard) and multi-session coaches; a single-session
@@ -234,25 +268,27 @@ function AuthedShell({
 
       {session ? (
         <>
-          <div role="group" aria-label="View mode" style={{ display: 'flex', gap: 8 }}>
-            <button
-              type="button"
-              onClick={() => setMode('live')}
-              aria-pressed={mode === 'live'}
-              style={toggleStyle(mode === 'live')}
-            >
-              Live
-            </button>
-            <button
-              type="button"
-              onClick={() => setMode('review')}
-              aria-pressed={mode === 'review'}
-              style={toggleStyle(mode === 'review')}
-            >
-              Review
-            </button>
-          </div>
-          {mode === 'live' ? (
+          {showReview ? (
+            <div role="group" aria-label="View mode" style={{ display: 'flex', gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => setMode('live')}
+                aria-pressed={mode === 'live'}
+                style={toggleStyle(mode === 'live')}
+              >
+                Live
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode('review')}
+                aria-pressed={mode === 'review'}
+                style={toggleStyle(mode === 'review')}
+              >
+                Review
+              </button>
+            </div>
+          ) : null}
+          {mode === 'live' || !showReview ? (
             <LiveView
               key={`${session}:${connEpoch}`}
               session={session}

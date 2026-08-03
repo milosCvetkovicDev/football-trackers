@@ -229,7 +229,9 @@ export async function initAuth(): Promise<void> {
     log.warn(
       'ALLOW_ANONYMOUS_LIVE=true — /live skips login for sessions ' +
         (ANON_SESSIONS.length ? `[${ANON_SESSIONS.join(',')}]` : '[] (NONE — reads nothing until ANON_SESSIONS is set)') +
-        '. Acceptable ONLY on a physically isolated LAN; NEVER on an internet-exposed deploy.',
+        '. The anon principal is scoped to the LIVE PITCH: /roster (names), /history and /events still ' +
+        'require a real login (403 login_required). Acceptable ONLY on a physically isolated LAN; NEVER ' +
+        'on an internet-exposed deploy.',
     );
   }
   if (!COOKIE_SECURE) {
@@ -404,12 +406,26 @@ const ANON_PRINCIPAL: Principal = {
 };
 
 /**
- * Resolve the current principal from a request's Cookie header. In anon mode the synthetic principal is
- * returned (login is moot on an isolated LAN). Otherwise: token → session (unexpired) → LIVE account by
- * username (so a revoked/removed account resolves to null even with a valid cookie).
+ * Resolve the current principal from a request's Cookie header: token → session (unexpired) → LIVE
+ * account by username (so a revoked/removed account resolves to null even with a valid cookie).
+ *
+ * In anon mode the synthetic principal is the FALLBACK, not an override. This used to short-circuit —
+ * `if (ANON_MODE) return ANON_PRINCIPAL` before the cookie was even parsed — which had two costs. The
+ * audit named the first (§4.1): the cookie layer was dead code on that stack, so the only gate left was
+ * an Origin check that treats an absent Origin as trusted. The second surfaced the moment /roster and
+ * /history began requiring a named account: a coach who DID log in was silently downgraded to the
+ * shared anon identity, so they could never reach the very endpoints the login was for, and every
+ * audit line for their reads said `username: null`. Cookie first, anon second: anon mode now means
+ * "a login is not REQUIRED for the live pitch", not "a login is impossible".
  */
 export function currentPrincipal(cookieHeader: string | undefined): Principal | null {
-  if (ANON_MODE) return ANON_PRINCIPAL;
+  const p = principalFromCookie(cookieHeader);
+  if (p) return p;
+  return ANON_MODE ? ANON_PRINCIPAL : null;
+}
+
+/** The cookie half of currentPrincipal — null when there is no valid, unexpired, still-provisioned session. */
+function principalFromCookie(cookieHeader: string | undefined): Principal | null {
   const token = parseCookie(cookieHeader);
   if (!token) return null;
   const s = sessions.get(token);

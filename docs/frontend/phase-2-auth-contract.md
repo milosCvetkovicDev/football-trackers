@@ -98,6 +98,33 @@ role:"coach", sessions: ANON_SESSIONS, csrf:"", wildcard:false}`. **The anon pri
 the sessions in `ANON_SESSIONS` (comma list, default empty ⇒ reads nothing) — NEVER wildcard.** Strict Origin
 still applies (a no-Origin curl cannot reach it). LOUD boot warning + `ft_anon_mode_active=1`.
 
+**Scope — anon is the LIVE PITCH and nothing else** (added by the 2026-08-03 audit, §4.1):
+
+| Surface | Anon | Why |
+|---|---|---|
+| `/live`, `/sessions`, `/auth/me` | ✅ | the pitch view and what it needs to find its session |
+| `/sessions/:id/config` | ✅ | one age-band enum + its thresholds; no name, no position, no per-child data |
+| `/sessions/:id/roster` | ❌ `403 login_required` | child **names** |
+| `/sessions/:id/history` | ❌ `403 login_required` | bulk raw child **location** export |
+| `/sessions/:id/events` | ❌ `403 login_required` | the review series built from that history |
+
+403, not 401: the anon caller *is* authenticated, just not permitted, and a 401 reads as an expired cookie
+to a client that has none. The check runs **before** `validSessionId`, like the 401, so it leaks no
+session-id-validity oracle. New session-scoped endpoints are **closed to anon by default** —
+`sessionGetGate(request, id, allowAnonymous = false)`; opting one in is a deliberate edit.
+
+**Anon is a FALLBACK, not an override.** `currentPrincipal` resolves the cookie FIRST and only returns the
+anon principal when there is no valid session. It used to short-circuit (`if (ANON_MODE) return
+ANON_PRINCIPAL`) before parsing the cookie, which made the cookie layer dead code on that stack — and, once
+the table above existed, made names unreachable there for *everyone*, while every audit line for a coach's
+read said `username: null`. On an anon stack a login is **optional** (it buys names + Review), not the way in.
+
+**Bind (`PUBLIC_HOST`).** Anon mode defaults the listener to `127.0.0.1`. A feed that needs no login must not
+also be LAN-reachable; the Origin allow-list is CSWSH defence and carries no authorization weight, since an
+absent Origin — what every non-browser client sends — cannot be authenticated. `PUBLIC_HOST` overrides it
+(a container needs `0.0.0.0` inside its own namespace, where the real boundary is the Docker port publish),
+and that combination logs a loud warning. See `server/test/anon-scope.ts`, which pins both directions.
+
 ## 4. Cookie
 Name is **`__Host-ft_session`** when `AUTH_COOKIE_SECURE !== 'false'` (default), else `ft_session`.
 `HttpOnly; SameSite=Lax; Path=/; Max-Age=<ttl>` + `Secure` when secure. **No `Domain`.** The `__Host-` prefix

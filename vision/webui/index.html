@@ -30,8 +30,6 @@
   .att{display:flex;gap:10px;align-items:flex-start;margin:10px 0 0;cursor:pointer}
   .att input{margin-top:3px;width:17px;height:17px;accent-color:var(--priv);flex:0 0 auto}
   .att span{font-size:13.5px;color:var(--ink)}
-  .kindsel{margin-top:12px;display:none}
-  .kindsel.on{display:block}
   select{background:#0c1117;border:1px solid var(--line);border-radius:9px;color:var(--ink);padding:8px 11px;font-size:14px}
   .levels{display:flex;flex-direction:column;gap:8px;margin-top:4px}
   .lvl{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;border:1px solid var(--line);border-radius:10px;cursor:pointer}
@@ -68,18 +66,11 @@
   <!-- PRIVACY GATE -->
   <div class="privacy">
     <h2>🔒 Pre obrade — obavezna potvrda</h2>
-    <p class="sub" style="margin:0;color:var(--ink);font-size:13.5px">Ovaj alat sme da obrađuje <b>javne snimke odraslih/profi</b> utakmica. Snimci <b>dece</b> su lični podaci maloletnika i traže <b>saglasnost roditelja</b> — i kad su na javnom linku. Bez potvrde, obrada ne kreće.</p>
+    <p class="sub" style="margin:0;color:var(--ink);font-size:13.5px">Ovaj alat sme da obrađuje <b>samo javne snimke odraslih/profi</b> utakmica. Snimci <b>dece se ne obrađuju</b> — ni uz saglasnost roditelja: to traži procenu uticaja (DPIA), proverenu saglasnost i dokumentovan pravni osnov, što ovaj alat nema (ADR-0023 §2/§14). Bez potvrde, obrada ne kreće.</p>
     <label class="att">
       <input type="checkbox" id="attest">
-      <span>Potvrđujem da je ovaj snimak <b>javni (odrasli/profi)</b> — ili <b>dečji uz saglasnost roditelja</b> — i da smem da ga obradim.</span>
+      <span>Potvrđujem da je ovaj snimak <b>javni (odrasli/profi)</b> i da smem da ga obradim.</span>
     </label>
-    <div class="kindsel" id="kindsel">
-      <label for="attest_kind">Vrsta:</label>
-      <select id="attest_kind">
-        <option value="public_adult">Javni odrasli / profi snimak</option>
-        <option value="consented_youth">Dečji — imam saglasnost roditelja</option>
-      </select>
-    </div>
   </div>
 
   <!-- INPUT -->
@@ -128,10 +119,9 @@
 <script>
 (function(){
   var $ = function(id){ return document.getElementById(id); };
-  var attest=$('attest'), kindsel=$('kindsel'), url=$('url'), go=$('go'), err=$('err');
+  var attest=$('attest'), url=$('url'), go=$('go'), err=$('err');
 
   function refresh(){
-    kindsel.classList.toggle('on', attest.checked);
     go.disabled = !(attest.checked && url.value.trim().length>0);
   }
   attest.addEventListener('change', refresh);
@@ -173,7 +163,9 @@
       level: level,
       seconds: parseInt($('seconds').value,10)||60,
       attest: attest.checked,
-      attest_kind: $('attest_kind').value
+      // The only kind this tool accepts (ADR-0023 §2 — no youth footage in any phase). There is no
+      // selector any more; the server refuses anything else regardless of what a client sends.
+      attest_kind: 'public_adult'
     };
     go.disabled=true; go.textContent='Šaljem…';
     $('results').classList.remove('on'); $('logbox').textContent=''; $('barfill').style.width='0%';

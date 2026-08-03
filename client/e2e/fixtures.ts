@@ -108,7 +108,9 @@ export async function withAnonStack(players: number, opts?: {
   const vitePort = opts?.vitePort ?? 5283;
   const session = opts?.session ?? 'pwload';
   const baseURL = `http://localhost:${vitePort}`;
-  const proxyTarget = `http://localhost:${serverPort}`;
+  // 127.0.0.1, NOT localhost: this stack is anonymous, and anon mode binds the IPv4 loopback (§4.1);
+  // `localhost` may resolve to ::1 first and the proxy would fail against a server that is up.
+  const proxyTarget = `http://127.0.0.1:${serverPort}`;
 
   const procs: ChildProcess[] = [];
 
@@ -192,7 +194,9 @@ export async function withAuthStack(opts?: {
   const brokerPort = opts?.brokerPort ?? 1885;
   const vitePort = opts?.vitePort ?? 5273;
   const baseURL = `http://localhost:${vitePort}`;
-  const proxyTarget = `http://localhost:${serverPort}`;
+  // 127.0.0.1 for the same reason as withAnonStack — this server binds 0.0.0.0 (anon is off), so either
+  // would work, but keeping one form across both stacks removes a difference nobody would think to check.
+  const proxyTarget = `http://127.0.0.1:${serverPort}`;
 
   // Fixture coach: an ADULT operator identity (never a child name), assigned to SESSION.
   const creds = { username: 'coach-pw', password: 'pw-e2e-pass', session: SESSION };
@@ -202,6 +206,28 @@ export async function withAuthStack(opts?: {
   const conf = join(dir, 'mosquitto.conf');
   const dbPath = join(dir, 'auth.db');
   const accountsFile = join(dir, 'auth-accounts.json');
+  const rosterFile = join(dir, 'roster.json');
+  const sessionConfigFile = join(dir, 'session-config.json');
+
+  // Phase-2 (audit §4.1): /roster, /history and /events now require a REAL login — the anonymous
+  // principal gets 403 login_required — so this is the only stack where names render and where a
+  // review query can succeed. It therefore has to carry the same throwaway fixtures the anonymous
+  // standalone writes for itself (simulate.ts §7): "01".."NN" -> "Player 01".."Player NN" and an age
+  // band. Without them a migrated spec would fail on an empty roster and look like an authz bug.
+  // These are DEV names for pseudonymous sim ids, never a real child's, and live in a temp dir this
+  // stack deletes on stop().
+  writeFileSync(
+    rosterFile,
+    JSON.stringify({
+      sessions: {
+        [SESSION]: Array.from({ length: PLAYERS }, (_, i) => {
+          const playerId = String(i + 1).padStart(2, '0');
+          return { playerId, displayName: `Player ${playerId}` };
+        }),
+      },
+    }) + '\n',
+  );
+  writeFileSync(sessionConfigFile, JSON.stringify({ sessions: { [SESSION]: { ageBand: 'U14' } } }) + '\n');
 
   // Anonymous broker is fine here — the AUTH being tested is the server's cookie /live gate, not the
   // broker ACL (that's covered by server/test/auth-e2e.ts + the sim's --secure mode).
@@ -229,6 +255,8 @@ export async function withAuthStack(opts?: {
       DB_PATH: dbPath,
       LOG_LEVEL: 'warn',
       AUTH_ACCOUNTS_FILE: accountsFile,
+      AUTH_ROSTER_FILE: rosterFile, // names — a real login is now the only way to see them
+      SESSION_CONFIG_FILE: sessionConfigFile, // age band → real youth zone thresholds, not the U14 fallback
       AUTH_COOKIE_SECURE: 'false', // localhost dev/e2e: a Secure cookie wouldn't be stored over http://
       ALLOWED_ORIGINS: baseURL, // allow this Vite origin so the proxied upgrade/POST is admitted
       // NB: NO ALLOW_ANONYMOUS_LIVE — login is required (the whole point of this stack).

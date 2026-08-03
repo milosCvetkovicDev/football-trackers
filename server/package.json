@@ -19,6 +19,8 @@
     "test:auth-dos": "bun run test/auth-dos.ts",
     "test:auth-loader": "bun run test/auth-loader.ts",
     "test:ws-origin": "bun run test/ws-origin.ts",
+    "test:anon-scope": "bun run test/anon-scope.ts",
+    "test:deploy-posture": "bun run test/deploy-posture.ts",
     "test:retention": "bun run test/retention.ts",
     "test:roster-loader": "bun run test/roster-loader.ts",
     "test:roster-cli": "bun run test/roster-cli.ts",

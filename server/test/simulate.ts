@@ -330,17 +330,24 @@ async function startStandaloneStack(secure: boolean) {
     );
     conf += `allow_anonymous false\npassword_file ${PW_FILE}\nacl_file ${ACL_FILE}\nmessage_size_limit 1024\n`;
 
-    // Phase-2 cookie auth: write a throwaway AUTH_ACCOUNTS_FILE with one coach assigned to this run's
-    // session. Hashing in-process via Bun.password (argon2id) — same shape auth-user.ts writes, so the
-    // server loads it unchanged — is simpler than shelling out to the CLI (no piped-stdin dance).
-    const hash = await Bun.password.hash(SIM_COACH_PW, { algorithm: 'argon2id' });
-    await Bun.write(
-      SIM_ACCOUNTS_FILE,
-      JSON.stringify({ accounts: [{ username: SIM_COACH_USER, hash, role: 'coach', sessions: [SESSION] }] }, null, 2) + '\n',
-    );
   } else {
     conf += 'allow_anonymous true\n';
   }
+
+  // Phase-2 cookie auth: a throwaway AUTH_ACCOUNTS_FILE with one coach assigned to this run's session.
+  // Hashing in-process via Bun.password (argon2id) — same shape auth-user.ts writes, so the server loads
+  // it unchanged — is simpler than shelling out to the CLI (no piped-stdin dance).
+  //
+  // Written in BOTH postures now. It used to be secure-only, which made the anonymous stack a place
+  // where logging in was impossible — fine while anon could read everything, wrong since anon was scoped
+  // to the live pitch (audit §4.1): signing in is how you get names and Review there, and the anon stack
+  // is the ONLY place the sign-in ⇄ sign-out transition happens without unmounting the shell (the exact
+  // path where a stale roster kept a child's name on screen for a principal no longer entitled to it).
+  const hash = await Bun.password.hash(SIM_COACH_PW, { algorithm: 'argon2id' });
+  await Bun.write(
+    SIM_ACCOUNTS_FILE,
+    JSON.stringify({ accounts: [{ username: SIM_COACH_USER, hash, role: 'coach', sessions: [SESSION] }] }, null, 2) + '\n',
+  );
   await Bun.write(CONF, conf);
 
   // Phase-3 roster (ADR-0016): write a throwaway roster.json for THIS run's session in BOTH postures (secure
@@ -395,10 +402,12 @@ async function startStandaloneStack(secure: boolean) {
   // proxy, where a Secure cookie would be silently dropped) — the server emits the loud boot warning.
   env.AUTH_COOKIE_SECURE = 'false';
   env.ALLOWED_ORIGINS = allowedOrigins;
+  // Named cookie auth in BOTH postures: secure REQUIRES a login to reach /live; anon makes it OPTIONAL
+  // (the pitch is open, but names + Review need an account since audit §4.1). currentPrincipal resolves
+  // the cookie first and only falls back to the anon principal, so both work off the same account file.
+  env.AUTH_ACCOUNTS_FILE = SIM_ACCOUNTS_FILE;
   if (secure) {
     env.MQTT_USERNAME = 'ingest'; env.MQTT_PASSWORD = INGEST_PW;
-    // Named cookie auth: the server loads the throwaway coach account written above; log in to reach /live.
-    env.AUTH_ACCOUNTS_FILE = SIM_ACCOUNTS_FILE;
   } else {
     // dev-only posture so the React client connects with no login (physically-isolated-LAN bypass). Anon is
     // now SCOPED to ANON_SESSIONS — without it the client subscribes but reads nothing — so pin it to SESSION.
