@@ -1,0 +1,74 @@
+# Server CI — the Bun + Elysia ingest / fan-out / persistence service (server/).
+#
+# Gate order (fail fast, cheapest first): install -> typecheck -> full suite. `bun run test` is
+# server/test/run-all.ts, which runs all 21 suites sequentially and REFUSES TO START if any file in
+# test/ is undeclared — so a suite added without being wired in turns this red instead of silently
+# shrinking the gate.
+#
+# Actions are SHA-pinned per the repo convention (tag in a trailing comment).
+name: server-ci
+
+# Path-filtered to server/**. The gitignore guard also runs inside `bun run test` here, but it must
+# NOT be relied on from this workflow: a leak arriving via docs/ or the repo root would match no path
+# filter and run nothing. repo-guard.yml runs that gate unfiltered on every commit; this is the
+# server's own suite.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - '.github/workflows/server-ci.yml'
+  pull_request:
+    paths:
+      - 'server/**'
+      - '.github/workflows/server-ci.yml'
+  workflow_dispatch:
+
+# PRs cancel in-progress (save runner time); main runs to completion.
+concurrency:
+  group: server-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege: this workflow only reads the repo.
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20 # the full suite is ~20 s locally; this is head-room, not an estimate
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          filter: tree:0 # treeless clone — faster for CI, and still a real .git for the guard
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Install mosquitto (and stand down the distro's own broker)
+        # Ten of the suites spawn their OWN broker; test/e2e.ts binds 127.0.0.1:1883 specifically.
+        # The Debian package enables a system mosquitto on that same port at install time, so leaving
+        # the service up makes e2e.ts fail to bind — an EADDRINUSE that reads like a product bug.
+        # `|| true`: on a runner image where the unit is absent, not-installed is the desired state.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mosquitto mosquitto-clients
+          sudo systemctl stop mosquitto || true
+          sudo systemctl disable mosquitto || true
+
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        # Bun executes .ts without typechecking, so nothing else in the pipeline would catch a type error.
+        run: bun run typecheck
+
+      - name: Full suite (21 suites, sequential)
+        # `bun run test` — the package script (run-all.ts), NOT bare `bun test`, which would try to
+        # execute the e2e harnesses as if they were bun:test files.
+        run: bun run test

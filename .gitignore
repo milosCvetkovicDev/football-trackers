@@ -22,21 +22,46 @@
 
 # ── Personal data & secrets: never commit ────────────────────────────────────────────
 # Child names, per session. AUTH_ROSTER_FILE, default ./roster.json (server/roster-user.ts).
+# The glob forms matter as much as the exact name: the realistic way this leaks is someone taking a
+# copy before an edit — roster.json.bak, roster-2026.json, "roster copy.json" — every one of which
+# holds the same twenty children's names as the original.
 roster.json
+*roster*.json
+*roster*.json.*
 # argon2id coach password hashes. AUTH_ACCOUNTS_FILE (server/auth-user.ts).
 auth-accounts.json
+*auth-accounts*.json*
 # Per-session config incl. age band. SESSION_CONFIG_FILE (server/session-config.ts).
 session-config.json
+*session-config*.json*
 # mosquitto credential DB: `mosquitto_passwd -c ft.passwd ingest` (server/mosquitto/README.md).
+# Upstream mosquitto/apache docs name this file half a dozen ways; cover the conventional ones.
 # NOTE: ft.acl is intentionally NOT ignored — it maps pseudonymous player ids to topic scopes
 # and carries no secret, so it stays reviewable in the diff.
 *.passwd
+passwd
+pwfile
+passwords
+.htpasswd
 # Anything env-shaped: ROBOFLOW_API_KEY (vision/docker-compose.yml), MQTT/AUTH overrides.
 .env
 .env.*
 !.env.example
-# Local Claude Code permissions — machine-specific and may name local paths.
-.claude/settings.local.json
+# Local Claude Code permissions — machine-specific and may name local paths. Unanchored so a nested
+# .claude/ (e.g. server/.claude/) is covered too; the root-anchored form was not.
+settings.local.json
+# Keys and keystores. Not used by the project today — which is exactly why there is no habit
+# protecting them, and why the TLS edge (ADR-0009) will arrive without one.
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
 
 # ── Data at rest (telemetry is children's positions, timestamped) ────────────────────
 *.db
@@ -44,9 +69,39 @@ session-config.json
 *.db-shm
 *.sqlite
 *.sqlite3
-# `VACUUM INTO` backups and the containerised store's bind-mount target.
+# Backups and dumps carry exactly the same rows as the live store. `VACUUM INTO` backups
+# (Phase 6) land as .db; a hand-rolled one is as likely to be gzipped or dumped to SQL.
 *.db.bak
+*.db.gz
+*.db.bz2
+*.db.xz
+*.db.zst
+*.sql
+*.dump
+# The containerised store's bind-mount target (Phase 2b).
 /server/data/
+
+# ── Footage & model weights, ANYWHERE ────────────────────────────────────────────────
+# vision/.gitignore is the scoped privacy firewall (ADR-0023 §3) and stays the local authority —
+# but it only protects vision/. A clip dropped in docs/ or at the repo root to "look at later" is
+# the same children's faces with none of the protection. Capitalised extensions are listed because
+# GoPro and iPhone write .MP4/.MOV by default, and Linux treats those as different files.
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.m4v
+*.mkv
+*.avi
+*.webm
+*.360
+*.insv
+*.mts
+*.pt
+*.pth
+*.onnx
+*.engine
+*.safetensors
 
 # ── Dependencies & build output ──────────────────────────────────────────────────────
 node_modules/
@@ -66,5 +121,10 @@ playwright/.cache/
 # ── OS & editor cruft ────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+# A vim swapfile holds the full plaintext of whatever is being edited — .roster.json.swp is the
+# roster. All three suffixes: vim rotates .swp -> .swo -> .swn when several are open.
 *.swp
+*.swo
+*.swn
 *~
+.idea/

@@ -1,0 +1,18 @@
+{
+  // Typechecks the test harness: e2e specs, the shared port contract, and the two configs.
+  //
+  // tsconfig.json deliberately scopes `include` to ["src"] — it is the APP's config, with DOM libs
+  // and vite/client types. That left everything outside src/ unchecked by every gate: `bun run
+  // typecheck` passed, `bun run lint` passed, `bun run build` passed, and a type error in
+  // playwright.config.ts or e2e/ports.ts would surface only as a confusing runtime failure inside a
+  // Playwright worker. ports.ts is a shared contract between the config and the specs, which is
+  // precisely the kind of file that must not be the unchecked one.
+  //
+  // Separate file rather than widening `include`: these run in Bun/node, not the browser, so they
+  // need node types instead of vite/client. Both are wired into `bun run typecheck`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": ["e2e", "playwright.config.ts", "vite.config.ts"]
+}

@@ -6,7 +6,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.e2e.json --noEmit",
     "lint": "eslint .",
     "test": "bun test src/homography.test.ts src/render/interpolate.test.ts src/ws/validate.test.ts src/zones.test.ts",
     "e2e": "playwright test",

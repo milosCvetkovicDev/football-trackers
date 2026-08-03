@@ -1,0 +1,67 @@
+# Firmware CI — the ESP32 wearable (firmware/).
+#
+# Compile-only (`pio run`). There is no hardware in CI and no host-runnable firmware test, so the
+# honest gate is "does the image still build for lolin32_lite". That is worth having: main.cpp is
+# the one component with no other automated check at all, and a build break currently surfaces only
+# when someone next flashes a device.
+#
+# PlatformIO is installed into a venv with pip rather than via a marketplace action, so no unverified
+# action SHA is introduced. PlatformIO Core is pinned to the version that builds this firmware today
+# (6.1.19, verified locally) rather than floating on latest.
+#
+# HONEST LIMIT: that pins the TOOL, not the TOOLCHAIN. platformio.ini declares `platform =
+# espressif32` unversioned, so CI resolves whatever the latest platform package is and may compile
+# against a different Arduino-ESP32 core than the local build did. A green run here therefore means
+# "still compiles", not "compiles identically to the image on the bench". Pinning the platform is a
+# firmware decision with its own verification (it changes the produced binary), so it is left as a
+# follow-up rather than slipped in here.
+name: firmware-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'firmware/**'
+      - '.github/workflows/firmware-ci.yml'
+  pull_request:
+    paths:
+      - 'firmware/**'
+      - '.github/workflows/firmware-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: firmware-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # first run downloads the espressif32 platform + xtensa toolchain (~hundreds of MB)
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          filter: tree:0
+
+      - name: Install PlatformIO Core
+        # python3 is preinstalled on ubuntu-latest; the venv keeps pio off the system interpreter.
+        run: |
+          python3 -m venv "$HOME/.pio-venv"
+          "$HOME/.pio-venv/bin/pip" install --upgrade pip
+          "$HOME/.pio-venv/bin/pip" install 'platformio==6.1.19'
+          echo "$HOME/.pio-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Compile (lolin32_lite)
+        working-directory: firmware
+        # pio resolves platform, toolchain and lib_deps itself; a resolution failure is a real
+        # regression (the deps are version-ranged in platformio.ini) and should fail the build.
+        run: pio run
+
+      - name: Report image size
+        working-directory: firmware
+        # Flash was 71.9% of 1.31 MB at the time this workflow was written. Not asserted — an
+        # arbitrary threshold would be a guess — but printed so growth is visible in the log.
+        run: pio run --target size

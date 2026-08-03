@@ -1,10 +1,12 @@
 # Client CI — coach live view (client/).
 #
-# ┌─ NOT-YET-ON-GITHUB ────────────────────────────────────────────────────────────┐
-# │ This repo is a local hobby project and is NOT under git/GitHub yet (no remote,   │
-# │ no Actions runner). This workflow is written and ready for when it is: `git init`│
-# │ + push to a GitHub repo and it runs as-is. Until then, run the same gates locally │
-# │ — see the commands mirrored in each step's `run:` and in client/playwright.config.ts.│
+# ┌─ NO REMOTE YET ────────────────────────────────────────────────────────────────┐
+# │ The repo is under git as of the Phase-1 initial commit, but has NO GitHub remote │
+# │ and so no Actions runner: nothing here has executed on a runner yet. It is       │
+# │ written to run as-is once a remote is added. Until then the same gates run       │
+# │ locally — the commands in each step's `run:` are the real ones, not a sketch:    │
+# │   cd client && bun run typecheck && bun run lint && bun run test && bun run build │
+# │   cd client && bun run e2e        (needs :3000/:5173 free — see e2e/ports.ts)    │
 # └────────────────────────────────────────────────────────────────────────────────┘
 #
 # Gate order (fail fast, cheapest first): install -> typecheck -> lint -> unit test

@@ -1,0 +1,43 @@
+# Repo guard — runs on EVERY push and pull request, with NO path filter. Deliberately.
+#
+# WHY ITS OWN WORKFLOW. This gate first lived inside server-ci, which is path-filtered to server/**
+# and the .gitignore files. That made it useless for precisely the commits it exists to stop: adding
+# `docs/roster.json`, `deploy/roster.json`, a stray .DS_Store, or footage at the repo root touches
+# none of those paths, so no workflow would have run and the leak would have sailed through green.
+#
+# A guard with a path filter is a guard that is absent exactly when the unexpected happens. There is
+# no path filter here and there should never be one. It costs a few seconds: the guard shells out to
+# git and needs no dependency install.
+name: repo-guard
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: repo-guard-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  gitignore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          filter: tree:0
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
+      - name: No personal data or secret can enter git
+        # No `bun install` on purpose — the guard imports only node:path and shells out to git, so it
+        # runs against a bare checkout. Fewer moving parts between a leak and the red X.
+        working-directory: server
+        run: bun run test/gitignore-guard.ts

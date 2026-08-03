@@ -458,6 +458,26 @@ phase closes (maker ≠ checker). Out-of-scope discoveries go to a triage list, 
 
 **Accept:** `git check-ignore -q` passes for every sensitive path · `bun run test` exits 0 and runs 20 suites · `pio run` exits 0 · all workflows present.
 
+> **✅ DONE 2026-08-03.** All four acceptance criteria met: the guard's 286 checks pass · `bun run test`
+> exits 0 running **21** suites in 19 s (20 as scoped, plus the guard itself) · `pio run` exits 0 ·
+> five workflows present, `actionlint` clean. Beyond the letter of the scope: the Playwright gate
+> **ran for the first time** (20 passed — it was un-runnable during the audit because :3000 was held),
+> and `client/e2e/` is now typechecked, having been outside every static gate.
+>
+> A five-lens independent checker pass found **seven real defects in this phase's own work**, all
+> fixed and re-verified by execution before the commit. The three worth remembering, because each is
+> a gate that reported green while not gating:
+> - The guard was **path-filtered out of CI for exactly the commits that leak** — adding `docs/roster.json`
+>   or a root-level file matched no filter, so nothing ran. It now has its own unfiltered `repo-guard.yml`.
+> - `run-all.ts`'s per-suite timeout **could not stop a hung suite**: the e2e suites' mosquitto/server
+>   grandchildren inherit the stdout pipe, so awaiting the drain alongside `proc.exited` blocked forever.
+> - The guard's sweep was **blind to non-ASCII and uppercase filenames** — git C-quotes
+>   `"samples/André.mp4"`, and cameras write `.MP4`. The child with an accented name was the one who
+>   would not have been caught.
+>
+> Deliberately left for later, not silently dropped: `platformio.ini` declares `platform = espressif32`
+> unversioned, so firmware CI proves "still compiles", not "compiles identically to the bench image".
+
 ### Phase 2 — Close the P0 exposure *(no new deps; ~40 lines total)*
 1. Bind `127.0.0.1:3007`; make `ANON_MODE ⇒ loopback` structural in `server.ts`.
 2. Dev broker auth parity (mount `ft.passwd`/`ft.acl`, absolute paths).

@@ -26,21 +26,35 @@ Server (from `server/`):
 ```
 bun install
 bun start          # run; bun --watch for dev (bun run dev)
-bunx tsc -p tsconfig.json --noEmit   # typecheck (Bun does not typecheck at runtime)
-bun run test/e2e.ts            # hardware-free e2e: spawns mosquitto + server, asserts
+bun run typecheck  # bunx tsc --noEmit (Bun does not typecheck at runtime)
+bun run test       # THE GATE: all 21 suites, sequential, ~20 s (test/run-all.ts)
+bun run test:e2e   # one suite; every suite also has its own test:* script
 bun run test/mosquitto-pub-demo.ts   # the README's literal mosquitto_pub -> WS path
 ```
+`bun run test` is `test/run-all.ts`, not bare `bun test`. It refuses to start if any file in
+`test/` is neither a declared suite nor a declared non-suite — so adding a test file without
+wiring it in fails loudly instead of quietly shrinking the gate.
 Env: `PORT` (default 3000), `MQTT_URL` (default `mqtt://127.0.0.1:1883`), `DB_PATH`
 (default `./telemetry.db`). The broker is mosquitto (`brew install mosquitto`).
 
 Client (from `client/`):
 ```
 bun install
-bun run dev        # Vite dev on :5173; VITE_WS_URL env (default ws://localhost:3000)
+bun run dev        # Vite dev on :5173; VITE_PROXY_TARGET is the same-origin proxy upstream
 bun run build      # vite production build
-bun test           # homography unit tests
-tsc -p tsconfig.json --noEmit   # typecheck
+bun run typecheck  # tsc --noEmit
+bun run lint       # eslint .
+bun run test       # unit suites (homography, interpolate, ws/validate, zones)
+bun run e2e        # Playwright, driven by the hardware-free simulator
 ```
+The e2e gate binds **twelve** ports across three stacks: the shared happy-path one
+(:3000/:9464/:1884/:5173) plus two dedicated stacks spun up inside specs — auth
+(:3201/:9466/:1885/:5273) and the 50-player frame-budget run (:3210/:9474/:1894/:5283).
+Only the happy-path four are env-overridable, which is enough in practice because :3000 is the
+one that collides. If something else holds it, move the block rather than shutting that down:
+`PW_SERVER_PORT=3300 PW_HEALTH_PORT=9564 PW_BROKER_PORT=1984 PW_VITE_PORT=5373 bun run e2e`
+— see [client/e2e/ports.ts](client/e2e/ports.ts), the single source both the config and the
+specs read (the other eight are hardcoded in `e2e/fixtures.ts`).
 
 Firmware (from `firmware/`):
 ```

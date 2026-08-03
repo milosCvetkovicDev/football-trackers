@@ -1,4 +1,5 @@
 import { defineConfig, devices } from '@playwright/test';
+import { SERVER_PORT, HEALTH_PORT, BROKER_PORT, VITE_PORT, SESSION, PLAYERS, BASE_URL } from './e2e/ports';
 
 /**
  * Playwright config — the Phase-2 e2e + frame-budget GATE for the coach live view.
@@ -40,18 +41,15 @@ import { defineConfig, devices } from '@playwright/test';
  * (Not committed; CI installs it — see .github/workflows/client-ci.yml.)
  */
 
-// Ports/identity — kept in lockstep with simulate.ts defaults so zero extra flags
-// are needed. Mirrored (not imported) in e2e/fixtures.ts for use inside specs.
-const VITE_PORT = 5173;
-const SERVER_PORT = 3000; // simulate.ts --standalone server (public /live + /auth + /sessions)
-const HEALTH_PORT = 9464; // simulate.ts METRICS_PORT (loopback /health + /metrics)
-const SESSION = 'pw'; // distinct session id so a stray dev broker can't bleed in
-const PLAYERS = 12; // smoke/live fleet size
+// Ports/identity live in e2e/ports.ts — kept in lockstep with simulate.ts defaults so zero extra
+// flags are needed, and SHARED with e2e/fixtures.ts rather than mirrored into it (that file used to
+// hold a second hardcoded copy). ports.ts also documents the PW_*_PORT overrides, which are what
+// let this gate run on a machine where something else already holds :3000.
 
 // Resolve the simulator + server cwd (../server) relative to this config.
 const SERVER_DIR = new URL('../server', import.meta.url).pathname;
 
-const baseURL = `http://localhost:${VITE_PORT}`;
+const baseURL = BASE_URL;
 
 export default defineConfig({
   testDir: './e2e',
@@ -110,8 +108,16 @@ export default defineConfig({
       // ALLOW_ANONYMOUS_LIVE=true AND ANON_SESSIONS=<session> so the anon principal is authorized for
       // exactly this session (anon is scoped to ANON_SESSIONS now — never wildcard) and the client
       // connects without a login. The 50-player frame-budget spec ramps inside its own stack.
-      command: `bun run test/simulate.ts --standalone --players ${PLAYERS} --session ${SESSION} --port ${SERVER_PORT} --metrics-port ${HEALTH_PORT} --broker-port 1884`,
+      command: `bun run test/simulate.ts --standalone --players ${PLAYERS} --session ${SESSION} --port ${SERVER_PORT} --metrics-port ${HEALTH_PORT} --broker-port ${BROKER_PORT}`,
       cwd: SERVER_DIR,
+      env: {
+        // Tell the standalone server which Vite origin to admit on the /live upgrade. simulate.ts
+        // defaults this to http://localhost:5173, so overriding PW_VITE_PORT without also setting
+        // this leaves the server rejecting every upgrade as `reason:"origin"` — the page loads, the
+        // canvas renders, and only the feed is missing, which looks like a rendering bug rather
+        // than an allow-list mismatch. (fixtures.ts does the same for its dedicated stacks.)
+        ALLOWED_ORIGINS: `http://localhost:${VITE_PORT}`,
+      },
       // /health flips ok+mqtt:true once the broker subscription is live (the QoS0
       // publish-before-subscribe readiness gate the e2e test relies on too).
       url: `http://127.0.0.1:${HEALTH_PORT}/health`,
@@ -121,7 +127,10 @@ export default defineConfig({
       stderr: 'pipe',
     },
     {
-      command: 'bun run dev',
+      // --strictPort: Vite's default is to silently increment past a busy port, which would leave the
+      // dev server on :5174 while every spec still targets :5173. Fail loudly instead. (The dedicated
+      // stacks in fixtures.ts already do this; the happy path did not.)
+      command: `bun run dev -- --port ${VITE_PORT} --strictPort`,
       url: baseURL,
       env: {
         // Same-origin model: the browser hits the Vite origin and Vite's dev proxy forwards /live +

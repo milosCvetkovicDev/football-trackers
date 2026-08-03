@@ -128,7 +128,10 @@ mosquitto_pub -t 'football-trackers/session/test/player/01/telemetry' \
   -m '{"id":"trk-01","pl":"01","ts":1,"lat":44.8125,"lon":20.4612,"spd":3.2,"hdg":90,"fix":3,"sats":11,"pdop":1.2}'
 ```
 Connect a WS client to `/live?sessionId=test` and watch for `{event:"telemetry"}`
-frames. Or run the fully self-contained version (spawns its own broker+server):
+frames. Or run the fully self-contained version (spawns its own broker+server).
+
+**All of the suites below run in one command** — `bun run test` from `server/` (~20 s, sequential).
+That is the gate CI runs; the individual commands are for working on one area at a time.
 ```
 bun run test/e2e.ts              # asserts fan-out, fix<2 drop, sqlite persist
 bun run test/mosquitto-pub-demo.ts   # the literal mosquitto_pub path above

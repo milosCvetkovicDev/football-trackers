@@ -25,13 +25,12 @@ import { existsSync, rmSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-// --- identity / ports of the happy-path stack (mirror playwright.config.ts) ---------
-export const SESSION = 'pw';
-export const SERVER_PORT = 3000;
-export const HEALTH_PORT = 9464;
-export const VITE_PORT = 5173;
-export const PLAYERS = 12;
-export const BASE_URL = `http://localhost:${VITE_PORT}`;
+// --- identity / ports of the happy-path stack ---------------------------------------
+// Re-exported from ./ports so the specs and playwright.config.ts read the SAME numbers. These used
+// to be a second hardcoded copy "mirroring" the config; the moment the config became overridable
+// (PW_SERVER_PORT etc.) that copy would have pointed the specs at a stack that wasn't there.
+export { SESSION, SERVER_PORT, HEALTH_PORT, BROKER_PORT, VITE_PORT, PLAYERS, BASE_URL } from './ports';
+import { SESSION, PLAYERS } from './ports';
 
 // Resolve sibling dirs relative to this file (client/e2e/).
 export const SERVER_DIR = new URL('../../server', import.meta.url).pathname;

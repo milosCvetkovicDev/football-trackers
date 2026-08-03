@@ -22,11 +22,31 @@
  *   bun run test/gitignore-guard.ts   — exits 0 on success, 1 on any failed assertion.
  */
 
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+/**
+ * Every git call is made with the repo's OWN rules and nothing else:
+ *   core.excludesFile=/dev/null  — a rule in the developer's ~/.config/git/ignore would otherwise
+ *     make check-ignore report "ignored" for a path this repo does not actually protect. The guard
+ *     would go green on their machine and the file would land from anyone else's.
+ *   core.quotePath=false — by default git C-quotes any path with a non-ASCII byte, so a clip named
+ *     after a child with an accent comes back as "samples/Andr\303\251.mp4" (with the quotes), and
+ *     every `\.mp4$` shape test misses it. That is the exact filename this repo must never leak.
+ * `.git/info/exclude` is checked separately below — it is per-clone and equally invisible to review.
+ */
 function git(args: string[], cwd?: string): { code: number; out: string } {
-  const p = Bun.spawnSync(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe' });
+  const p = Bun.spawnSync(['git', '-c', 'core.excludesFile=/dev/null', '-c', 'core.quotePath=false', ...args], {
+    cwd,
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
   return { code: p.exitCode, out: new TextDecoder().decode(p.stdout) };
+}
+
+/** Split a `-z` (NUL-separated) git listing. Belt to core.quotePath=false's braces. */
+function gitZ(args: string[], cwd?: string): string[] {
+  return git([...args, '-z'], cwd).out.split('\0').filter(Boolean);
 }
 
 function assert(cond: unknown, msg: string): asserts cond {
@@ -63,6 +83,26 @@ const MUST_IGNORE: Array<[path: string, why: string]> = [
   ['server/node_modules/x', 'dependency tree'],
   ['firmware/.pio/build/x.o', 'PlatformIO build tree'],
   ['vision/.venv/bin/python', 'python virtualenv'],
+  // --- the variants: how this actually leaks in practice, not how it leaks in theory ------------
+  ['server/roster.json.bak', 'a copy taken before an edit holds the same twenty names'],
+  ['server/roster-2026-08.json', 'a dated copy, ditto'],
+  ['docs/roster.json', 'the same file somewhere nobody was guarding'],
+  ['server/mosquitto/passwd', "mosquitto's own docs name it this as often as ft.passwd"],
+  ['server/mosquitto/pwfile', 'ditto'],
+  ['server/.claude/settings.local.json', 'a NESTED .claude/, which the root-anchored rule missed'],
+  ['id_ed25519', 'private key'],
+  ['deploy/tls/server.key', 'private key — the TLS edge (ADR-0009) will arrive without a habit here'],
+  ['deploy/tls/server.pem', 'private key or bundle'],
+  ['backup/telemetry.db.gz', 'a compressed backup holds exactly the same child positions'],
+  ['backup/telemetry.sql', 'a SQL dump, ditto'],
+  // Footage and weights ANYWHERE, not just under vision/. Capitalised because GoPro and iPhone
+  // write .MP4/.MOV by default and Linux treats those as different files.
+  ['docs/clip.mp4', 'a clip parked outside vision/ is the same children with none of the protection'],
+  ['docs/CLIP.MP4', 'the capitalised form a camera actually produces'],
+  ['GX010042.MOV', 'a GoPro file dropped at the repo root'],
+  ['models/players.pt', 'weights outside vision/'],
+  ['server/.roster.json.swp', "a vim swapfile contains the edited file's full plaintext"],
+  ['.idea/workspace.xml', 'IDE state (can embed paths and tokens)'],
 ];
 
 /**
@@ -83,20 +123,39 @@ const MUST_TRACK: Array<[path: string, why: string]> = [
   ['firmware/src/main.cpp', 'the firmware itself'],
 ];
 
-/** Shapes that must never be committable, wherever they appear. Drives the step-3 sweep. */
+/**
+ * Shapes that must never be committable, wherever they appear. Drives the step-3 sweep.
+ *
+ * ALL CASE-INSENSITIVE. macOS is case-insensitive so `ROSTER.JSON` and `roster.json` are the same
+ * file here — but CI and the Docker deploy are Linux, where they are two different files and only
+ * the lowercase one is ignored. Cameras make this concrete rather than theoretical: GoPro and iPhone
+ * both write `.MP4`/`.MOV` in capitals by default, so the uppercase form is the LIKELY one for
+ * exactly the footage this repo must never carry.
+ */
 const SENSITIVE_SHAPES: Array<[re: RegExp, what: string]> = [
-  [/(^|\/)roster\.json$/, 'child-name roster'],
-  [/(^|\/)auth-accounts\.json$/, 'password hashes'],
-  [/(^|\/)session-config\.json$/, 'session config'],
-  [/\.passwd$/, 'broker credential DB'],
-  [/(^|\/)\.env(\..+)?$/, 'environment secrets'],
-  [/(^|\/)settings\.local\.json$/, 'machine-local editor settings'],
-  [/\.(db|db-wal|db-shm|sqlite|sqlite3)$/, 'telemetry store'],
-  [/\.(pt|engine|onnx|weights)$/, 'model weights'],
-  [/\.(mp4|mov|360|mkv|avi)$/, 'raw or derived footage of children'],
-  [/(^|\/)\.DS_Store$/, 'Finder metadata'],
-  [/(^|\/)id_(rsa|ed25519)$/, 'private key'],
-  [/\.(pem|key|p12|pfx)$/, 'private key or certificate'],
+  // Roster/account/config: match variants too. A human protecting data before an edit produces
+  // `roster.json.bak`, `roster-2026.json`, `roster copy.json` — none of which the exact basename
+  // rule catches, and all of which hold the same twenty children's names.
+  [/(^|\/)[^/]*roster[^/]*\.json(\.\w+)?$/i, 'child-name roster (or a copy of one)'],
+  [/(^|\/)[^/]*auth-accounts[^/]*\.json(\.\w+)?$/i, 'password hashes (or a copy)'],
+  [/(^|\/)[^/]*session-config[^/]*\.json(\.\w+)?$/i, 'session config (or a copy)'],
+  // Broker credentials: *.passwd is the repo's convention, but mosquitto's own docs use bare
+  // `passwd`/`pwfile`/`passwords` just as often.
+  [/\.passwd$/i, 'broker credential DB'],
+  [/(^|\/)(passwd|pwfile|passwords|htpasswd)$/i, 'credential file (mosquitto/apache naming)'],
+  [/(^|\/)\.env(\..+)?$/i, 'environment secrets'],
+  [/(^|\/)settings\.local\.json$/i, 'machine-local editor settings'],
+  [/\.(db|db-wal|db-shm|sqlite|sqlite3)$/i, 'telemetry store'],
+  [/\.(db|sqlite3?)\.(gz|bz2|xz|zst|bak)$/i, 'compressed or backed-up telemetry store'],
+  [/\.(sql|dump)$/i, 'database dump'],
+  [/\.(pt|pth|engine|onnx|safetensors|weights)$/i, 'model weights'],
+  [/\.(mp4|mov|360|mkv|avi|webm|ogv|m4v|mts|insv)$/i, 'raw or derived footage of children'],
+  [/(^|\/)\.DS_Store$/i, 'Finder metadata'],
+  [/(^|\/)id_(rsa|dsa|ecdsa|ed25519)$/i, 'private key'],
+  // .crt/.cer are deliberately absent — those are public certificates, and a shape that cries wolf
+  // on a legitimately-committed CA bundle is a shape people start ignoring.
+  [/\.(pem|key|p12|pfx|jks|keystore)$/i, 'private key or keystore'],
+  [/\.(swp|swo|swn)$/i, 'editor swapfile (contains the full plaintext of the file being edited)'],
 ];
 /** Deliberate exceptions to the shapes above — each must be justified, not merely convenient. */
 const SHAPE_ALLOW: RegExp[] = [
@@ -133,7 +192,10 @@ try {
       r.code !== 0,
       `OVER-BROAD: "${path}" IS gitignored but must be tracked — ${why}.\n  matched by: ${m.out.trim() || '(unknown)'}`,
     );
-    checks++;
+    // "Not ignored" is not the same as "present". Without this, deleting one of these files leaves
+    // the guard reporting "10 required paths tracked" — a sentence that would then be false.
+    assert(existsSync(resolve(REPO, path)), `MISSING: "${path}" is required but does not exist — ${why}`);
+    checks += 2;
   }
 
   // ── 3. The sweep: nothing sensitive is committable RIGHT NOW. ───────────────────────────────────
@@ -141,8 +203,10 @@ try {
   //   a) untracked-and-not-ignored — exactly what `git add .` would newly stage;
   //   b) already tracked — .gitignore does NOT protect a tracked file, so a rule added after the
   //      fact is cosmetic. This is the check that notices the barn door is already open.
-  const staged = git(['ls-files', '--others', '--exclude-standard'], REPO).out.split('\n').filter(Boolean);
-  const tracked = git(['ls-files'], REPO).out.split('\n').filter(Boolean);
+  // `-z` (NUL-separated): the only listing format git never quotes or escapes. A path containing a
+  // newline or a non-ASCII byte is otherwise mangled before any shape test sees it.
+  const staged = gitZ(['ls-files', '--others', '--exclude-standard'], REPO);
+  const tracked = gitZ(['ls-files'], REPO);
 
   for (const [label, files] of [
     ['would be staged by `git add .`', staged],
@@ -155,6 +219,25 @@ try {
     }
   }
   checks += staged.length + tracked.length;
+
+  // ── 3b. The protection must live in the REPO, not in this clone or this machine. ────────────────
+  // check-ignore is already run with core.excludesFile=/dev/null, but .git/info/exclude is
+  // per-clone: rules there are invisible to review, absent for every other developer and absent in
+  // CI. If it has any content, the green above may be resting on it.
+  const infoExclude = resolve(REPO, '.git/info/exclude');
+  if (existsSync(infoExclude)) {
+    const meaningful = (await Bun.file(infoExclude).text())
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith('#'));
+    assert(
+      meaningful.length === 0,
+      `.git/info/exclude has ${meaningful.length} active rule(s): ${meaningful.join(', ')}\n` +
+        `  These are local to YOUR clone — not reviewable, not present for anyone else, not present in CI.\n` +
+        `  Move anything load-bearing into the tracked .gitignore.`,
+    );
+  }
+  checks++;
 
   // ── 4. The negation actually fires. `!models/MANIFEST.json` under `models/` parsed fine and did
   //      nothing; only asking git to list the file proves the re-include works. ────────────────────

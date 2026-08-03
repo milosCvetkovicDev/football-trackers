@@ -1,0 +1,56 @@
+# Vision CI — the offline CV subproject (vision/), ADR-0023.
+#
+# Runs the suite THROUGH DOCKER COMPOSE rather than installing Python on the runner, because that is
+# the subproject's actual contract: vision/README.md says "All commands run in Docker. Do NOT run
+# Python/pytest on the host." Testing it a second, host-shaped way would gate a configuration nobody
+# ever runs — and would silently drift from the image the code is developed against.
+#
+# It also avoids pinning actions/setup-python, which is not in the repo's verified-versions list; the
+# rule here is to reuse a verified pin or avoid the action, never to invent a SHA.
+name: vision-ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'vision/**'
+      - '.github/workflows/vision-ci.yml'
+  pull_request:
+    paths:
+      - 'vision/**'
+      - '.github/workflows/vision-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: vision-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30 # most of this is the one-time CPU image build (opencv + sklearn wheels)
+    defaults:
+      run:
+        working-directory: vision
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          filter: tree:0
+
+      # docker + the compose plugin are preinstalled on ubuntu-latest; no action needed.
+      - name: Build the CPU test image
+        # Built as its own step so a dependency/image failure is distinguishable from a test failure.
+        run: docker compose build test
+
+      - name: Test suite (pytest, CPU image)
+        run: docker compose run --rm test
+
+      - name: Offline guards (pipeline --selftest)
+        # ADR-0023's privacy posture is "no network at inference time". --selftest is what asserts
+        # the guards are armed, and it is worth its own step: a green pytest with a broken offline
+        # guard is precisely the failure this subproject cannot afford.
+        run: docker compose run --rm selftest
