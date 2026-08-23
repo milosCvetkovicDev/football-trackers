@@ -163,6 +163,7 @@ bun run test/roster-loader.ts    # fail-closed roster loader (missing/oversize/m
 bun run test/roster-cli.ts       # roster-user.ts set/remove/list (mode 0600, no name leaked on a validation error)
 bun run test/roster-e2e.ts       # GET /sessions/:id/roster authz matrix + per-principal 429 + no-store + no name leak
 bun run test/erasure-e2e.ts      # right-to-erasure: roster set -> purge-player -> rosterEntriesErased + DB rows + file
+bun run test/erasure-audit.ts    # the five audit-2026-08-03 §4.5 erasure defects stay fixed (WAL residue, dup id, collateral, bad file, missing DB)
 bun run test/history.ts          # GET /sessions/:id/history: aggregate/raw correctness, composite cursor, DoS gates, SLO
 bun run test/history-e2e.ts      # live history endpoint: authz, rate-limit/inflight caps, opaque errors, no-store
 bun run test/device-health-e2e.ts # a .../status frame -> minimised {event:'status'} on /live (no heap/up/pub/stash/name)
@@ -186,7 +187,7 @@ bun run test/scan-load.ts        # the off-loop inflight cap is genuinely SHARED
 ```
 Erase one player's raw location (GDPR / lost device — see [ADR-0010](docs/decisions/0010-location-data-retention.md)):
 ```
-bun run purge-player.ts <playerId> [sessionId]   # exit 0 + JSON receipt; exit 3 = not erased, retry
+bun run purge-player.ts <playerId> [sessionId]   # exit 0 + JSON receipt; 3 = transient, re-run; 4 = rebuild incomplete, re-run; 5 = permanent (wrong file/path/permissions/disk), fix first
 ```
 
 ### Simulate a device fleet (no hardware)
@@ -271,7 +272,7 @@ cd client && VITE_PROXY_TARGET=http://127.0.0.1:3007 bun run dev   # coach view 
 - [x] Bun/Elysia ingest + WS fan-out + bun:sqlite persist (e2e verified, no hardware)
 - [x] Observability: Prometheus `/metrics`, JSON logs, device `.../status` health topic (e2e verified)
 - [x] Security MSI: token-gated `/live` (+ Origin/CSWSH check), per-device MQTT creds + topic ACLs, server-side `id_mismatch` reject (e2e verified). Architecture-board reviewed — see [target-architecture](docs/architecture/target-architecture.md) + [ADRs 0006–0014](docs/decisions/README.md)
-- [x] Data minimisation ([ADR-0010](docs/decisions/0010-location-data-retention.md)): 30-day raw-fix auto-purge (batched), per-player `secure_delete` erasure CLI, self-reporting retention metrics (unit + e2e verified)
+- [x] Data minimisation ([ADR-0010](docs/decisions/0010-location-data-retention.md)): 30-day raw-fix auto-purge (batched) that also prunes roster sessions whose fixes are gone, per-player erasure CLI (indexed + batched delete, `secure_delete` + forced WAL `TRUNCATE` checkpoint, permissive roster rewrite, distinct exit codes), self-reporting retention metrics — the five ways erasure was broken are pinned by `test/erasure-audit.ts` (audit 2026-08-03 §4.5, Phase 2b)
 - [x] React live view: 4-corner pitch homography, useRef Map + rAF canvas (browser-verified, no hardware)
 - [x] FE Phase 1 (client-only MSI): DPR-crisp/~30fps-capped canvas, honest bounded interpolation ([ADR-0018](docs/decisions/0018-live-position-smoothing-honesty.md)), explicit failure states, accessible mirror + ARIA, strict CSP (connect-src derived from `VITE_WS_URL`), outdoor mode + wake-lock — typecheck/lint/unit + Playwright e2e through the simulator (p95 9.4 ms @ 50 players, DPR-crisp verified). See [improvement-plan](docs/frontend/improvement-plan.md)
 - [x] FE Phase 2 (auth & security core): named login (argon2id + HttpOnly cookie) -> **cookie-on-upgrade**; bundled `LIVE_TOKEN` killed; principal-bound session authz on `/live` (`ft_ws_rejected{reason="not_authorized_for_session"}`); accounts file + `auth-user.ts` CLI; Vite same-origin proxy + `connect-src 'self'`; strict Origin; isolated-LAN anon scoped to `ANON_SESSIONS` ([ADR-0015](docs/decisions/0015-frontend-auth-transport.md), implements [ADR-0008](docs/decisions/0008-authentication-access-control.md)) — verified by the server auth e2e + client Playwright auth specs through the simulator

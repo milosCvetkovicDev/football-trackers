@@ -9,12 +9,17 @@
 
 import { Database } from 'bun:sqlite';
 import type { Telemetry } from './types';
-
-const DB_PATH = process.env.DB_PATH ?? 'telemetry.db';
+import { DB_PATH } from './db-path';
 
 const db = new Database(DB_PATH, { create: true });
 db.exec('PRAGMA journal_mode = WAL;');
 db.exec('PRAGMA synchronous = NORMAL;');
+// Audit §4.5(a): secure_delete zeroes freed pages in the page images THIS connection writes — and in
+// WAL mode those land in the -wal sidecar, where the PRE-delete images also still sit. Without this
+// pragma a WAL reset merely rewinds the write cursor and the old frames stay on disk until overwritten;
+// with it, every reset truncates the file. purge-player.ts additionally forces a TRUNCATE checkpoint
+// (checkpointTruncate below) so an erasure does not wait for the next incidental reset.
+db.exec('PRAGMA journal_size_limit = 0;');
 // WAL lets the purge-player CLI mutate the DB while the server is running; the
 // busy timeout makes the two processes wait briefly for the lock instead of
 // erroring out with SQLITE_BUSY.
@@ -47,6 +52,11 @@ db.exec(
 // serve that range (session_id leads), so give it a dedicated index to avoid a
 // full-table scan every sweep.
 db.exec('CREATE INDEX IF NOT EXISTS idx_telemetry_server_ts ON telemetry(server_ts);');
+// Erasure deletes by player (optionally within a session). Without this index that DELETE is a full
+// table SCAN holding the write lock — with secure_delete zeroing every freed page — for tens of seconds
+// during a match (audit §4.5). (player_id, session_id) serves both the all-sessions and the one-session
+// form, and the rowid-subquery batching below keeps each statement short.
+db.exec('CREATE INDEX IF NOT EXISTS idx_telemetry_player ON telemetry(player_id, session_id);');
 
 const insert = db.query(`
   INSERT INTO telemetry
@@ -84,10 +94,25 @@ const deleteOlderThanBatch = db.query(
   'DELETE FROM telemetry WHERE rowid IN (SELECT rowid FROM telemetry WHERE server_ts < $cutoff LIMIT $limit)',
 );
 const minServerTs = db.query('SELECT MIN(server_ts) AS m FROM telemetry');
-const deletePlayerAll = db.query('DELETE FROM telemetry WHERE player_id = $player');
-const deletePlayerSession = db.query(
-  'DELETE FROM telemetry WHERE player_id = $player AND session_id = $session',
+// Same bounded-DELETE shape as the retention sweep, keyed on idx_telemetry_player.
+const deletePlayerAllBatch = db.query(
+  'DELETE FROM telemetry WHERE rowid IN (SELECT rowid FROM telemetry WHERE player_id = $player LIMIT $limit)',
 );
+const deletePlayerSessionBatch = db.query(
+  'DELETE FROM telemetry WHERE rowid IN (SELECT rowid FROM telemetry WHERE player_id = $player AND session_id = $session LIMIT $limit)',
+);
+// One indexed seek per roster session (idx_telemetry_session_ts leads on session_id). NOT `SELECT
+// DISTINCT session_id` — that plans as a full covering-index SCAN, linear in ROWS, and the sweep runs on the
+// live event loop (the checker measured ~170 ms+ at a 30-day store, hourly).
+const sessionProbe = db.query('SELECT 1 FROM telemetry WHERE session_id = $session LIMIT 1');
+const walCheckpointTruncate = db.query('PRAGMA wal_checkpoint(TRUNCATE)');
+const walCheckpointPassive = db.query('PRAGMA wal_checkpoint(PASSIVE)');
+
+/** Rows per erasure DELETE batch — bounds how long one statement holds the write lock. */
+export const PURGE_BATCH_DEFAULT = (() => {
+  const n = Number(process.env.PURGE_BATCH ?? 5_000);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 5_000;
+})();
 
 /**
  * Delete up to `limit` raw fixes stamped before `cutoffMs` (server_ts). Returns rows
@@ -105,13 +130,80 @@ export function oldestServerTs(): number | null {
 }
 
 /**
- * Right-to-erasure / lost-device wipe: delete a player's raw fixes. Scoped to one
- * session when `sessionId` is given, otherwise every session. Returns rows removed.
+ * ONE bounded erasure batch: delete up to `limit` of a player's raw fixes (optionally within one
+ * session). Returns rows removed. Exposed so the loop below is testable at the batch boundary.
  */
-export function purgePlayer(playerId: string, sessionId?: string): number {
+export function purgePlayerBatch(playerId: string, sessionId: string | undefined, limit: number): number {
   return sessionId
-    ? deletePlayerSession.run({ $player: playerId, $session: sessionId }).changes
-    : deletePlayerAll.run({ $player: playerId }).changes;
+    ? deletePlayerSessionBatch.run({ $player: playerId, $session: sessionId, $limit: limit }).changes
+    : deletePlayerAllBatch.run({ $player: playerId, $limit: limit }).changes;
+}
+
+/**
+ * Right-to-erasure / lost-device wipe: delete ALL of a player's raw fixes, scoped to one session when
+ * `sessionId` is given, otherwise every session. Runs in bounded batches with a short pause between
+ * them so a concurrent writer (the live server, via busy_timeout) can take the lock in between instead
+ * of stalling for the whole wipe. Returns total rows removed.
+ */
+export async function purgePlayer(
+  playerId: string,
+  sessionId?: string,
+  opts: { batch?: number } = {},
+): Promise<number> {
+  const limit = opts.batch ?? PURGE_BATCH_DEFAULT;
+  let removed = 0;
+  let n: number;
+  do {
+    n = purgePlayerBatch(playerId, sessionId, limit);
+    removed += n;
+    if (n === limit) await Bun.sleep(2); // let the server's pending insert through between batches
+  } while (n === limit);
+  return removed;
+}
+
+export interface CheckpointResult { busy: number; log: number; checkpointed: number }
+
+/**
+ * Force a TRUNCATE checkpoint: copy every WAL frame into the main file and shrink the WAL to zero
+ * bytes, so the rebuilt page images REPLACE the old ones on disk instead of sitting beside them in the
+ * sidecar. Returns SQLite's triple: `busy` 1 means a reader held the WAL and the truncate did NOT
+ * complete — the caller must treat that as "residue remains".
+ *
+ * CAUTION: a TRUNCATE checkpoint takes the WRITE lock and then busy-waits for readers to drain. With
+ * this connection's default busy_timeout (5 s) that is 5 s of frozen ingest per attempt — call
+ * setBusyTimeout(<small>) first and keep the attempts short; do the bulk copy with checkpointPassive().
+ */
+export function checkpointTruncate(): CheckpointResult {
+  return walCheckpointTruncate.get() as CheckpointResult;
+}
+
+/** A PASSIVE checkpoint copies whatever frames it can WITHOUT taking the write lock or waiting on readers. */
+export function checkpointPassive(): CheckpointResult {
+  return walCheckpointPassive.get() as CheckpointResult;
+}
+
+/** Change how long THIS connection's statements wait on a lock before failing with SQLITE_BUSY. */
+export function setBusyTimeout(ms: number): void {
+  db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(ms))};`);
+}
+
+/**
+ * Rebuild every page of the store. Needed for byte-level erasure: secure_delete zeroes pages that are
+ * FREED, but a leaf page that keeps a survivor's rows is rebalanced in place and the erased rows' bytes
+ * stay in its unused gap (the checker found ~0.2-0.5% of an erased player's rows recoverable that way,
+ * in the everyday round-robin ingest layout). VACUUM rewrites those pages clean. It holds the write
+ * lock for the duration — proportional to store size — so erasures belong between sessions, not mid-match.
+ * Returns wall time in ms.
+ */
+export function vacuum(): number {
+  const t0 = performance.now();
+  db.exec('VACUUM');
+  return Math.round(performance.now() - t0);
+}
+
+/** Does this session still have at least one stored fix? One indexed seek. */
+export function sessionHasTelemetry(sessionId: string): boolean {
+  return sessionProbe.get({ $session: sessionId }) !== null;
 }
 
 // --- review/replay read path (ADR-0017): paged, keyset, OFF the live loop -------

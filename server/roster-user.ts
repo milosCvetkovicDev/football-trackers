@@ -22,6 +22,7 @@
  * mirrors auth-user.ts, which likewise never echoes the password on a failure path.
  */
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { withRosterLock } from './src/roster';
 
 interface RosterEntry {
   playerId: string;
@@ -29,6 +30,10 @@ interface RosterEntry {
 }
 interface RosterFile {
   sessions: Record<string, RosterEntry[]>;
+  /** Per-session provisioning stamp (epoch ms of the last `set`). The retention sweep prunes a session whose
+   *  fixes are all gone only once this is older than the window — so names entered BEFORE a match survive. */
+  sessionMeta?: Record<string, { updatedAt?: number }>;
+  [other: string]: unknown; // anything else in the file is preserved untouched
 }
 
 const FILE = process.env.AUTH_ROSTER_FILE ?? './roster.json';
@@ -38,9 +43,10 @@ const PLAYER_ID_RE = /^[A-Za-z0-9._-]{1,64}$/; // must match PLAYER_ID_RE in src
 const argv = process.argv.slice(2);
 const cmd = argv[0];
 
+/** Thrown, not exited: the roster lock (below) must be released by its finally before the process ends. */
+class CliError extends Error {}
 function fail(msg: string): never {
-  console.error(`❌ ${msg}`);
-  process.exit(1);
+  throw new CliError(msg);
 }
 
 function load(): RosterFile {
@@ -52,7 +58,7 @@ function load(): RosterFile {
       parsed.sessions && typeof parsed.sessions === 'object' && !Array.isArray(parsed.sessions)
         ? (parsed.sessions as Record<string, RosterEntry[]>)
         : {};
-    return { sessions };
+    return { ...parsed, sessions };
   } catch {
     fail(`roster file is not valid JSON: ${FILE} (fix or delete it before re-running)`);
   }
@@ -81,6 +87,7 @@ function cmdSet(): void {
   const entry: RosterEntry = { playerId, displayName };
   if (i >= 0) list[i] = entry;
   else list.push(entry);
+  (file.sessionMeta ??= {})[sessionId] = { ...file.sessionMeta[sessionId], updatedAt: Date.now() };
   save(file);
   // SUCCESS path: printing the name is in scope (operator console).
   console.log(
@@ -98,7 +105,10 @@ function cmdRemove(): void {
   const next = list.filter((e) => e.playerId !== playerId);
   if (next.length === list.length) fail(`no such roster entry: ${sessionId}/${playerId}`);
   if (next.length > 0) file.sessions[sessionId] = next;
-  else delete file.sessions[sessionId]; // drop a now-empty session so the file stays tidy
+  else {
+    delete file.sessions[sessionId]; // drop a now-empty session so the file stays tidy
+    if (file.sessionMeta) delete file.sessionMeta[sessionId];
+  }
   save(file);
   console.log(`✅ removed ${sessionId}/${playerId} → ${FILE} (the server reloads it within AUTH_ROSTER_RELOAD_SECONDS)`);
 }
@@ -122,20 +132,29 @@ function cmdList(): void {
   }
 }
 
-switch (cmd) {
-  case 'set':
-    cmdSet();
-    break;
-  case 'remove':
-    cmdRemove();
-    break;
-  case 'list':
-    cmdList();
-    break;
-  default:
-    console.error('usage: bun run roster-user.ts <set|remove|list> …');
-    console.error('  set <sessionId> <playerId> <displayName>   (upsert one entry)');
-    console.error('  remove <sessionId> <playerId>');
-    console.error('  list [sessionId]');
-    process.exit(cmd ? 1 : 0);
+// set/remove take the roster lock: the server's retention sweep and purge-player.ts rewrite the same file, and
+// two unguarded read-modify-writes racing can silently drop one side's change (or write an erased name back).
+try {
+  switch (cmd) {
+    case 'set':
+      await withRosterLock(async () => cmdSet(), FILE);
+      break;
+    case 'remove':
+      await withRosterLock(async () => cmdRemove(), FILE);
+      break;
+    case 'list':
+      cmdList();
+      break;
+    default:
+      console.error('usage: bun run roster-user.ts <set|remove|list> …');
+      console.error('  set <sessionId> <playerId> <displayName>   (upsert one entry)');
+      console.error('  remove <sessionId> <playerId>');
+      console.error('  list [sessionId]');
+      process.exit(cmd ? 1 : 0);
+  }
+} catch (err) {
+  // CliError messages are rule-only by construction (never a name value); anything else is a lock/IO error
+  // from roster.ts, which is code-only.
+  console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
 }
