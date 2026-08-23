@@ -67,7 +67,7 @@ services:
       MQTT_PASSWORD: ${MQTT_PASSWORD:?run ./server/mosquitto/dev-provision.sh first (writes .env)}
       PORT: "3000"                         # public: /live + /auth + /sessions
       METRICS_PORT: "9464"                 # loopback inside the container: /health + /metrics
-      DB_PATH: /data/telemetry.db          # persisted in a named volume, not the bind mount
+      DB_PATH: /data/telemetry.db          # persisted in ./server/data on the host (bind mount, see volumes)
       ALLOW_ANONYMOUS_LIVE: "true"         # isolated-LAN bypass so the browser can view without login
       ANON_SESSIONS: test                  # the anon principal may view ONLY this session (== firmware SESSION_ID)
       # In anon mode the server defaults its bind to 127.0.0.1. Inside a container that would make the
@@ -82,7 +82,16 @@ services:
     volumes:
       - ./server:/app                      # live source (no rebuild needed)
       - server_node_modules:/app/node_modules   # container-native deps mask the host's
-      - server_data:/data                  # telemetry.db lives here
+      # telemetry.db lives here, as a HOST-VISIBLE file (audit §4.5 d). It used to be a named volume, which
+      # no host path addresses: the documented host-side purge-player.ts run then deleted the child's NAME
+      # from the bind-mounted roster.json, could not reach the positions at all, and reported
+      # {erased:0, retry:true} forever. A bind mount makes the store something the operator can see, back
+      # up, and erase. Erasure while the stack is up: `docker compose exec -T server bun run purge-player.ts …`
+      # (the container's DB_PATH); or with the stack down, from server/ (paths are cwd-relative):
+      # `cd server && DB_PATH=./data/telemetry.db bun run purge-player.ts …`. On a Linux host Docker creates
+      # ./server/data root-owned (the bun image runs as root), so there the exec form is the only one that
+      # works without fixing ownership — the CLI reports a read-only store as exit 5, not "retry".
+      - ./server/data:/data
     ports:
       # Host port the on-host Vite dev server proxies to (3000 is held by other host containers → map to 3007).
       # BOUND TO 127.0.0.1 (audit §4.1): anon mode means no login, and the only consumer is the Vite proxy
@@ -96,4 +105,3 @@ services:
 
 volumes:
   server_node_modules:
-  server_data:

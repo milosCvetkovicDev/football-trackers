@@ -218,6 +218,12 @@ export const metrics = {
       'Retention sweeps that threw (caught, server kept running) — alert on increase()',
     ),
   ),
+  rosterSessionsPruned: registry.register(
+    new Counter(
+      'ft_retention_roster_sessions_pruned_total',
+      'Roster sessions dropped by the retention sweep because no fix remained and the provisioning stamp was older than the window (audit §4.5) — present-at-0',
+    ),
+  ),
   retentionLastRun: registry.register(
     new Gauge(
       'ft_retention_last_run_timestamp_seconds',

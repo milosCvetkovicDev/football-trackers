@@ -1,9 +1,9 @@
 ---
 name: production-readiness-audit
 description: Severity-ranked production-readiness audit of firmware/server/client/vision/infra, with a phased hardening roadmap
-status: awaiting-approval
+status: in-progress
 created: 2026-08-03T08:34:07Z
-updated: 2026-08-03T08:34:07Z
+updated: 2026-08-23T17:56:23Z
 ---
 
 # Production-Readiness Audit — football-trackers
@@ -527,6 +527,54 @@ phase closes (maker ≠ checker). Out-of-scope discoveries go to a triage list, 
 5. Extend retention to prune orphaned roster sessions.
 
 **Accept:** after purge, `! strings -a $DB $DB-wal | grep -q <playerId>` · duplicate-playerId roster → **non-zero** exit and name removed · erasing one session leaves all others byte-identical · missing `DB_PATH` → distinct non-zero exit · `EXPLAIN QUERY PLAN` shows `SEARCH`, not `SCAN` · erasure e2e passes against the containerized store.
+
+> **✅ DONE 2026-08-23.** All five items. Acceptance, by execution: the `strings -a` scan of `telemetry.db` + `-wal`
+> finds **0** hits after a purge — in `server/test/erasure-audit.ts` with the erased rows *interleaved* with survivors
+> (3:1 burst and a 10-player round-robin), and against the **running Docker stack** via
+> `docker compose exec -T server bun run purge-player.ts …` with the scan run from the host on the bind-mounted
+> `./server/data/` (4,500 rows, receipt `walTruncated:true, vacuumed:true`, WAL 0 bytes, server kept serving, 0 error
+> lines) · erasing one session leaves every other session **semantically** identical — order, loader-rejected entries
+> and unknown keys preserved (the file is re-serialised, so "byte-identical" was the wrong word) · missing, **empty**
+> or non-SQLite `DB_PATH` → exit **5**, `retry:false`, file untouched · both purge lookups `SEARCH idx_telemetry_player`
+> · 24 server suites green (1 new: `erasure-audit.ts`).
+>
+> **One acceptance clause amended, deliberately:** "duplicate-playerId roster → non-zero exit and name removed" is
+> self-contradictory — if the name *is* removed, non-zero would tell the operator to re-run a completed erasure. The
+> implementation erases **every** occurrence (`rosterEntriesErased:2`) and exits 0; what must never happen — a success
+> receipt with the name still on disk — is what the test pins. An *unreadable* roster is the non-zero case (exit 3),
+> and it is checked **before** any row is deleted, so "nothing was changed" is literally true.
+>
+> The six-lens checker pass found **six real defects in this phase's own first cut**, each reproduced independently
+> before it counted (26 candidates confirmed, about half downgraded on impact), all fixed and re-verified by execution:
+> - **`secure_delete` + `TRUNCATE` was not enough.** Freed pages are zeroed, but a leaf page a *surviving* player still
+>   occupies is rebalanced in place and keeps the erased rows' bytes in its gap — ~0.2–0.5 % of an erased player's rows
+>   recoverable in the everyday round-robin layout, behind a green receipt. The first cut's test inserted each player's
+>   rows contiguously and could not see it. Now: `VACUUM` before the checkpoint; the test interleaves.
+> - **The TRUNCATE checkpoint froze the live server for 5 s per attempt** when a reader pinned the WAL — it busy-waits
+>   *holding the write lock*, and the CLI inherited `busy_timeout=5000`. Now: PASSIVE copy first, 100 ms busy timeout
+>   for eight short TRUNCATE attempts — exit 4 in ~2.6 s instead of ~26 s, and the writer is never held for more than
+>   100 ms.
+> - **A roster failure after the rows were gone printed `erased:0` / "nothing was changed"** and skipped the
+>   checkpoint. Now: the roster is read (and validated) *before* the delete, the failure receipt reports the true
+>   counts, and VACUUM + checkpoint run in a `finally`.
+> - **The hourly sweep's rewrite could race a CLI purge** and write a just-erased name back behind a success receipt.
+>   Now: every writer of `roster.json` (sweep, purge CLI, `roster-user.ts`) takes a lock file; the purge re-reads to
+>   verify. A `process.exit` inside the lock in `roster-user.ts` would have left it behind — caught by its own test.
+> - **`SELECT DISTINCT session_id`** for the pruner was a full covering-index scan on the event loop, linear in rows.
+>   Now: one indexed `LIMIT 1` probe per roster session.
+> - **A 0-byte `DB_PATH` passed the `existsSync` guard** and was initialised as a fresh schema — "erased 0, exit 0" by
+>   another route. Now: regular-file + size + SQLite-header check.
+>
+> Smaller items folded in from the same pass: ids validated (`[A-Za-z0-9._-]{1,64}`, exit 2) so a typo cannot become an
+> "erased 0" record; a read-only store is exit 5 (`retry:false`), not "retry forever" — the Linux root-owned bind
+> mount; future-dated provisioning stamps clamped; a session literally named `__proto__` stamped as an own key; atomic
+> rewrite at the symlink *target* with the temp file removed on failure; the runbook's exit-5 remedy no longer exits 5
+> itself; the new counter is in the metrics table. **Known, documented bound:** names for a session that never receives
+> a fix expire `RETENTION_DAYS` after the last `roster-user.ts set` (re-run `set` to renew) — a WARN names the session.
+>
+> Two test-harness lessons worth keeping: an un-finalised `EXPLAIN` statement on a bun:sqlite connection pins a WAL
+> snapshot once any later statement runs (prepare + finalize it); and an unreferenced `Database` in a helper process
+> is garbage-collected mid-`await`, silently closing the connection — the "pinned reader" that was not pinning.
 
 ### Phase 3 — Boundary correctness
 1. Coerce every wire field in `ingest.ts` (telemetry **and** status); `Number.isFinite` guard on `Gauge.set`.

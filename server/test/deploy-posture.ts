@@ -125,6 +125,29 @@ check(
   `these config files set allow_anonymous true: ${anonConfs.map((f) => f.replace(REPO + '/', '')).join(', ')}`,
 );
 
+// ── 5b. The telemetry store must be a host-visible BIND mount, not a named volume (§4.5 d) ───────
+// With `server_data:/data` the documented host-side `purge-player.ts` invocation deleted the child's NAME
+// from the bind-mounted roster.json and could not reach the positions at all — they lived in a volume no
+// host path addresses — then reported {erased:0, retry:true} forever. A bind mount makes the store a file
+// the operator can see, back up, and erase from the host; the runbook's `docker compose exec` form works
+// either way, but the wrong form must not be able to destroy the identifier while leaving the trace.
+const dataMounts = composeLines.filter((l) => /:\/data"?$/.test(l));
+check(
+  'the server mounts ./server/data at /data (bind mount — the store is a host-visible file)',
+  dataMounts.some((l) => /^-\s*"?\.\/server\/data:\/data"?$/.test(l)),
+  `no "- ./server/data:/data" volume entry in ${COMPOSE}; /data entries seen: ${JSON.stringify(dataMounts)}`,
+);
+check(
+  'DB_PATH points inside /data (the mount and the env are two halves of one invariant)',
+  composeLines.some((l) => /^DB_PATH:\s*\/data\/\S+/.test(l)),
+  `no "DB_PATH: /data/<file>" directive in the server service — a store outside /data is unreachable from the host and lost on container recreate`,
+);
+check(
+  'no named volume holds the telemetry store',
+  !dataMounts.some((l) => /^-\s*"?[A-Za-z_][\w-]*:\/data"?$/.test(l)),
+  `a named volume is still mounted at /data (${JSON.stringify(dataMounts)}) — positions would again be unreachable from the host`,
+);
+
 // ── 6. The provisioning script the whole stack now depends on must exist and be executable ───────
 const provision = join(REPO, 'server', 'mosquitto', 'dev-provision.sh');
 check(

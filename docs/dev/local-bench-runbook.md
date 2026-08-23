@@ -44,6 +44,15 @@ docker compose logs -f server   # expect "http listening" + "mqtt connected"
 > `MQTT_PASSWORD is not set` from compose means the provisioning step above hasn't run. That is on
 > purpose — the alternative used to be a broker that accepted anybody.
 
+The telemetry store is `./server/data/telemetry.db` on the host (a bind mount — it used to be a named volume no
+host path could reach, which broke erasure: audit §4.5 d). To erase a player while the stack is up, run the CLI
+**inside the container** so it sees the container's `DB_PATH`:
+```sh
+docker compose exec -T server bun run purge-player.ts <playerId> [sessionId]   # exit 0 = erased; 3 retry; 4 re-run; 5 wrong DB_PATH
+```
+It VACUUMs the store (the live server pauses for the duration — seconds on a big store), so do this between
+sessions, not mid-match.
+
 Smoke-test the broker → server path without hardware. Publishing now needs credentials — use a
 wearable account from the provisioning step (its ACL allows exactly its own player topic):
 ```sh
@@ -163,6 +172,8 @@ and `localhost` can resolve to `::1` first. Two consequences worth knowing befor
 | `mosquitto_pub` → `Connection Refused: not authorised` | The dev broker is authenticated now | Pass `-u <playerId> -P <password>` from §1; the ACL allows only that player's own topic |
 | Coach view unreachable from another device on the Wi-Fi | Deliberate: the server is published on `127.0.0.1` only, because this stack needs no login | This-machine-only is the posture; a pitch-side tablet is the Caddy + real-auth deployment |
 | Live view shows ids (`01`) instead of names; no Review toggle | You are the anonymous principal — names + Review need a real login | Click **Sign in for names & review** and log in with a coach account (§5) |
+| `purge-player.ts` exits `5` (`DB_PATH does not exist` / `read-only`) | Paths are cwd-relative: the container's `/data/…` vs the host's `./server/data/…`; on Linux the bind mount is root-owned | Stack up: `docker compose exec -T server bun run purge-player.ts …`; stack down: `cd server && DB_PATH=./data/telemetry.db bun run purge-player.ts …` (the receipt prints the absolute `dbPath` it looked for) |
+| `purge-player.ts` exits `4` (`WAL checkpoint stayed busy`) | A reader pinned the WAL at that instant | Re-run the same command; it is idempotent and exits `0` once the WAL truncates |
 
 ## Related
 - [`firmware/README.md`](../../firmware/README.md) — wiring, enrollment console, credential rotation.

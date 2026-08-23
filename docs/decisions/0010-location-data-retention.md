@@ -16,11 +16,19 @@ not the indefinite raw trace.
 - **Cloud (relay):** stores **aggregates only** — never durable raw 10 Hz.
 - **Right to erasure:** a `purge-player <playerId>` operation deletes raw + aggregates + roster entry + the
   cloud aggregate copy for that player.
-  - *Shipped today (raw only):* [`server/purge-player.ts`](../../server/purge-player.ts) erases the raw
-    `telemetry` rows (`secure_delete` zeroes the bytes). Aggregates/roster/cloud copies don't exist yet;
-    when they land, extend the CLI to purge them too. Two residuals it can't reach — the running server's
-    in-memory Prometheus series (clear by restart) and pre-wipe DB backups — are in the
-    [erasure runbook](../architecture/observability.md).
+  - *Shipped (raw + roster):* [`server/purge-player.ts`](../../server/purge-player.ts) erases the raw
+    `telemetry` rows in indexed, bounded batches **and** the roster entry, then forces a WAL `TRUNCATE`
+    checkpoint so `secure_delete`'s zeroed pages replace the old ones on disk (with `journal_size_limit = 0`
+    every later WAL reset truncates too). The roster rewrite is a permissive read-modify-write that preserves
+    everything it is not asked to remove and fails loudly on an unreadable file; a missing `DB_PATH` is a
+    distinct exit (`5`, wrong file) so it can never be reported as "erased 0". The retention sweep also prunes
+    roster sessions whose fixes are all gone (after the same window, keyed on a per-session provisioning stamp
+    so names entered ahead of a match survive). Aggregates/cloud copies don't exist yet; when they land,
+    extend the CLI to purge them too. Two residuals it can't reach — the running server's in-memory
+    Prometheus series (clear by restart) and pre-wipe DB backups — are in the
+    [erasure runbook](../architecture/observability.md). The five ways this was broken before Phase 2b are
+    in the [2026-08-03 audit](../audit/2026-08-03-production-readiness.md) §4.5 and pinned by
+    `server/test/erasure-audit.ts`.
 - **Pseudonymity:** the telemetry DB carries only opaque `playerId`; the `playerId → name` roster is a
   separate, access-controlled, encrypted store.
 

@@ -13,9 +13,15 @@
  *   - ft_retention_last_run_timestamp_seconds  — liveness: did the sweep actually run
  *   - ft_retention_sweep_failures_total        — did it error
  *   - ft_oldest_raw_fix_age_seconds            — data-minimisation SLI (oldest fix still held)
+ *   - ft_retention_roster_sessions_pruned_total — roster sessions dropped because their fixes are gone
+ *
+ * The sweep ALSO bounds the name↔playerId map (audit §4.5): once a session's last raw fix has expired,
+ * its roster entries have no location left to identify and are dropped after the same window — otherwise
+ * roster.json would outlive every fix it names, with no time bound and no SLI watching it.
  */
 
-import { purgeOlderThan, oldestServerTs } from './db';
+import { purgeOlderThan, oldestServerTs, sessionHasTelemetry } from './db';
+import { pruneRosterSessions } from './roster';
 import { metrics } from './metrics';
 import { log } from './log';
 
@@ -67,6 +73,15 @@ export async function runRetention(now: number = Date.now()): Promise<number> {
       metrics.retentionSweepFailures.inc();
       log.error('retention purge failed', { err: String(err) });
     }
+    // Names follow the fixes: prune roster sessions with nothing left to identify. Its own try — a roster
+    // file problem must not be mistaken for a telemetry-sweep failure, and vice versa.
+    try {
+      const pruned = await pruneRosterSessions(sessionHasTelemetry, now, RETENTION_DAYS * DAY_MS);
+      metrics.rosterSessionsPruned.inc({}, pruned);
+    } catch (err) {
+      metrics.retentionSweepFailures.inc();
+      log.error('roster prune failed', { err: String(err) }); // content-free by construction (roster.ts)
+    }
   }
   // Always emit the work signal (present-at-0) and the liveness stamp — success or caught
   // failure — so an operator can tell "ran, nothing expired" from "never ran".
@@ -88,6 +103,7 @@ export function startRetention(): ReturnType<typeof setInterval> {
   // Seed the work counter so it is present-at-0 from the first scrape, before the first
   // sweep completes — otherwise "stays at 0" / rate() alerts have no series to bind to.
   metrics.retentionPurged.inc({}, 0);
+  metrics.rosterSessionsPruned.inc({}, 0);
   void runRetention();
   const timer = setInterval(() => void runRetention(), SWEEP_MS);
   // Don't let the sweep timer by itself hold the process open.

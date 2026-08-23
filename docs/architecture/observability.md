@@ -161,7 +161,8 @@ guarantee *observable* — see [ADR-0010](../decisions/0010-location-data-retent
 | `ft_oldest_raw_fix_age_seconds` | gauge | Age of the oldest raw fix still stored (0 if empty) — the **data-minimisation SLI** |
 | `ft_retention_rows_purged_total` | counter | Rows the sweep deleted (seeded present-at-0 at boot, so `rate()`/"stays 0" rules bind) |
 | `ft_retention_last_run_timestamp_seconds` | gauge | Unix time the sweep last ran (success **or** caught failure) — liveness |
-| `ft_retention_sweep_failures_total` | counter | Sweeps that threw (caught; the server keeps serving) |
+| `ft_retention_sweep_failures_total` | counter | Sweep stages that threw (telemetry purge **and** roster prune count separately; caught; the server keeps serving) |
+| `ft_retention_roster_sessions_pruned_total` | counter | Roster sessions dropped because no fix remained and the provisioning stamp aged past the window (present-at-0) |
 
 > **Alerting note (avoids false flaps):** the oldest fix legitimately ages to `RETENTION_DAYS` **plus up
 > to one sweep interval** before the next sweep removes it, so an alert needs headroom **and** a `for:`
@@ -324,16 +325,42 @@ Walk the signals from the edge inward:
 
 ## Runbook — right-to-erasure / lost-device wipe (ADR-0010)
 
-To erase one player's raw location (GDPR request, or a lost/stolen device):
+To erase one player's raw location AND their roster name (GDPR request, or a lost/stolen device):
 
 ```
-cd server && DB_PATH=<field-box-db> bun run purge-player.ts <playerId> [sessionId]
+# while the Docker stack is up — run it INSIDE the container, against the container's DB_PATH:
+docker compose exec -T server bun run purge-player.ts <playerId> [sessionId]
+
+# with the stack down, from the host (the store is the bind-mounted ./server/data):
+cd server && DB_PATH=./data/telemetry.db bun run purge-player.ts <playerId> [sessionId]
 ```
 
-It prints a JSON receipt `{erased:N,...}` and exits 0; on failure it prints `{erased:0,...,retry:true}`
-and exits 3 — **treat a non-zero exit as "not erased" and retry**, never assume the wipe happened.
-`PRAGMA secure_delete` ([`db.ts`](../../server/src/db.ts)) zeroes the freed pages, so the bytes are
-destroyed in the live DB once the WAL checkpoints (not merely unlinked).
+It prints a JSON receipt `{erased:N, rosterEntriesErased:M, walTruncated:true, vacuumed:true, rosterFound:true, …}`
+and exits 0. Ids are validated (`[A-Za-z0-9._-]{1,64}`) so a typo cannot become an "erased 0" record filed for the
+real player; `rosterFound:false` means no roster file at the path the receipt names — either no names were ever
+provisioned, or you ran it from the wrong cwd. **The exit code is the verdict** — read it, not the receipt's presence:
+
+| exit | meaning | what to do |
+|---|---|---|
+| `0` | erased: rows deleted, roster entry removed, WAL truncated | keep the receipt as the compliance record |
+| `3` | the erasure did **not** complete (roster locked/unreadable/unwritable, DB busy, delete failed); `erased` in the receipt is the TRUE count of rows already gone (0 when the roster was unreadable — it is checked first) | re-run; it is idempotent |
+| `4` | rows + roster entry erased but the WAL could not be truncated (a reader held it) — residue may remain on disk | re-run the **same** command (idempotent) until it exits `0` |
+| `5` | `DB_PATH` is the **wrong file** (missing, empty, not SQLite, or read-only for this user) — not a transient fault | fix `DB_PATH`/ownership (see the two forms above; the receipt prints the absolute path it tried); retrying the same path erases nothing, forever |
+
+Why the VACUUM and the checkpoint matter: `PRAGMA secure_delete` ([`db.ts`](../../server/src/db.ts)) zeroes pages
+that are *freed* — but a leaf page a surviving player still occupies is rebalanced in place and keeps the erased
+rows' bytes in its unused gap (the Phase 2b checker found ~0.2–0.5 % of an erased player's rows recoverable that
+way in the everyday round-robin ingest layout). The CLI therefore runs `VACUUM` (every page rebuilt), then a
+`wal_checkpoint(TRUNCATE)` so the rebuilt pages replace the old ones in the main file and the WAL shrinks to 0
+bytes; `journal_size_limit = 0` makes every later WAL reset truncate too. **VACUUM holds the write lock for a time
+proportional to store size** (the live server pauses; on a big store, seconds) — erase between sessions, not
+mid-match. Before Phase 2b an erasure receipt of `{"erased":300}` left the identifier ~9,000× in the sidecar
+(audit §4.5 a).
+
+On a **Linux** host Docker creates the bind-mounted `./server/data` root-owned (the bun image runs as root), so the
+host-side form fails with a read-only store (exit 5, `retry:false`) — use the `docker compose exec` form there.
+
+Verify on disk if you need to (the acceptance check the gate runs): `! strings -a telemetry.db telemetry.db-wal | grep -q <playerId>`.
 
 Two residuals the CLI **cannot** reach from its separate process — clear them by hand:
 1. **In-memory Prometheus series.** The running server holds per-player gauges
@@ -343,9 +370,17 @@ Two residuals the CLI **cannot** reach from its separate process — clear them 
 2. **Backups.** Any file-level copy of `telemetry.db` taken before the wipe still holds the data — purge
    or rotate backups per your retention policy.
 
-> Not built yet (raw-only store today): when aggregates / roster / cloud-copy stores land, extend
-> `purge-player.ts` to delete those in the same call. Tracked in the
-> [board review](reviews/2026-06-14-architecture-board-review.md) (action #3, risk #6).
+Names also expire on their own: the retention sweep drops a roster session once none of its fixes remain
+and its provisioning stamp (`sessionMeta.<id>.updatedAt`, written by `roster-user.ts set`) is older than
+`RETENTION_DAYS` — counted by `ft_retention_roster_sessions_pruned_total` and logged at WARN with the session id.
+A roster entered *before* a match (no fixes yet, fresh stamp) is kept — **but the bound is real: names for a session
+that never receives a fix expire `RETENTION_DAYS` after the last `set`.** Provisioning more than a month ahead?
+Re-run `roster-user.ts set` closer to the date to renew the stamp. Every writer of `roster.json` (the sweep, the
+purge CLI, `roster-user.ts`) takes a lock file beside it (`roster.json.lock`, stale after 60 s) so no two can race.
+
+> Aggregates and the cloud aggregate copy do not exist yet; when they land, extend `purge-player.ts` to delete
+> them in the same call. Tracked in the [board review](reviews/2026-06-14-architecture-board-review.md)
+> (action #3, risk #6).
 
 ---
 

@@ -66,7 +66,7 @@ function readRoster(): Record<string, RosterEntry[]> {
 }
 
 // Fresh temp file each run.
-if (existsSync(ROSTER_FILE)) rmSync(ROSTER_FILE);
+for (const f of [ROSTER_FILE, `${ROSTER_FILE}.lock`]) rmSync(f, { force: true }); // a crashed earlier run must not leave a lock behind
 
 try {
   // --- 1. set s1/07 -> exit 0; file exists, 0o600, correct shape ----------------------------------------
@@ -104,6 +104,15 @@ try {
   const listOne = await runCli(['list', SESSION]);
   assert(listOne.code === 0 && listOne.stdout.includes(PID_A), `list ${SESSION} should show its entries`);
 
+  // --- 3b. set stamps the session (audit §4.5: the retention sweep prunes roster sessions that outlived
+  // their fixes, and needs to know a session was provisioned RECENTLY so it never deletes names entered
+  // ahead of a match). The stamp lives beside `sessions`, not inside it, so the serving loader's shape is
+  // untouched.
+  const stamped = JSON.parse(readFileSync(ROSTER_FILE, 'utf8')) as { sessionMeta?: Record<string, { updatedAt?: number }> };
+  const updatedAt = stamped.sessionMeta?.[SESSION]?.updatedAt;
+  assert(typeof updatedAt === 'number' && Number.isFinite(updatedAt) && Math.abs(Date.now() - updatedAt) < 60_000,
+    `set must write sessionMeta.${SESSION}.updatedAt as a recent epoch-ms stamp, got ${JSON.stringify(stamped.sessionMeta)}`);
+
   // --- 4. remove s1/07 -> exit 0; later list no longer shows 07 but still shows 09 ----------------------
   const rm = await runCli(['remove', SESSION, PID_A]);
   assert(rm.code === 0, `remove ${SESSION}/${PID_A} should exit 0, got ${rm.code} (stderr: ${rm.stderr.trim()})`);
@@ -120,6 +129,15 @@ try {
   sessions = readRoster();
   assert(sessions[SESSION].length === 1 && sessions[SESSION][0].playerId === PID_B,
     `a failed remove must leave the file intact (only ${PID_B}), got ${JSON.stringify(sessions[SESSION])}`);
+
+  // --- 5b. removing the LAST entry drops the session AND its stamp (no orphaned metadata) --------------
+  const rmLast = await runCli(['remove', SESSION, PID_B]);
+  assert(rmLast.code === 0, `remove ${SESSION}/${PID_B} should exit 0, got ${rmLast.code}`);
+  const emptied = JSON.parse(readFileSync(ROSTER_FILE, 'utf8')) as { sessions: Record<string, unknown>; sessionMeta?: Record<string, unknown> };
+  assert(emptied.sessions[SESSION] === undefined, 'removing the last entry drops the session');
+  assert(emptied.sessionMeta?.[SESSION] === undefined, `removing the last entry must drop its stamp too, got ${JSON.stringify(emptied.sessionMeta)}`);
+  const reset = await runCli(['set', SESSION, PID_B, NAME_B]); // restore the precondition for section 6
+  assert(reset.code === 0, 'restoring the entry should exit 0');
 
   // --- 6. set with a 65-char name -> NONZERO exit AND stderr does NOT contain the name string -----------
   const setLong = await runCli(['set', SESSION, '13', OVER_LONG_NAME]);
@@ -138,10 +156,10 @@ try {
   console.log('\n✅ ROSTER CLI PASSED — set writes 0o600 {sessions} JSON (upsert, not dup), list shows current state, '
     + 'remove drops one & keeps the other, remove-absent errors without corrupting the file, and a 65-char name '
     + 'exits nonzero WITHOUT the name value in stderr (value-free validation error)');
-  if (existsSync(ROSTER_FILE)) rmSync(ROSTER_FILE);
+  for (const f of [ROSTER_FILE, `${ROSTER_FILE}.lock`]) rmSync(f, { force: true });
   process.exit(0);
 } catch (err) {
   console.error('\n❌ ROSTER CLI FAILED:', (err as Error).message);
-  try { if (existsSync(ROSTER_FILE)) rmSync(ROSTER_FILE); } catch { /* noop */ }
+  try { for (const f of [ROSTER_FILE, `${ROSTER_FILE}.lock`]) rmSync(f, { force: true }); } catch { /* noop */ }
   process.exit(1);
 }
