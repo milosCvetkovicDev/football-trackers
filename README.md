@@ -187,7 +187,7 @@ bun run test/scan-load.ts        # the off-loop inflight cap is genuinely SHARED
 ```
 Erase one player's raw location (GDPR / lost device — see [ADR-0010](docs/decisions/0010-location-data-retention.md)):
 ```
-bun run purge-player.ts <playerId> [sessionId]   # exit 0 + JSON receipt; 3 = not erased (retry); 4 = WAL not truncated (re-run); 5 = wrong DB_PATH
+bun run purge-player.ts <playerId> [sessionId]   # exit 0 + JSON receipt; 3 = transient, re-run; 4 = rebuild incomplete, re-run; 5 = permanent (wrong file/path/permissions/disk), fix first
 ```
 
 ### Simulate a device fleet (no hardware)

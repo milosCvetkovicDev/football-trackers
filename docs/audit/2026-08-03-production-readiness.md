@@ -572,6 +572,15 @@ phase closes (maker ≠ checker). Out-of-scope discoveries go to a triage list, 
 > itself; the new counter is in the metrics table. **Known, documented bound:** names for a session that never receives
 > a fix expire `RETENTION_DAYS` after the last `roster-user.ts set` (re-run `set` to renew) — a WARN names the session.
 >
+> A **second** checker pass on the fixed code (lock, VACUUM, CLI) found no erasure-integrity defect but hardened the
+> new machinery: the roster lock was held across the whole DB delete (minutes on a huge store, past its own 60 s
+> stale rule) — now two millisecond windows, a dead holder broken atomically, a live one never broken; permanent
+> conditions (bad roster path/permissions, malformed file, un-removable lock, full disk, a name nested where the
+> rewrite cannot reach) are exit 5 `retry:false`, not "retry"; receipts carry `storeBytes` + per-stage timings; the
+> CLI refuses when the disk cannot hold the ~2.5× rebuild; the `strings | grep` verification one-liner (false-pass
+> on a missing file, false-fail on substrings) is replaced. Known, documented cost: on a ~1 GB store the rebuild is
+> tens of seconds to ~2 minutes and a live server drops fixes meanwhile — erase between sessions.
+>
 > Two test-harness lessons worth keeping: an un-finalised `EXPLAIN` statement on a bun:sqlite connection pins a WAL
 > snapshot once any later statement runs (prepare + finalize it); and an unreferenced `Database` in a helper process
 > is garbage-collected mid-`await`, silently closing the connection — the "pinned reader" that was not pinning.

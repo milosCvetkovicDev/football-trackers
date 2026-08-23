@@ -50,8 +50,9 @@ host path could reach, which broke erasure: audit §4.5 d). To erase a player wh
 ```sh
 docker compose exec -T server bun run purge-player.ts <playerId> [sessionId]   # exit 0 = erased; 3 retry; 4 re-run; 5 wrong DB_PATH
 ```
-It VACUUMs the store (the live server pauses for the duration — seconds on a big store), so do this between
-sessions, not mid-match.
+It rebuilds the store (secure-delete batches + VACUUM — the live server drops fixes for the duration: tens of seconds
+to ~2 minutes on a ~1 GB store; the receipt's `totalMs` says how long), so do this between sessions, not mid-match.
+It refuses up front (exit 5) if the disk cannot hold the ~2.5× transient rebuild.
 
 Smoke-test the broker → server path without hardware. Publishing now needs credentials — use a
 wearable account from the provisioning step (its ACL allows exactly its own player topic):
@@ -173,7 +174,8 @@ and `localhost` can resolve to `::1` first. Two consequences worth knowing befor
 | Coach view unreachable from another device on the Wi-Fi | Deliberate: the server is published on `127.0.0.1` only, because this stack needs no login | This-machine-only is the posture; a pitch-side tablet is the Caddy + real-auth deployment |
 | Live view shows ids (`01`) instead of names; no Review toggle | You are the anonymous principal — names + Review need a real login | Click **Sign in for names & review** and log in with a coach account (§5) |
 | `purge-player.ts` exits `5` (`DB_PATH does not exist` / `read-only`) | Paths are cwd-relative: the container's `/data/…` vs the host's `./server/data/…`; on Linux the bind mount is root-owned | Stack up: `docker compose exec -T server bun run purge-player.ts …`; stack down: `cd server && DB_PATH=./data/telemetry.db bun run purge-player.ts …` (the receipt prints the absolute `dbPath` it looked for) |
-| `purge-player.ts` exits `4` (`WAL checkpoint stayed busy`) | A reader pinned the WAL at that instant | Re-run the same command; it is idempotent and exits `0` once the WAL truncates |
+| `purge-player.ts` exits `4` (receipt `walTruncated:false`, `retry:true`) | A reader pinned the WAL, or the live server was mid-checkpoint (the `error` says which) | Re-run the same command; it is idempotent and exits `0` once the WAL truncates |
+| `purge-player.ts` exits `3` (`locked by another writer: … held by pid N`) | A purge, the retention sweep or `roster-user.ts` holds `roster.json.lock` | Wait for it; a dead holder's lock is broken automatically, a live one is never pulled from under |
 
 ## Related
 - [`firmware/README.md`](../../firmware/README.md) — wiring, enrollment console, credential rotation.

@@ -79,8 +79,14 @@ export async function runRetention(now: number = Date.now()): Promise<number> {
       const pruned = await pruneRosterSessions(sessionHasTelemetry, now, RETENTION_DAYS * DAY_MS);
       metrics.rosterSessionsPruned.inc({}, pruned);
     } catch (err) {
-      metrics.retentionSweepFailures.inc();
-      log.error('roster prune failed', { err: String(err) }); // content-free by construction (roster.ts)
+      if (/locked by another writer/.test(String(err))) {
+        // A purge-player.ts or roster-user.ts run overlapping the tick is benign: skip this hour's prune,
+        // do not trip the sweep-failure alert.
+        log.warn('roster prune skipped — the roster is locked by another writer; next sweep will retry');
+      } else {
+        metrics.retentionSweepFailures.inc();
+        log.error('roster prune failed', { err: String(err) }); // content-free by construction (roster.ts)
+      }
     }
   }
   // Always emit the work signal (present-at-0) and the liveness stamp — success or caught

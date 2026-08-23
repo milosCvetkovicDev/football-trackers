@@ -14,10 +14,10 @@
  *   (c) collateral       — erasing one player from one session leaves every other session semantically
  *                          identical (order + unknown keys preserved), including entries the serving loader
  *                          would reject and unknown top-level keys.
- *   (b') unreadable file — an unreadable roster must exit NON-ZERO with retry:true, never a success receipt —
- *                          and it must be detected BEFORE any row is deleted, so "nothing was changed" is true.
+ *   (b') unreadable file — an unreadable/malformed roster must exit NON-ZERO, never a success receipt — and it
+ *                          must be detected BEFORE any row is deleted, so "nothing was changed" is true.
  *   (f)  honest failure  — a roster WRITE failure after rows were deleted must report the rows actually erased
- *                          and still truncate the WAL; the re-run must then exit 0.
+ *                          and still truncate the WAL (exit 5: permissions are permanent); the re-run must exit 0.
  *   (g)  locked file     — a concurrent roster writer (the retention sweep) holds a lock; the CLI must wait,
  *                          then fail non-zero rather than race it; a stale lock is broken.
  *   (e) wrong DB         — a DB_PATH that does not exist, is empty, or is not a SQLite file must exit with a
@@ -209,11 +209,15 @@ try {
   // ── (a) + (c): erase ERASE_ME from session sat ──────────────────────────────────────────────────
   const purge = await runCli('purge-player.ts', [ERASE_ME, 'sat']);
   assert(purge.code === 0, `purge-player ${ERASE_ME} sat should exit 0, got ${purge.code} (stderr: ${purge.stderr.trim().slice(-400)})`);
-  const receipt = lastJson(purge.stdout) as { erased: number; rosterEntriesErased: number; walTruncated: boolean; vacuumed: boolean };
+  const receipt = lastJson(purge.stdout) as { erased: number; rosterEntriesErased: number; walTruncated: boolean; vacuumed: boolean; storeBytes: number };
   assert(receipt.erased === 3000, `receipt erased must be 3000, got ${receipt.erased}`);
   assert(receipt.rosterEntriesErased === 1, `receipt rosterEntriesErased must be 1, got ${receipt.rosterEntriesErased}`);
   assert(receipt.walTruncated === true, `receipt must report walTruncated:true, got ${JSON.stringify(receipt)}`);
   assert(receipt.vacuumed === true, `receipt must report vacuumed:true — without a VACUUM the gap of a rebalanced leaf page keeps whole rows, got ${JSON.stringify(receipt)}`);
+  for (const k of ['deleteMs', 'vacuumMs', 'checkpointMs', 'totalMs', 'storeBytes'] as const) {
+    const v = (receipt as unknown as Record<string, unknown>)[k];
+    assert(typeof v === 'number' && v >= 0, `receipt must carry ${k} (the compliance record shows how long the store was under the knife), got ${JSON.stringify(receipt)}`);
+  }
   assert(rowsFor(ERASE_ME) === 0 && rowsFor(KEEP_SAT) === 1000, 'the departing child is gone from the table; the sibling survives');
   for (const p of SQUAD) assert(rowsFor(p) === 600, `squad player ${p} must be untouched`);
 
@@ -255,9 +259,9 @@ try {
   // ── (b'): an unreadable roster is a FAILED erasure — non-zero, retry:true, and NOTHING deleted ──
   writeFileSync(ROSTER_FILE, '{ this is not json', { mode: 0o600 });
   const bad = await runCli('purge-player.ts', [SUN_A]);
-  assert(bad.code === 3, `(b') a malformed roster must exit 3 (not erased — retry), got ${bad.code} (stdout: ${bad.stdout.trim()})`);
+  assert(bad.code === 5, `(b') a malformed roster must exit 5 (not erased — fix the file, a blind retry cannot succeed), got ${bad.code} (stdout: ${bad.stdout.trim()})`);
   const badReceipt = lastJson(bad.stderr) as { retry?: boolean; error?: string; erased?: number };
-  assert(badReceipt.retry === true, `(b') the failure receipt must say retry:true, got ${bad.stderr.trim()}`);
+  assert(badReceipt.retry === false, `(b') the failure receipt must say retry:false, got ${bad.stderr.trim()}`);
   assert(!/this is not json/.test(bad.stderr), '(b\') the receipt must never echo roster file CONTENT (it holds names)');
   assert(readFileSync(ROSTER_FILE, 'utf8') === '{ this is not json', '(b\') a failed erasure must not rewrite the file');
   assert(rowsFor(SUN_A) === 20 && badReceipt.erased === 0,
@@ -273,10 +277,10 @@ try {
   chmodSync(RO_DIR, 0o500);
   const roFail = await runCli('purge-player.ts', [SUN_A], { AUTH_ROSTER_FILE: RO_LINK });
   chmodSync(RO_DIR, 0o700);
-  assert(roFail.code === 3, `(f) a roster write failure must exit 3, got ${roFail.code} (stdout: ${roFail.stdout.trim()})`);
+  assert(roFail.code === 5, `(f) a roster write failure (permissions) must exit 5 — fix it, a blind retry cannot succeed — got ${roFail.code} (stdout: ${roFail.stdout.trim()})`);
   const roReceipt = lastJson(roFail.stderr) as { erased?: number; rosterEntriesErased?: number; walTruncated?: boolean; retry?: boolean; error?: string };
   assert(roReceipt.erased === 20, `(f) the failure receipt must report the rows ACTUALLY erased (20), got ${JSON.stringify(roReceipt)}`);
-  assert(roReceipt.rosterEntriesErased === 0 && roReceipt.retry === true, `(f) …and rosterEntriesErased:0, retry:true, got ${JSON.stringify(roReceipt)}`);
+  assert(roReceipt.rosterEntriesErased === 0 && roReceipt.retry === false, `(f) …and rosterEntriesErased:0, retry:false, got ${JSON.stringify(roReceipt)}`);
   assert(roReceipt.walTruncated === true, `(f) the WAL must still be truncated on the failure path, got ${JSON.stringify(roReceipt)}`);
   assert(!/Sunday A/.test(roFail.stderr) && !/Sunday A/.test(roFail.stdout), '(f) no name may reach the console on the failure path');
   assert(!existsSync(`${RO_DIR}`) || !readFileSync(RO_ROSTER, 'utf8').includes('tmp'), 'sanity');
@@ -299,12 +303,41 @@ try {
   assert(/lock/i.test(String((lastJson(locked.stderr) as { error?: string }).error)), `(g) the receipt must say the roster was locked, got ${locked.stderr.trim().slice(-300)}`);
   assert(locked.ms >= 1_000, `(g) the CLI must WAIT for the lock before giving up (took ${locked.ms} ms)`);
   assert(readFileSync(ROSTER_FILE, 'utf8').includes('Sunday A') && rowsFor(SUN_A) === 5, '(g) a locked roster must change nothing');
+  const lockedErr = String((lastJson(locked.stderr) as { error?: string }).error);
+  assert(new RegExp(`pid ${process.pid}`).test(lockedErr) && /alive/.test(lockedErr) && lockedErr.includes(LOCK),
+    `(g) the lock error must name the lock path, the holder pid and whether it is alive, got: ${lockedErr}`);
+  // An OLD lock whose holder is STILL ALIVE is not stale — a long-running holder must never be broken from under.
   const stale = new Date(Date.now() - 10 * 60_000);
   utimesSync(LOCK, stale, stale);
+  const stillHeld = await runCli('purge-player.ts', [SUN_A]);
+  assert(stillHeld.code === 3, `(g) a 10-min-old lock whose pid is ALIVE must still be respected (exit 3), got ${stillHeld.code} (stdout: ${stillHeld.stdout.trim()})`);
+  assert(readFileSync(ROSTER_FILE, 'utf8').includes('Sunday A') && existsSync(LOCK), '(g) a live holder\'s lock is neither broken nor changed');
+  // A lock whose holder is DEAD is broken immediately (no 60 s wait), whatever its age.
+  const ghost = Bun.spawnSync(['true']); // a pid that has already exited
+  writeFileSync(LOCK, String(ghost.pid));
   const unstuck = await runCli('purge-player.ts', [SUN_A]);
-  assert(unstuck.code === 0, `(g) a STALE lock (10 min old) must be broken and the purge proceed, got ${unstuck.code} (stderr: ${unstuck.stderr.trim().slice(-300)})`);
+  assert(unstuck.code === 0, `(g) a lock whose holder pid is DEAD must be broken and the purge proceed, got ${unstuck.code} (stderr: ${unstuck.stderr.trim().slice(-300)})`);
+  assert(unstuck.ms < 2_500, `(g) a dead holder's lock must be broken without waiting for the deadline (took ${unstuck.ms} ms)`);
   assert(!existsSync(LOCK), '(g) the CLI must release the lock it took');
-  assert(!readFileSync(ROSTER_FILE, 'utf8').includes('Sunday A'), '(g) the name is gone after the stale lock was broken');
+  assert(!readFileSync(ROSTER_FILE, 'utf8').includes('Sunday A'), '(g) the name is gone after the dead lock was broken');
+  // A lock that cannot be removed (it is a DIRECTORY) must fail fast with a clear error, not spin forever.
+  mkdirSync(LOCK);
+  const dirLock = await runCli('purge-player.ts', ['SUN-B']);
+  rmSync(LOCK, { recursive: true, force: true });
+  assert(dirLock.code === 5 && dirLock.ms < 6_000, `(g) an un-removable lock must exit 5 promptly (permanent condition), got ${dirLock.code} in ${dirLock.ms} ms (stderr: ${dirLock.stderr.trim().slice(-300)})`);
+  assert((lastJson(dirLock.stderr) as { retry?: boolean }).retry === false, '(g) …with retry:false');
+
+  // ── (j): permanent roster-path/permission problems are exit 5, not "retry" ────────────────────────
+  const noDir = await runCli('purge-player.ts', ['SUN-B'], { AUTH_ROSTER_FILE: `${DIR}/no-such-dir/roster.json` });
+  assert(noDir.code === 5 && (lastJson(noDir.stderr) as { retry?: boolean }).retry === false,
+    `(j) a roster path in a non-existent directory can never be fixed by retrying — exit 5 retry:false, got ${noDir.code} (stderr: ${noDir.stderr.trim().slice(-300)})`);
+  assert(rowsFor('SUN-B') === 0 && (lastJson(noDir.stderr) as { rosterFound?: unknown }).rosterFound === null,
+    '(j) nothing deleted, and rosterFound is null (unknown) on a receipt emitted before the roster was read');
+  // A name hidden in a structure the rewrite does not interpret must not pass for erased.
+  writeRoster({ sessions: { odd: [[{ playerId: 'ODD-1', displayName: 'Nested Name' }]] } });
+  const nested = await runCli('purge-player.ts', ['ODD-1']);
+  assert(nested.code === 5 && /unrecognised structure/.test(String((lastJson(nested.stderr) as { error?: string }).error)),
+    `(j) an entry nested where the rewrite cannot reach it must fail with "unrecognised structure" (exit 5), got ${nested.code} (stderr: ${nested.stderr.trim().slice(-300)})`);
 
   // ── (h): a reader pinning the WAL → exit 4 QUICKLY, then the re-run exits 0 ──────────────────────
   writeRoster({ sessions: { pin: [{ playerId: PIN_ID, displayName: 'Pinned Child' }] } });
@@ -350,7 +383,7 @@ try {
   }
 
   console.log('\n✅ ERASURE AUDIT PASSED — no on-disk residue (interleaved + round-robin layouts, VACUUM + TRUNCATE), duplicate ids erased, '
-    + 'other sessions preserved, unreadable roster → exit 3 before any delete, honest failure receipts, lock respected / stale lock broken, '
+    + 'other sessions preserved, unreadable roster → exit 5 before any delete, honest failure receipts, lock respected / stale lock broken, '
     + 'pinned reader → fast exit 4 then 0, wrong DB → exit 5 untouched, ids validated, delete path indexed + batched');
   cleanup();
   process.exit(0);

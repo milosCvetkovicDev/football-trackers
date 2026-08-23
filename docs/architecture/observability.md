@@ -343,9 +343,14 @@ provisioned, or you ran it from the wrong cwd. **The exit code is the verdict** 
 | exit | meaning | what to do |
 |---|---|---|
 | `0` | erased: rows deleted, roster entry removed, WAL truncated | keep the receipt as the compliance record |
-| `3` | the erasure did **not** complete (roster locked/unreadable/unwritable, DB busy, delete failed); `erased` in the receipt is the TRUE count of rows already gone (0 when the roster was unreadable — it is checked first) | re-run; it is idempotent |
-| `4` | rows + roster entry erased but the WAL could not be truncated (a reader held it) — residue may remain on disk | re-run the **same** command (idempotent) until it exits `0` |
-| `5` | `DB_PATH` is the **wrong file** (missing, empty, not SQLite, or read-only for this user) — not a transient fault | fix `DB_PATH`/ownership (see the two forms above; the receipt prints the absolute path it tried); retrying the same path erases nothing, forever |
+| `3` | **transient** — the erasure did not complete (roster locked by a live writer, DB busy, delete failed); `erased` in the receipt is the TRUE count of rows already gone | re-run; it is idempotent |
+| `4` | rows and roster entry erased but the on-disk rebuild did not complete (a reader pinned the WAL, or a live writer held the checkpoint lock — the `error` says which) — residue may remain | re-run the **same** command (idempotent) until it exits `0` |
+| `5` | **permanent** — fix something, do not just retry: `DB_PATH` is the wrong file (missing, empty, not SQLite, read-only for this user), the disk is too full for the rebuild (~2.5× the store), or the roster is unreadable / malformed / unwritable / a name sits in a structure the rewrite cannot reach | fix the path, permissions, disk or file (the receipt prints the absolute paths it used and `retry:false`); retrying unchanged erases nothing, forever |
+
+`rosterFound` is `null` on a receipt emitted before the roster was read (a lock or path problem), `false` when there
+is no file at the path named. Exit `0`/`4` receipts carry `deleteMs`, `vacuumMs`, `checkpointMs`, `totalMs` and
+`storeBytes` — how long the store was under the knife; on a ~1 GB store expect tens of seconds to ~2 minutes in
+total (the secure-delete batches dominate, not the VACUUM), during which the live server's inserts time out.
 
 Why the VACUUM and the checkpoint matter: `PRAGMA secure_delete` ([`db.ts`](../../server/src/db.ts)) zeroes pages
 that are *freed* — but a leaf page a surviving player still occupies is rebalanced in place and keeps the erased
@@ -360,7 +365,15 @@ mid-match. Before Phase 2b an erasure receipt of `{"erased":300}` left the ident
 On a **Linux** host Docker creates the bind-mounted `./server/data` root-owned (the bun image runs as root), so the
 host-side form fails with a read-only store (exit 5, `retry:false`) — use the `docker compose exec` form there.
 
-Verify on disk if you need to (the acceptance check the gate runs): `! strings -a telemetry.db telemetry.db-wal | grep -q <playerId>`.
+To verify on disk yourself, scan the exact files as bytes and fail loudly if they are not there — a plain
+`strings | grep` passes silently on a missing file and false-fails when a short id is a substring of a session id:
+
+```
+cd server && bun -e 'const fs=require("node:fs");const id=process.argv[1];const f=process.env.DB_PATH??"./data/telemetry.db";
+let n=0;for(const p of [f,f+"-wal"]){if(!fs.existsSync(p)){if(p===f){console.error("no such file:",p);process.exit(5)}continue}
+const b=fs.readFileSync(p);let i=b.indexOf(id);while(i!==-1){n++;i=b.indexOf(id,i+1)}}console.log(n?"RESIDUE "+n:"clean");process.exit(n?1:0)' <playerId>
+```
+(the gate's `server/test/erasure-audit.ts` does the same scan with long, distinctive ids).
 
 Two residuals the CLI **cannot** reach from its separate process — clear them by hand:
 1. **In-memory Prometheus series.** The running server holds per-player gauges
@@ -373,10 +386,14 @@ Two residuals the CLI **cannot** reach from its separate process — clear them 
 Names also expire on their own: the retention sweep drops a roster session once none of its fixes remain
 and its provisioning stamp (`sessionMeta.<id>.updatedAt`, written by `roster-user.ts set`) is older than
 `RETENTION_DAYS` — counted by `ft_retention_roster_sessions_pruned_total` and logged at WARN with the session id.
+A sweep tick that lands while a purge or `roster-user.ts` holds the roster lock skips that hour's prune (WARN, not a
+sweep failure).
 A roster entered *before* a match (no fixes yet, fresh stamp) is kept — **but the bound is real: names for a session
 that never receives a fix expire `RETENTION_DAYS` after the last `set`.** Provisioning more than a month ahead?
 Re-run `roster-user.ts set` closer to the date to renew the stamp. Every writer of `roster.json` (the sweep, the
-purge CLI, `roster-user.ts`) takes a lock file beside it (`roster.json.lock`, stale after 60 s) so no two can race.
+purge CLI, `roster-user.ts`) takes a lock file beside it (`roster.json.lock`, holder pid inside) for the milliseconds of
+the file round-trip — never across the DB delete — so no two can race. A lock whose holder is dead is broken at once;
+a live holder is waited for (3 s) and then reported by pid and age.
 
 > Aggregates and the cloud aggregate copy do not exist yet; when they land, extend `purge-player.ts` to delete
 > them in the same call. Tracked in the [board review](reviews/2026-06-14-architecture-board-review.md)

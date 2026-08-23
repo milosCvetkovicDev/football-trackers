@@ -209,11 +209,30 @@ async function rosterTarget(file: string): Promise<string> {
 // ----- lock: every writer of the file (CLI purge, sweep prune, roster-user.ts) serialises on it ----
 // Two unguarded read-modify-writes racing — the hourly sweep stamping/pruning while an operator runs
 // purge-player.ts — let the sweep's rename land last and write a just-erased name back behind a success
-// receipt. A lock file beside the roster (O_EXCL create) prevents that; a lock older than
-// ROSTER_LOCK_STALE_MS is a crashed holder and is broken.
+// receipt. A lock file beside the roster (O_EXCL create, holder pid inside) prevents that.
+//
+// Breaking a lock: a holder whose pid is DEAD is broken at once; a LIVE holder is never broken, however
+// old the lock (a long erasure must not have its lock pulled from under it) — the contender waits up to
+// ROSTER_LOCK_WAIT_MS and then fails with the holder's pid and age. A lock we cannot read the pid from is
+// treated as dead once older than ROSTER_LOCK_STALE_MS. The break itself is atomic (rename, then unlink):
+// two contenders cannot both "break" the same lock and both proceed.
+//
+// Critical sections are kept to the file round-trip (milliseconds) — never across the DB delete.
 const ROSTER_LOCK_WAIT_MS = 3_000;
 const ROSTER_LOCK_STALE_MS = 60_000;
 const ROSTER_LOCK_POLL_MS = 50;
+
+/** A lock problem that no retry will fix (directory in the way, missing/unwritable parent) — exit 5 territory. */
+export class RosterPermanentError extends Error {}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException)?.code === 'EPERM'; // exists, not ours — treat as alive
+  }
+}
 
 export async function withRosterLock<T>(fn: () => Promise<T>, file: string = ROSTER_FILE): Promise<T> {
   // Beside the CONFIGURED path (every writer in this repo uses the same AUTH_ROSTER_FILE string), not the
@@ -226,21 +245,43 @@ export async function withRosterLock<T>(fn: () => Promise<T>, file: string = ROS
       await writeFile(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
       break;
     } catch (e) {
-      if ((e as NodeJS.ErrnoException)?.code !== 'EEXIST') throw new Error(`roster lock is not creatable (${(e as NodeJS.ErrnoException)?.code ?? 'error'})`);
-      let age = 0;
+      const code = (e as NodeJS.ErrnoException)?.code;
+      if (code !== 'EEXIST') throw new RosterPermanentError(`roster lock ${lock} is not creatable (${code ?? 'error'}) — wrong AUTH_ROSTER_FILE path or directory permissions`);
+    }
+    // Someone holds it. Who, and are they alive?
+    let ageMs = 0;
+    let holderPid: number | undefined;
+    try {
+      const st = await stat(lock);
+      ageMs = Date.now() - st.mtimeMs;
+      if (st.isDirectory()) throw new RosterPermanentError(`roster lock ${lock} is a directory — remove it by hand`);
+      const pid = Number((await readFile(lock, 'utf8')).trim());
+      if (Number.isInteger(pid) && pid > 0) holderPid = pid;
+    } catch (e) {
+      if (e instanceof RosterPermanentError) throw e;
+      if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') continue; // vanished — retry the create at once
+    }
+    const dead = holderPid !== undefined ? !pidAlive(holderPid) : ageMs > ROSTER_LOCK_STALE_MS;
+    if (dead) {
+      // Atomic break: only ONE contender's rename succeeds; the others see ENOENT and simply retry.
+      const breaking = `${lock}.breaking.${process.pid}`;
       try {
-        age = Date.now() - (await stat(lock)).mtimeMs;
+        await rename(lock, breaking);
       } catch {
-        continue; // vanished between the two calls — retry the create immediately
-      }
-      if (age > ROSTER_LOCK_STALE_MS) {
-        await unlink(lock).catch(() => undefined); // crashed holder — break it (count only, never a name)
-        log.warn('roster: broke a stale lock', { ageMs: Math.round(age) });
         continue;
       }
-      if (Date.now() > deadline) throw new Error('roster file is locked by another writer (purge/prune/roster-user running?) — retry');
-      await new Promise((r) => setTimeout(r, ROSTER_LOCK_POLL_MS));
+      try {
+        await unlink(breaking);
+      } catch (e) {
+        throw new RosterPermanentError(`roster lock ${lock} is stale but cannot be removed (${(e as NodeJS.ErrnoException)?.code ?? 'error'}) — remove it by hand`);
+      }
+      log.warn('roster: broke a dead lock', { holderPid: holderPid ?? null, ageMs: Math.round(ageMs) }); // never a name
+      continue;
     }
+    if (Date.now() > deadline) {
+      throw new Error(`roster file is locked by another writer: ${lock} held by pid ${holderPid ?? '?'} (alive) for ${Math.round(ageMs / 1000)} s — a purge, the retention sweep or roster-user is running; retry when it finishes`);
+    }
+    await new Promise((r) => setTimeout(r, ROSTER_LOCK_POLL_MS));
   }
   try {
     return await fn();
@@ -256,17 +297,19 @@ export async function readRosterFile(file: string = ROSTER_FILE): Promise<Roster
     text = await readFile(file, 'utf8');
   } catch (e) {
     if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') return null;
-    throw new Error(`roster file is not readable (${(e as NodeJS.ErrnoException)?.code ?? 'error'})`);
+    const code = (e as NodeJS.ErrnoException)?.code ?? 'error';
+    if (code === 'EACCES' || code === 'EPERM' || code === 'EISDIR' || code === 'ENOTDIR') throw new RosterPermanentError(`roster file is not readable (${code}) — fix the path or permissions`);
+    throw new Error(`roster file is not readable (${code})`);
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new Error('roster file is not valid JSON — fix or restore it before re-running (roster unchanged)');
+    throw new RosterPermanentError('roster file is not valid JSON — fix or restore it, then re-run (roster unchanged)');
   }
   const sessions = (parsed as { sessions?: unknown })?.sessions;
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || !sessions || typeof sessions !== 'object' || Array.isArray(sessions)) {
-    throw new Error('roster file has no "sessions" object — fix or restore it before re-running (roster unchanged)');
+    throw new RosterPermanentError('roster file has no "sessions" object — fix or restore it, then re-run (roster unchanged)');
   }
   return parsed as RosterFileRaw;
 }
@@ -303,7 +346,9 @@ async function writeRosterRaw(file: string, raw: RosterFileRaw): Promise<void> {
     await rename(tmp, target);
   } catch (e) {
     await unlink(tmp).catch(() => undefined);
-    throw new Error(`roster file is not writable (${(e as NodeJS.ErrnoException)?.code ?? 'error'})`);
+    const code = (e as NodeJS.ErrnoException)?.code ?? 'error';
+    if (code === 'EACCES' || code === 'EPERM' || code === 'EROFS' || code === 'ENOENT' || code === 'ENOTDIR') throw new RosterPermanentError(`roster file is not writable (${code}) — fix the path or permissions`);
+    throw new Error(`roster file is not writable (${code})`);
   }
 }
 
@@ -319,17 +364,17 @@ async function writeRosterRaw(file: string, raw: RosterFileRaw): Promise<void> {
  * "nothing to erase". Everything not targeted (other sessions, entries the serving loader would reject,
  * unknown keys) is preserved.
  *
- * `preRead` lets the CLI read (and validate) the file BEFORE it deletes any DB rows, inside withRosterLock,
- * so "roster unreadable" really means nothing was changed, and nothing can rewrite the file in between.
+ * Callers take withRosterLock around this. The CLI additionally reads the file (under the lock) BEFORE it
+ * deletes any DB rows, so "roster unreadable" really means nothing was changed.
  */
-export async function purgeRosterPlayer(playerId: string, sessionId?: string, preRead?: RosterFileRaw | null): Promise<number> {
-  const raw = preRead === undefined ? await readRosterFile() : preRead;
+export async function purgeRosterPlayer(playerId: string, sessionId?: string): Promise<number> {
+  const raw = await readRosterFile();
   let removed = 0;
   if (raw) {
     const meta = metaOf(raw);
     for (const [sid, entries] of Object.entries(raw.sessions)) {
       if (sessionId !== undefined && sid !== sessionId) continue;
-      if (!Array.isArray(entries)) continue; // not ours to interpret — leave it exactly as found
+      if (!Array.isArray(entries)) continue; // not ours to interpret — leave it exactly as found (checked below)
       const kept = entries.filter((e) => !(e && typeof e === 'object' && (e as { playerId?: unknown }).playerId === playerId));
       if (kept.length === entries.length) continue;
       removed += entries.length - kept.length;
@@ -342,14 +387,18 @@ export async function purgeRosterPlayer(playerId: string, sessionId?: string, pr
     if (removed > 0) {
       if (raw.sessionMeta !== undefined || Object.keys(meta).length > 0) raw.sessionMeta = meta;
       await writeRosterRaw(ROSTER_FILE, raw);
-      // Belt and braces against any writer that slipped past the lock: the file we just wrote must not name
-      // the player (in the targeted sessions) — if it does, the erasure did NOT happen and the caller must fail.
-      const check = await readRosterFile();
-      for (const [sid, entries] of Object.entries(check?.sessions ?? {})) {
-        if (sessionId !== undefined && sid !== sessionId) continue;
+    }
+    // Verify by re-reading what is now on disk: the id must not appear ANYWHERE in the targeted sessions — not
+    // as a recognised entry (a writer slipping past the lock), and not inside a structure the rewrite above
+    // does not interpret (a hand-edited nesting). Either way "erased" would be a lie; fail so the operator fixes it.
+    const check = removed > 0 ? await readRosterFile() : raw;
+    for (const [sid, entries] of Object.entries(check?.sessions ?? {})) {
+      if (sessionId !== undefined && sid !== sessionId) continue;
+      if (mentionsPlayer(entries, playerId)) {
         if (Array.isArray(entries) && entries.some((e) => e && typeof e === 'object' && (e as { playerId?: unknown }).playerId === playerId)) {
           throw new Error('roster rewrite verification failed — the entry is still present; retry');
         }
+        throw new RosterPermanentError(`roster session "${sid}" names the player inside an unrecognised structure the erasure cannot rewrite — fix the file by hand, then re-run`);
       }
     }
   }
@@ -357,6 +406,14 @@ export async function purgeRosterPlayer(playerId: string, sessionId?: string, pr
   // next periodic reload (and so a test asserting rosterFor() after a purge sees the result deterministically).
   await reload();
   return removed;
+}
+
+/** Does this JSON value, at any depth, contain an object whose playerId === id? */
+function mentionsPlayer(value: unknown, id: string): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some((v) => mentionsPlayer(v, id));
+  if ((value as { playerId?: unknown }).playerId === id) return true;
+  return Object.values(value as Record<string, unknown>).some((v) => mentionsPlayer(v, id));
 }
 
 // ----- retention coupling (audit §4.5: "retention never touches roster.json") ----------------

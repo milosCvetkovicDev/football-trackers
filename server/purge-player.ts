@@ -20,24 +20,28 @@
  *   cd server && DB_PATH=./data/telemetry.db bun run purge-player.ts 07
  *
  * Order of operations (each step's failure is reported as what it is):
- *   1. validate ids; refuse a DB_PATH that is missing / empty / not SQLite (exit 5) BEFORE opening it;
- *   2. take the roster lock; READ the roster (an unreadable file → exit 3 with NOTHING changed);
- *   3. delete the rows in indexed, bounded batches;
- *   4. rewrite the roster without the entry, re-read to verify, release the lock;
+ *   1. validate ids; refuse a DB_PATH that is missing / empty / not SQLite (exit 5) BEFORE opening it; refuse
+ *      when the disk cannot hold the rebuild (~2.5× the store, exit 5);
+ *   2. under the roster lock (milliseconds): READ the roster — unreadable/malformed → exit 5, NOTHING changed;
+ *   3. delete the rows in indexed, bounded batches (outside the roster lock — the DB has its own);
+ *   4. under the roster lock again: rewrite the roster without the entry, re-read to verify;
  *   5. always (even after a failure in 3-4): VACUUM, PASSIVE checkpoint, then short TRUNCATE attempts.
  *
  * Exit codes — each one means something different for the operator, so never collapse them:
- *   0  erased. The JSON receipt on stdout is the compliance record.
+ *   0  erased. The JSON receipt on stdout is the compliance record (with deleteMs/vacuumMs/checkpointMs/
+ *      totalMs/storeBytes — how long the store was under the knife).
  *   2  usage error (missing/invalid playerId or sessionId — an id the system cannot contain must never
  *      become an "erased 0" success record that gets filed for the real player).
- *   3  the erasure did NOT complete (roster locked/unreadable/unwritable, DB busy, delete failed). The
- *      receipt's `erased` is the TRUE number of rows already deleted (0 when the roster was unreadable —
- *      that is checked first). Re-run; it is idempotent.
- *   4  rows and roster entry erased, but the WAL could not be truncated (a reader held it) — residue may
- *      remain on disk. Re-run the SAME command until it exits 0.
- *   5  DB_PATH is the WRONG FILE (does not exist, is empty, is not SQLite, or is read-only), not a transient
- *      fault: retrying erases nothing, forever. Fix DB_PATH / permissions. bun:sqlite would otherwise
- *      CREATE a missing file or INITIALISE an empty one and report "erased 0" as success (audit §4.5 e).
+ *   3  TRANSIENT: the erasure did not complete (roster locked by a live writer, DB busy, delete failed). The
+ *      receipt's `erased` is the TRUE number of rows already deleted. Re-run; it is idempotent.
+ *   4  rows and roster entry erased, but the on-disk rebuild did not complete (a reader pinned the WAL, or a
+ *      live writer held the checkpoint lock) — residue may remain. Re-run the SAME command until it exits 0.
+ *   5  PERMANENT — fix something, do not just retry: DB_PATH is the wrong file (missing, empty, not SQLite,
+ *      read-only), the disk is too full for the rebuild, or the roster is unreadable/malformed/unwritable
+ *      (wrong AUTH_ROSTER_FILE path, permissions, a lock that cannot be removed, a name inside a structure the
+ *      rewrite cannot reach). The receipt carries `retry:false` and names the path(s). bun:sqlite would
+ *      otherwise CREATE a missing DB or INITIALISE an empty one and report "erased 0" as success (audit §4.5 e).
+ *   `rosterFound` is null on a receipt emitted before the roster was read; false = no file at the path named.
  *
  * Residuals this CLI cannot reach from a separate process: (a) per-player Prometheus series in the RUNNING
  * server's in-memory registry (pseudonymous, loopback-only /metrics; restart the server to clear them);
@@ -45,8 +49,8 @@
  * docs/architecture/observability.md.
  */
 
-import { resolve } from 'node:path';
-import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { realpathSync, statSync, statfsSync } from 'node:fs';
 import { DB_PATH, absoluteDbPath, sqliteFileProblem } from './src/db-path';
 import { PLAYER_ID_RE } from './src/roster';
 
@@ -62,30 +66,54 @@ if (sessionId !== undefined && !PLAYER_ID_RE.test(sessionId)) usage('invalid ses
 
 const dbPath = absoluteDbPath(DB_PATH);
 const rosterFile = resolve(process.env.AUTH_ROSTER_FILE ?? './roster.json');
+/** Receipt paths: the real path where one exists, so the two fields read as the same tree. */
+const shown = (p: string): string => { try { return realpathSync(p); } catch { return p; } };
 
-function wrongFile(error: string): never {
-  console.error(JSON.stringify({ erased: 0, rosterEntriesErased: 0, playerId, error, dbPath, rosterFile, retry: false }));
+/** Wrong file / permissions / disk — permanent: exit 5, retry:false. */
+function permanent(error: string, extra: Record<string, unknown> = {}): never {
+  console.error(JSON.stringify({ erased: 0, rosterEntriesErased: 0, rosterFound: null, playerId, error, dbPath: shown(dbPath), rosterFile: shown(rosterFile), retry: false, ...extra }));
   process.exit(5);
 }
 
 // Audit §4.5(e): check BEFORE importing db.ts — it opens (creates / initialises) DB_PATH on import.
 const problem = sqliteFileProblem(DB_PATH);
-if (problem) wrongFile(`${problem} — nothing erased. This is the wrong file, not a transient failure; do not retry with the same path.`);
+if (problem) permanent(`${problem} — nothing erased. This is the wrong file, not a transient failure; do not retry with the same path.`);
+
+// VACUUM appends a full rebuilt copy of the store to the WAL and the secure_delete batches add zeroed page
+// images before it: the checker measured a transient footprint of ~2.6× the store. Refuse up front rather than
+// die mid-VACUUM with SQLITE_FULL (which no retry fixes).
+const storeBytes = statSync(dbPath).size;
+const FREE_FACTOR = 2.5;
+{
+  const fsInfo = statfsSync(dirname(dbPath));
+  const freeBytes = Number(fsInfo.bavail) * Number(fsInfo.bsize);
+  if (freeBytes < storeBytes * FREE_FACTOR) {
+    permanent(`not enough free disk for the rebuild: ${Math.round(freeBytes / 1e6)} MB free, need ~${Math.round((storeBytes * FREE_FACTOR) / 1e6)} MB (${FREE_FACTOR}× the ${Math.round(storeBytes / 1e6)} MB store) — free space, then re-run`, { storeBytes, freeBytes });
+  }
+}
+// ~5 ms/MB on an M-series Mac (slower on a Pi); above this the live server's 5 s busy_timeout is at risk.
+const VACUUM_WARN_BYTES = 256 * 1024 * 1024;
+if (storeBytes > VACUUM_WARN_BYTES) {
+  console.error(`warning: ${Math.round(storeBytes / 1e6)} MB store — the VACUUM will hold the write lock for roughly ${Math.round(storeBytes / 1e6 * 5 / 1000)} s+; a live server drops fixes meanwhile. Erase between sessions.`);
+}
 
 /** TRUNCATE attempts: each holds the WRITE lock while it busy-waits, so keep the wait short and the sleeps long. */
-const TRUNCATE_ATTEMPTS = 8;
+const TRUNCATE_ATTEMPTS = 12;
 const TRUNCATE_BUSY_MS = 100;
-const TRUNCATE_SLEEP_MS = 250;
+const TRUNCATE_SLEEP_MS = 400;
 
 // Receipt state is tracked OUTSIDE the try so a failure receipt reports what actually happened.
+const t0 = performance.now();
 let erased = 0;
 let rosterEntriesErased = 0;
-let rosterFound = false;
+let rosterFound: boolean | null = null; // null = never got as far as reading it
 let vacuumed = false;
 let vacuumMs = -1;
+let deleteMs = -1;
+let checkpointMs = -1;
 let walTruncated = false;
 let wal: { busy: number; log: number; checkpointed: number } | undefined;
-let failure: string | undefined;
+let failure: Error | undefined;
 
 let dbMod: typeof import('./src/db') | undefined;
 try {
@@ -95,20 +123,25 @@ try {
   const { purgePlayer } = dbMod;
   const { withRosterLock, readRosterFile, purgeRosterPlayer } = await import('./src/roster');
 
+  // 1. Read (and validate) the roster FIRST, under the lock: if it cannot be read, nothing has changed yet and
+  //    the failure is literally "nothing was changed". A MISSING file is a valid posture (no names provisioned)
+  //    — reported as rosterFound:false so a run from the wrong cwd cannot pass for a complete erasure unnoticed.
   await withRosterLock(async () => {
-    // Read (and validate) the roster FIRST: if it cannot be read, nothing has changed yet and exit 3 is
-    // literally true. A MISSING file is a valid posture (no names provisioned) — reported in the receipt
-    // as rosterFound:false so a run from the wrong cwd cannot pass for a complete erasure unnoticed.
-    const raw = await readRosterFile();
-    rosterFound = raw !== null;
-    erased = await purgePlayer(playerId, sessionId);
-    // Same lock, same run: a roster-write failure surfaces as exit 3 with the true `erased`, never as a
-    // silent partial erasure (raw fixes gone but the name lingers). 0 entries removed still exits 0 — the
-    // erasure goal is met regardless, matching purgePlayer's 0-rows semantics.
-    rosterEntriesErased = await purgeRosterPlayer(playerId, sessionId, raw);
+    rosterFound = (await readRosterFile()) !== null;
+  });
+  // 2. Delete the rows — OUTSIDE the roster lock (the DB has its own; a big delete can run for minutes and a
+  //    lock held that long would be the one thing the other writers must not be made to wait on or break).
+  const td = performance.now();
+  erased = await purgePlayer(playerId, sessionId);
+  deleteMs = Math.round(performance.now() - td);
+  // 3. Remove the entry under a fresh short lock (re-reads the file, rewrites, re-reads to verify). A
+  //    roster-write failure surfaces as a failure receipt with the TRUE `erased`, never as a silent partial
+  //    erasure. 0 entries removed still exits 0 — the erasure goal is met regardless.
+  await withRosterLock(async () => {
+    rosterEntriesErased = await purgeRosterPlayer(playerId, sessionId);
   });
 } catch (err) {
-  failure = String(err); // content-free by construction: roster.ts throws code-only errors, db.ts SQLite codes
+  failure = err instanceof Error ? err : new Error(String(err)); // content-free by construction (roster.ts code-only errors, SQLite codes)
 } finally {
   // Audit §4.5(a) + checker finding: secure_delete zeroes FREED pages only; a leaf page a survivor still
   // lives on is rebalanced in place and keeps the erased rows' bytes in its gap. VACUUM rebuilds every
@@ -119,8 +152,9 @@ try {
       vacuumMs = dbMod.vacuum();
       vacuumed = true;
     } catch (err) {
-      failure ??= `VACUUM failed: ${String(err)}`;
+      failure ??= new Error(`VACUUM failed: ${String(err)}`);
     }
+    const tc = performance.now();
     try {
       dbMod.checkpointPassive(); // bulk copy without the write lock or waiting on readers
       dbMod.setBusyTimeout(TRUNCATE_BUSY_MS); // a TRUNCATE busy-waits HOLDING the write lock — keep it short
@@ -131,8 +165,9 @@ try {
       }
       walTruncated = wal?.busy === 0;
     } catch (err) {
-      failure ??= `WAL checkpoint failed: ${String(err)}`;
+      failure ??= new Error(`WAL checkpoint failed: ${String(err)}`);
     }
+    checkpointMs = Math.round(performance.now() - tc);
   }
 }
 
@@ -142,31 +177,40 @@ const receipt = {
   rosterFound,
   walTruncated,
   vacuumed,
+  deleteMs,
   vacuumMs,
+  checkpointMs,
+  totalMs: Math.round(performance.now() - t0),
+  storeBytes,
   playerId,
   scope: sessionId ? { sessionId } : 'all sessions',
-  dbPath,
-  rosterFile,
+  dbPath: shown(dbPath),
+  rosterFile: shown(rosterFile),
 };
 
 if (failure !== undefined) {
-  // A read-only store is a WRONG-FILE/permissions problem (root-owned bind mount on Linux, host vs
-  // container), not a transient fault — "retry" would never succeed.
-  if (/readonly|read-only/i.test(failure)) {
-    console.error(JSON.stringify({ ...receipt, error: `${failure} — the store is read-only for this user; run inside the container (docker compose exec) or fix ownership`, retry: false }));
+  const { RosterPermanentError } = await import('./src/roster');
+  const msg = String(failure.message ?? failure);
+  // Permanent conditions — wrong path/permissions/disk — are exit 5: "retry" would never succeed. A read-only
+  // store (root-owned bind mount on Linux, host vs container) and a full disk land here too.
+  if (failure instanceof RosterPermanentError || /readonly|read-only|SQLITE_FULL|disk is full/i.test(msg)) {
+    console.error(JSON.stringify({ ...receipt, error: /readonly|read-only/i.test(msg) ? `${msg} — the store is read-only for this user; run inside the container (docker compose exec) or fix ownership` : msg, retry: false }));
     process.exit(5);
   }
   // Make a compliance failure unmistakable: a non-zero JSON receipt + exit 3, never a bare stack trace an
   // operator might mistake for a transient glitch.
-  console.error(JSON.stringify({ ...receipt, error: failure, retry: true }));
+  console.error(JSON.stringify({ ...receipt, error: msg, retry: true }));
   process.exit(3);
 }
 if (!walTruncated || !vacuumed) {
-  console.error(JSON.stringify({ ...receipt, wal, error: 'rows and roster entry erased, but the on-disk rebuild did not complete (a reader held the WAL) — residue may remain; re-run this command', retry: true }));
+  // log === -1: the checkpoint could not even take the lock (a live writer's own checkpoint in progress);
+  // log >= 0: a reader pinned `log - checkpointed` frames. Both: re-run; it is idempotent.
+  const cause = !vacuumed ? 'the VACUUM did not complete' : wal && wal.log >= 0 ? `a reader pinned the WAL (${wal.log - wal.checkpointed} of ${wal.log} frames not checkpointed)` : 'the checkpoint lock was busy (a live writer was checkpointing)';
+  console.error(JSON.stringify({ ...receipt, wal, error: `rows and roster entry erased, but the on-disk rebuild did not complete — ${cause}; residue may remain. Re-run this command`, retry: true }));
   process.exit(4);
 }
-if (!rosterFound && !existsSync(rosterFile)) {
-  console.error(`note: no roster file at ${rosterFile} — names were not provisioned there (or this is the wrong cwd/AUTH_ROSTER_FILE); the receipt says rosterFound:false`);
+if (rosterFound === false) {
+  console.error(`note: no roster file at ${shown(rosterFile)} — names were not provisioned there (or this is the wrong cwd/AUTH_ROSTER_FILE); the receipt says rosterFound:false`);
 }
 console.log(JSON.stringify(receipt));
 process.exit(0);
