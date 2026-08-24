@@ -23,6 +23,7 @@
  * No heavyweight dependency: argon2id is Bun-native (Bun.password); tokens via node:crypto.
  */
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { envBool, envInt, envNumber, envString } from './env';
 import { readFile, stat } from 'node:fs/promises';
 import { metrics } from './metrics';
 import { log } from './log';
@@ -53,25 +54,25 @@ interface AuthSession {
 }
 
 // ----- config (env) ---------------------------------------------------------------------
-const ACCOUNTS_FILE = process.env.AUTH_ACCOUNTS_FILE ?? './auth-accounts.json';
-const SESSION_TTL_MS = Math.max(1, Number(process.env.AUTH_SESSION_TTL_SECONDS ?? 43200)) * 1000; // 12h
-const COOKIE_SECURE = process.env.AUTH_COOKIE_SECURE !== 'false'; // default true; dev/sim set false
-const RELOAD_MS = Math.max(1, Number(process.env.AUTH_ACCOUNTS_RELOAD_SECONDS ?? 15)) * 1000;
-const MAX_SESSIONS = Math.max(1, Number(process.env.AUTH_MAX_SESSIONS ?? 1000)); // global backstop
+const ACCOUNTS_FILE = envString('AUTH_ACCOUNTS_FILE', './auth-accounts.json');
+const SESSION_TTL_MS = envNumber('AUTH_SESSION_TTL_SECONDS', 43200, { min: 1, max: 2_592_000 }) * 1000; // 12h; max 30 d ('valid forever' was the audit's S-3 example)
+const COOKIE_SECURE = envBool('AUTH_COOKIE_SECURE', true); // default true; dev/sim set false
+const RELOAD_MS = envNumber('AUTH_ACCOUNTS_RELOAD_SECONDS', 15, { min: 1, max: 2_147_483 }) * 1000; // max: 32-bit timer clamp
+const MAX_SESSIONS = envInt('AUTH_MAX_SESSIONS', 1000, { min: 1 }); // global backstop
 // Per-username live-token cap. Bounds the store to ~(users × this), and — crucially — means a single
 // principal spamming /auth/login can only ever evict its OWN oldest tokens, never another coach/admin's
 // (the global-FIFO-eviction force-logout DoS the expert review found).
-const MAX_SESSIONS_PER_USER = Math.max(1, Number(process.env.AUTH_MAX_SESSIONS_PER_USER ?? 8));
-const MAX_INFLIGHT_LOGINS = Math.max(1, Number(process.env.MAX_INFLIGHT_LOGINS ?? 4));
-const LOGIN_BURST = Math.max(1, Number(process.env.AUTH_LOGIN_BURST ?? 5));
-const LOGIN_WINDOW_MS = Math.max(1, Number(process.env.AUTH_LOGIN_WINDOW_S ?? 30)) * 1000;
+const MAX_SESSIONS_PER_USER = envInt('AUTH_MAX_SESSIONS_PER_USER', 8, { min: 1 });
+const MAX_INFLIGHT_LOGINS = envInt('MAX_INFLIGHT_LOGINS', 4, { min: 1 });
+const LOGIN_BURST = envInt('AUTH_LOGIN_BURST', 5, { min: 1 });
+const LOGIN_WINDOW_MS = envNumber('AUTH_LOGIN_WINDOW_S', 30, { min: 1, max: 86_400 }) * 1000;
 const LOCKOUT_FAILS = 10;
 const LOCKOUT_WINDOW_MS = 15 * 60_000;
 const LOCKOUT_MS = 15 * 60_000;
 const MAX_ACCOUNTS_BYTES = 1_000_000;
 
-export const ANON_MODE = process.env.ALLOW_ANONYMOUS_LIVE === 'true';
-export const ANON_SESSIONS = (process.env.ANON_SESSIONS ?? '')
+export const ANON_MODE = envBool('ALLOW_ANONYMOUS_LIVE', false);
+export const ANON_SESSIONS = envString('ANON_SESSIONS', '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
@@ -418,6 +419,13 @@ const ANON_PRINCIPAL: Principal = {
  * audit line for their reads said `username: null`. Cookie first, anon second: anon mode now means
  * "a login is not REQUIRED for the live pitch", not "a login is impossible".
  */
+/** Every session id any account is assigned to — for boot-time metric label seeding. */
+export function accountSessionIds(): string[] {
+  const out = new Set<string>();
+  for (const a of accounts.values()) for (const sid of a.sessions) out.add(sid);
+  return [...out];
+}
+
 export function currentPrincipal(cookieHeader: string | undefined): Principal | null {
   const p = principalFromCookie(cookieHeader);
   if (p) return p;

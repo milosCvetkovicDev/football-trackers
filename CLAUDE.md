@@ -27,7 +27,7 @@ Server (from `server/`):
 bun install
 bun start          # run; bun --watch for dev (bun run dev)
 bun run typecheck  # bunx tsc --noEmit (Bun does not typecheck at runtime)
-bun run test       # THE GATE: all 24 suites, sequential, ~20 s (test/run-all.ts)
+bun run test       # THE GATE: all 25 suites, sequential, ~35 s (test/run-all.ts)
 bun run test:e2e   # one suite; every suite also has its own test:* script
 bun run test/mosquitto-pub-demo.ts   # the README's literal mosquitto_pub -> WS path
 ```
@@ -35,7 +35,9 @@ bun run test/mosquitto-pub-demo.ts   # the README's literal mosquitto_pub -> WS 
 `test/` is neither a declared suite nor a declared non-suite — so adding a test file without
 wiring it in fails loudly instead of quietly shrinking the gate.
 Env: `PORT` (default 3000), `MQTT_URL` (default `mqtt://127.0.0.1:1883`), `DB_PATH`
-(default `./telemetry.db`). The broker is mosquitto (`brew install mosquitto`).
+(default `./telemetry.db`). Every numeric knob goes through `src/env.ts` — an invalid value (e.g. `6h`) falls back to
+the default LOUDLY (warn at parse, listed again in the boot `config resolved` line), never to `NaN`.
+The broker is mosquitto (`brew install mosquitto`).
 
 Client (from `client/`):
 ```
@@ -112,14 +114,15 @@ explicitly **not** authoritative. The server stamps `serverTs = Date.now()` at i
 that is the source of truth. The split lives across `main.cpp`, `types.ts`
 (`RawTelemetry` vs enriched `Telemetry`), and `ingest.ts` — preserve it.
 
-**Ingest → fan-out → persist** (`server/src/ingest.ts`): MQTT QoS0 → JSON-parse → drop
-packets without a real fix (`fix < 2` or non-numeric `lat`) → enrich into `Telemetry` →
+**Ingest → fan-out → persist** (`server/src/ingest.ts`): MQTT QoS0 → JSON-parse → validate every field at the
+boundary (`src/wire.ts`: finite numbers + bounded ids, else `bad_payload`; `fix < 2` → `no_fix`) → enrich into `Telemetry` →
 `insertTelemetry()` (bun:sqlite) → `publish(sessionId, t)`. The publish callback is wired
 in `server.ts` to Elysia's native WS pub/sub: `server.publish('session:'+id, …)`. Every step
 is instrumented — drops are counted **by reason**, latencies timed — see Observability below.
 
 **Observability** (`server/src/metrics.ts`, `log.ts`): a zero-dep Prometheus registry on
-`GET /metrics` (counters/gauges/histograms, `ft_` prefix, bounded session/player labels) plus
+`GET /metrics` (counters/gauges/histograms, `ft_` prefix; session/player labels are CAPPED — 32/256 distinct values,
+overflow → `_other`; non-finite values are refused) plus
 structured ndjson logs (`log.{info,warn,error}`, `LOG_LEVEL`). The `.../status` topic feeds
 per-player device-health gauges (battery/RSSI/backlog). Full strategy, SLOs, alert rules, and a
 runbook in `docs/architecture/observability.md`; the e2e test asserts `/metrics` is correct.
@@ -129,8 +132,9 @@ runbook in `docs/architecture/observability.md`; the e2e test asserts `/metrics`
 per session). Frames sent to clients are JSON envelopes `{event:'telemetry', data:Telemetry}`.
 Fan-out uses Bun's native WS pub/sub directly — **not** socket.io — so the (not-yet-built)
 coach UI uses a plain `WebSocket`, not `socket.io-client`. `GET /health` returns
-`{ok, mqtt, version, uptimeSeconds}` where `mqtt` flips true once the broker subscription is
-live (used by the e2e test as a readiness gate to avoid the QoS0 publish-before-subscribe race).
+`{ok, mqtt, db, version, uptimeSeconds}` — HTTP 200 when `ok` (= `mqtt && db`), 503 otherwise — where `mqtt`
+follows the broker client's connect/close events (true once subscribed, false on close/offline) and `db` is a
+`SELECT 1` probe; the e2e tests poll it as a readiness gate to avoid the QoS0 publish-before-subscribe race.
 `GET /metrics` is the Prometheus scrape target.
 
 **Persistence** (`server/src/db.ts`): bun:sqlite, WAL mode, one prepared insert per packet

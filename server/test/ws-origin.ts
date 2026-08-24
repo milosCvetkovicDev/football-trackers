@@ -50,11 +50,14 @@ try {
 
   await import('../src/server');
 
-  // wait for the loopback /health
+  // wait for the loopback /health to ANSWER. There is deliberately no broker here, so since Phase 3 it
+  // answers 503 {ok:false, mqtt:false} — truthfully; "HTTP is up" is what this test needs, not "ready".
   let up = false;
   for (let i = 0; i < 60; i++) {
     try {
-      if ((await fetch(`http://127.0.0.1:${METRICS_PORT}/health`)).ok) {
+      const res = await fetch(`http://127.0.0.1:${METRICS_PORT}/health`);
+      const body = (await res.json()) as { mqtt: boolean; db: boolean };
+      if (res.status === 503 && body.mqtt === false && body.db === true) {
         up = true;
         break;
       }

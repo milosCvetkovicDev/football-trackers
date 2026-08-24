@@ -55,6 +55,7 @@ const SUITES: Array<[file: string, proves: string]> = [
   ['history.ts', 'history paging, span caps, off-loop gate'],
   ['events.ts', 'tactical event detection (team-shape series + phases)'],
   ['scan-load.ts', 'the off-loop inflight cap is shared across /history and /events'],
+  ['boundary.ts', 'wire fields coerced, env knobs fall back loudly, metrics never non-finite, labels capped (Phase 3)'],
   ['retention.ts', 'the retention sweep deletes on schedule'],
   // --- spawn a CLI + temp files ---
   ['auth-cli.ts', 'auth-user.ts add/remove/sessions'],

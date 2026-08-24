@@ -18,6 +18,7 @@
  */
 
 import { readFixesPage, type FixRow } from './db';
+import { envNumber } from './env';
 import { ageBandFor, thresholdsForSession } from './sessionConfig';
 import type { DetectorParams, EventsResult, TacticalEvent, TeamShapeBucket } from './types';
 import { acquireScanSlot, releaseScanSlot } from './scanLoad';
@@ -27,10 +28,7 @@ import { metrics } from './metrics';
 /** Parse a positive-integer env knob, falling back to `def` on a missing / non-numeric / < 1 value. PB-N1: a
  * `Math.max(1, Number('6h'))` is NaN, and `span > NaN` is always false — silently voiding a security-critical
  * bound on a children's-location scan. So fall back instead of admitting NaN. */
-function envCount(name: string, def: number): number {
-  const n = Number(process.env[name]);
-  return Number.isFinite(n) && n >= 1 ? n : def;
-}
+const envCount = (name: string, def: number): number => envNumber(name, def, { min: 1 });
 /** Max query window: a match + warmup is well under 6h, smaller than history's 24h (a tighter scan ceiling). */
 const EVENTS_MAX_SPAN_MS = envCount('EVENTS_MAX_SPAN_MS', 21_600_000);
 /** Rows per keyset page — same ~1–2 ms sync hold/page as history; we await-yield between pages. */
@@ -46,27 +44,27 @@ const MIN_BUCKET_MS = envCount('EVENTS_MIN_BUCKET_MS', 1000);
 const EVENTS_MAX_PLAYERS_PER_BUCKET = envCount('EVENTS_MAX_PLAYERS_PER_BUCKET', 64);
 
 // DoS: per-principal RATE bucket (this surface's own) + the SHARED scanLoad inflight slot (PM-1).
-const EVENTS_RATE_BURST = Math.max(1, Number(process.env.EVENTS_RATE_BURST ?? 20));
-const EVENTS_RATE_PER_MIN = Math.max(1, Number(process.env.EVENTS_RATE_PER_MIN ?? 40));
+const EVENTS_RATE_BURST = envNumber('EVENTS_RATE_BURST', 20, { min: 1 });
+const EVENTS_RATE_PER_MIN = envNumber('EVENTS_RATE_PER_MIN', 40, { min: 1 });
 const RATE_WINDOW_MS = 60_000;
 
 // ----- domain constants (§1.5) — PROPOSED heuristics, NOT spec; env-tunable; UNVALIDATED on real match data --
 /** PM-6: detectors ignore buckets with fewer than this many present players (a thin-data fabrication guard:
  * one dropped-out child's track must not become a max-confidence "team" event). Relates to MIN_PLAYERS_FOR_HULL. */
-const MIN_PLAYERS_FOR_EVENTS = Math.max(1, Number(process.env.EVENTS_MIN_PLAYERS ?? 3));
+const MIN_PLAYERS_FOR_EVENTS = envNumber('EVENTS_MIN_PLAYERS', 3, { min: 1 });
 /** Hull needs ≥3 distinct vertices for a non-zero area (PM-S2). */
 const MIN_PLAYERS_FOR_HULL = 3;
 /** high_tempo: a run of buckets with hsrFraction ≥ this. */
-const HIGH_TEMPO_FRACTION = Number(process.env.EVENTS_HIGH_TEMPO_FRACTION ?? 0.3);
-const HIGH_TEMPO_MIN_S = Number(process.env.EVENTS_HIGH_TEMPO_MIN_S ?? 3.0);
+const HIGH_TEMPO_FRACTION = envNumber('EVENTS_HIGH_TEMPO_FRACTION', 0.3, { min: 0, max: 1 });
+const HIGH_TEMPO_MIN_S = envNumber('EVENTS_HIGH_TEMPO_MIN_S', 3.0, { min: 0 });
 /** transition: centroid net displacement ≥ this over a ≤ window with the team actually moving. */
-const TRANSITION_M = Number(process.env.EVENTS_TRANSITION_M ?? 20);
-const TRANSITION_WINDOW_S = Number(process.env.EVENTS_TRANSITION_WINDOW_S ?? 5.0);
-const TRANSITION_MIN_MEAN_MPS = Number(process.env.EVENTS_TRANSITION_MIN_MEAN_MPS ?? 2.0);
+const TRANSITION_M = envNumber('EVENTS_TRANSITION_M', 20, { min: 0 });
+const TRANSITION_WINDOW_S = envNumber('EVENTS_TRANSITION_WINDOW_S', 5.0, { min: 0.001 });
+const TRANSITION_MIN_MEAN_MPS = envNumber('EVENTS_TRANSITION_MIN_MEAN_MPS', 2.0, { min: 0 });
 /** stoppage: a run where the team is near-stationary AND the centroid barely moves. */
-const STOPPAGE_SPEED_MPS = Number(process.env.EVENTS_STOPPAGE_SPEED_MPS ?? 0.5);
-const STOPPAGE_CENTROID_MAX_M = Number(process.env.EVENTS_STOPPAGE_CENTROID_MAX_M ?? 5);
-const STOPPAGE_MIN_S = Number(process.env.EVENTS_STOPPAGE_MIN_S ?? 8.0);
+const STOPPAGE_SPEED_MPS = envNumber('EVENTS_STOPPAGE_SPEED_MPS', 0.5, { min: 0 });
+const STOPPAGE_CENTROID_MAX_M = envNumber('EVENTS_STOPPAGE_CENTROID_MAX_M', 5, { min: 0 });
+const STOPPAGE_MIN_S = envNumber('EVENTS_STOPPAGE_MIN_S', 8.0, { min: 0 });
 /** Float-sum tolerance for duration/span comparisons (mirrors history.ts: a sum of 0.x s steps drifts). */
 const SECONDS_EPS = 1e-6;
 

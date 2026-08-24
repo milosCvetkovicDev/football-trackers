@@ -19,10 +19,11 @@
 import { readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { log } from './log';
+import { envNumber, envString } from './env';
 
 // ----- config (env) ---------------------------------------------------------------------
-const ROSTER_FILE = process.env.AUTH_ROSTER_FILE ?? './roster.json';
-const RELOAD_MS = Math.max(1, Number(process.env.AUTH_ROSTER_RELOAD_SECONDS ?? 15)) * 1000;
+const ROSTER_FILE = envString('AUTH_ROSTER_FILE', './roster.json');
+const RELOAD_MS = envNumber('AUTH_ROSTER_RELOAD_SECONDS', 15, { min: 1, max: 2_147_483 }) * 1000; // max: 32-bit timer clamp
 const ROSTER_MAX_BYTES = 1_000_000; // mirrors auth.ts MAX_ACCOUNTS_BYTES — over cap = 0 names (fail closed)
 const ROSTER_NAME_MAX = 64; // max displayName length in chars
 // Per-session player cap == MAX_TRACKED_PLAYERS (the live store's cap); a session can't roster more
@@ -350,6 +351,11 @@ async function writeRosterRaw(file: string, raw: RosterFileRaw): Promise<void> {
     if (code === 'EACCES' || code === 'EPERM' || code === 'EROFS' || code === 'ENOENT' || code === 'ENOTDIR') throw new RosterPermanentError(`roster file is not writable (${code}) — fix the path or permissions`);
     throw new Error(`roster file is not writable (${code})`);
   }
+}
+
+/** Session ids currently in the serving map — for boot-time metric label seeding. */
+export function rosterSessionIds(): string[] {
+  return [...roster.keys()];
 }
 
 // ----- erasure (§1.4; ADR-0016 + ADR-0010) -----------------------------------------------

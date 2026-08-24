@@ -13,12 +13,13 @@
  * aggregate reads the same band, so live colour and review breakdown can never disagree.
  */
 import { readFile, stat } from 'node:fs/promises';
+import { envNumber, envString } from './env';
 import { log } from './log';
 import type { AgeBand, ZoneThresholds } from './types';
 
 // ----- config (env) ---------------------------------------------------------------------
-const CONFIG_FILE = process.env.SESSION_CONFIG_FILE ?? './session-config.json';
-const RELOAD_MS = Math.max(1, Number(process.env.SESSION_CONFIG_RELOAD_SECONDS ?? 15)) * 1000;
+const CONFIG_FILE = envString('SESSION_CONFIG_FILE', './session-config.json');
+const RELOAD_MS = envNumber('SESSION_CONFIG_RELOAD_SECONDS', 15, { min: 1, max: 2_147_483 }) * 1000; // max: 32-bit timer clamp
 const CONFIG_MAX_BYTES = 1_000_000; // over cap → 0 configured sessions (defaults apply), never a crash
 const BANDS: readonly AgeBand[] = ['U12', 'U14', 'U16', 'U19'];
 
@@ -105,6 +106,11 @@ export async function initSessionConfig(): Promise<void> {
 }
 
 /** The session's configured band, or the documented U14 default (so zones always resolve). */
+/** Session ids with a configured band — for boot-time metric label seeding. */
+export function configuredSessionIds(): string[] {
+  return [...config.keys()];
+}
+
 export function ageBandFor(sessionId: string): AgeBand {
   return config.get(sessionId) ?? DEFAULT_AGE_BAND;
 }

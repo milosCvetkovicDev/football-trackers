@@ -55,6 +55,30 @@ a counter can't hold. Health is for liveness probes and the e2e readiness gate.
 All metrics are prefixed `ft_`. Labels are deliberately **low-cardinality** — `session`, `player`,
 `reason` — and the player count per session is bounded (≤ ~20), so there is no label explosion.
 
+**Label caps (audit S-5).** The broker ACL scopes a device to its own `player` id but leaves the `session` topic
+segment as `+`, so one device could mint a fresh `{session}` series per publish (200 garbage publishes → 201
+series). Each label name admits a bounded number of distinct values per process — `session` ≤ 32, `player` ≤ 256 —
+and everything else reads as one `_other` bucket. **Admission is a privilege** (`server/src/metrics.ts`): the
+sessions the configuration names (`ANON_SESSIONS`, the roster, session-config, account assignments) are seeded at
+boot and can never be displaced, and beyond that only *fully validated* traffic (a frame that passed coercion and
+the rate limit, or an authorized WS join) claims a slot — junk publishes, however many, stay in `_other`
+(`capLabelPeek` never reserves). One visible consequence: the FIRST valid packet of a brand-new stream is counted
+in `ft_telemetry_received_total` under `_other` (it fires before its own validation admits the label) — a
+one-packet blur; `published` and every gauge use the admitted label exactly. A real squad never approaches the
+caps; a flood shows up as `_other` growing. The ingest rate-limit buckets are swept once idle long enough to have
+fully refilled (≥ `INGEST_BUCKET_IDLE_MS`, default 60 s).
+
+**Wire boundary (audit S-1/S-2).** Every device frame is validated field by field before it becomes a row, a WS
+frame or a sample (`server/src/wire.ts`): telemetry fields must be finite JSON numbers **within physical ranges**
+(`spd ≥ 0`, `hdg` 0–360, `fix` an integer 0–5, `sats` 0–128, `pdop` 0–100, `ts ≥ 0`) and ids bounded strings —
+anything else is `ft_telemetry_dropped_total{reason="bad_payload"}`; frames over 1 KiB are `too_large` (the server
+enforces the shipped broker's `message_size_limit` itself). A status frame needs a numeric `up ≥ 0`; every other
+field takes a sentinel when missing, invalid **or physically impossible** (a wrapped `pct` of 250 must not read
+healthy): `pct → -1`, `batt → 0`, and `rssi → -127` — deliberately not 0, which is the *strongest* possible signal
+and would render a signal-less device as a green card; `-127` classifies as **bad**, so the coach investigates.
+The registry itself refuses non-finite values as a last line of defence (a string `fix` of
+`3\nft_injected_metric 999` once forged a metric line and `undefined` once broke the whole scrape).
+
 ### Pipeline
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
@@ -405,8 +429,18 @@ a live holder is waited for (3 s) and then reported by pid and age.
 
 - **Logs**: ndjson via `log.{debug,info,warn,error}(msg, fields)`; level via `LOG_LEVEL`. Parseable
   as-is by Loki/Vector — no reformatting. Errors (e.g. DB insert failure) carry `session`/`player`.
-- **Health**: `GET /health` (on `METRICS_PORT`, loopback-only) → `{ ok, mqtt, version, uptimeSeconds }`. `ok && mqtt` is the readiness
-  gate the e2e test polls before publishing (avoids the QoS0 publish-before-subscribe race).
+- **Health**: `GET /health` (on `METRICS_PORT`, loopback-only) → `{ ok, mqtt, db, version, uptimeSeconds }` with HTTP
+  **200 when `ok`, 503 otherwise**. `mqtt` follows the broker client's connect/close events (it used to latch true
+  once and stay green with the broker dead — audit S-4); a hard broker death flips it in milliseconds, a
+  TCP-alive-but-wedged broker within ~22 s (MQTT keepalive 15 s × 1.5). `db` probes the **telemetry table** and
+  folds in the last insert outcome (a plain `SELECT 1` cannot fail with the table dropped or the disk full — a
+  failed insert holds `db:false` for up to 60 s unless a later insert succeeds); honest limit: an idle server
+  with an intact file reads true. `ok = mqtt && db`. The 503 is what a compose healthcheck / Playwright's
+  webServer wait key on.
+- **Config at boot**: one `config resolved` info line lists every env knob with the value in force (secrets
+  redacted), and a `config: some env values were INVALID` warn lists any that fell back to their default — a typo'd
+  `HISTORY_MAX_SPAN_MS=6h` used to parse as `NaN` and silently void the cap (audit S-3); now it is rejected loudly and
+  the default is enforced (`server/src/env.ts`).
 
 ---
 

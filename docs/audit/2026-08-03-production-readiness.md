@@ -3,7 +3,7 @@ name: production-readiness-audit
 description: Severity-ranked production-readiness audit of firmware/server/client/vision/infra, with a phased hardening roadmap
 status: in-progress
 created: 2026-08-03T08:34:07Z
-updated: 2026-08-23T17:56:23Z
+updated: 2026-08-23T19:10:00Z
 ---
 
 # Production-Readiness Audit — football-trackers
@@ -591,6 +591,47 @@ phase closes (maker ≠ checker). Out-of-scope discoveries go to a triage list, 
 3. Truthful `/health` (+ DB probe); session label cap + bucket sweep.
 
 **Accept:** injection test finds no non-numeric value in `/metrics` · typo'd env still enforces caps · `/health` flips to `mqtt:false` within 5 s of broker loss · 500 novel sessions ≤ 33 series.
+
+> **✅ DONE 2026-08-23.** All three items. Acceptance, by execution (`server/test/e2e.ts` §12–15 against a real
+> broker + the real server, and the new `server/test/boundary.ts`): six malformed frames (the audit's
+> `fix: "3\nft_injected_metric 999"`, a numeric-looking string, a `null`, a `NaN`, a string `lat`, an object `ts`)
+> → zero WS frames, zero rows, `bad_payload` ×6, **no `ft_injected_metric` and every sample value a plain decimal**
+> · a status frame with everything but `up` missing exports `ft_device_battery_percent -1` (the unmetered
+> sentinel) and a finite-number health envelope; a non-numeric `up` is dropped · `HISTORY_MAX_SPAN_MS=6h` (and
+> every other knob) falls back to its default with a WARN naming the rejected value, and the boot log lists the
+> whole resolved config · **`/health` → 503 `{ok:false, mqtt:false}` within 5 s of killing the broker** (it used to
+> latch `true` forever); it also carries a `db` probe · 500 publishes under novel session ids → **≤ 33** distinct
+> `session` label values (32 + `_other`); the real session keeps its own series · 25 server suites + 21 Playwright
+> specs green.
+>
+> The five-lens checker pass then found **three defects in this phase's own first cut** (18 findings confirmed
+> in all, the rest hardening/pre-existing), each reproduced independently and fixed before commit:
+> - **The new `/health` `db` probe could not fail** — `SELECT 1` runs entirely in SQLite's VM, so the table
+>   dropped or the disk full still answered `db:true`. Now it reads the telemetry table and folds in the last
+>   insert outcome; the e2e drops the table and watches `db:false` appear.
+> - **The label cap was first-come for ANY traffic** — 32 junk publishes (even unparseable ones) could reserve
+>   every session slot and evict the real match into `_other` for the process lifetime, inside the exact S-5
+>   threat model. Now configured sessions are seeded at boot, only validated frames admit, and unvalidated
+>   traffic reads `_other` without reserving (cost: the first valid packet of a new stream counts under `_other`).
+> - **The status `rssi` sentinel was `0`** — the strongest possible signal, so a firmware omitting rssi rendered
+>   a GREEN card where the old stack showed a blank one. The sentinel is now `-127` (classifies bad), and every
+>   status/telemetry field has a physical range (a wrapped `pct: 250` reads unmetered, `spd < 0` is rejected —
+>   two of those once overflowed a `/history` average to `null`).
+> Also folded in from that pass: timer knobs are bounded below the 32-bit `setInterval` clamp (a "sweep monthly"
+> value used to become a 1 ms hot loop the boot log vouched for); sane maxima on TTL/history-span/retention;
+> `envBool` stays strict-lowercase (case-insensitivity would have loosened anon/proxy/cookie knobs); URL userinfo
+> is redacted from the boot log; the invalid-config summary logs at ERROR so `LOG_LEVEL=error` still shows it;
+> a 1 KiB server-side payload cap (`too_large`); MQTT keepalive 15 s (~22 s half-open detection, was ~90 s).
+>
+> What changed, structurally: `src/wire.ts` is now the single boundary for both device frames (explicit fields,
+> finite numbers, bounded ids — no string coercion: a device sending `"3"` is a bug to surface, not to paper over);
+> `src/env.ts` replaces 40-odd ad-hoc `Number(process.env.X ?? d)` reads (the `Math.max(1, NaN)` pattern that
+> admitted a 10-year export) and records every knob for the boot log; the registry refuses non-finite values and
+> caps label cardinality (`session` 32, `player` 256, overflow `_other`); the ingest rate buckets are swept when
+> idle; `/health` follows the MQTT client's close/offline events and returns 503 when not ok — Playwright's
+> webServer wait (200–403 = available) and a future compose healthcheck then both mean what they say. One test
+> (`ws-origin.ts`, deliberately brokerless) had been using HTTP `.ok` as "server up" and now waits for the
+> truthful 503 body instead.
 
 ### Phase 4 — Field resilience (firmware)
 Non-blocking connect state machine + jittered backoff · GPS drain loop + larger RX buffer · paced flush

@@ -35,7 +35,8 @@
     "test:session-config-loader": "bun run test/session-config-loader.ts",
     "test:session-config-cli": "bun run test/session-config-cli.ts",
     "test:config-e2e": "bun run test/config-e2e.ts",
-    "test:erasure-audit": "bun run test/erasure-audit.ts"
+    "test:erasure-audit": "bun run test/erasure-audit.ts",
+    "test:boundary": "bun run test/boundary.ts"
   },
   "dependencies": {
     "elysia": "^1.4.28",

@@ -56,12 +56,18 @@ abstract class Metric {
   }
 }
 
+// Audit S-1: a value that is not a finite number must NEVER reach the exposition. `${undefined}` or a string
+// carrying a newline becomes a forged or malformed sample line that breaks the WHOLE scrape (up=0, every
+// alert dead). The wire boundary (wire.ts) rejects such values upstream; this is the last line of defence.
+const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
 class Counter extends Metric {
   private series = new Map<string, { labels: Labels; v: number }>();
   constructor(name: string, help: string) {
     super(name, help, 'counter');
   }
   inc(labels: Labels = {}, delta = 1): void {
+    if (!finite(delta)) return;
     const k = seriesKey(labels);
     const s = this.series.get(k);
     if (s) s.v += delta;
@@ -80,9 +86,11 @@ class Gauge extends Metric {
     super(name, help, 'gauge');
   }
   set(labels: Labels, value: number): void {
+    if (!finite(value)) return;
     this.series.set(seriesKey(labels), { labels, v: value });
   }
   inc(labels: Labels = {}, delta = 1): void {
+    if (!finite(delta)) return;
     const k = seriesKey(labels);
     const s = this.series.get(k);
     if (s) s.v += delta;
@@ -155,6 +163,52 @@ class Registry {
 
 export const registry = new Registry();
 
+// Audit S-5: label cardinality is bounded. The broker ACL scopes a device to its own player id but leaves the
+// session segment as `+`, so one device can mint a fresh {session} label per publish — 200 garbage publishes
+// became 201 series. Each label name admits at most LABEL_CAPS distinct values; the first values seen keep
+// their own series for the life of the process (stable), everything after collapses into one `_other`.
+// Admission is a PRIVILEGE (checker finding): the slots are first-come for the process lifetime, so letting
+// arbitrary traffic reserve them would let 32 junk publishes evict the real match session into `_other`
+// forever. Only two things admit: boot seeding from configuration the operator controls (seedLabel — anon
+// sessions, roster, session-config, account assignments), and fully VALIDATED traffic (capLabel, called by
+// ingest only after a frame passed coercion + rate limit, and by the WS path only for authorized joins).
+// Everything else reads the current state via capLabelPeek, which never reserves.
+const LABEL_CAPS: Record<string, number> = { session: 32, player: 256 };
+const seenLabelValues = new Map<string, Set<string>>();
+export const LABEL_OVERFLOW = '_other';
+
+function seenFor(name: string): Set<string> {
+  let seen = seenLabelValues.get(name);
+  if (!seen) {
+    seen = new Set();
+    seenLabelValues.set(name, seen);
+  }
+  return seen;
+}
+
+/** Admit `value` (if room) and return the label to use. Call ONLY for validated/authorized traffic. */
+export function capLabel(name: string, value: string): string {
+  const cap = LABEL_CAPS[name];
+  if (cap === undefined) return value;
+  const seen = seenFor(name);
+  if (seen.has(value)) return value;
+  if (seen.size >= cap) return LABEL_OVERFLOW;
+  seen.add(value);
+  return value;
+}
+
+/** Read the label WITHOUT reserving a slot — for counters that fire before validation (e.g. received). */
+export function capLabelPeek(name: string, value: string): string {
+  if (LABEL_CAPS[name] === undefined) return value;
+  return seenFor(name).has(value) ? value : LABEL_OVERFLOW;
+}
+
+/** Boot-time admission for sessions the configuration already names — they can never be evicted by a flood. */
+export function seedLabel(name: string, value: string): void {
+  if (LABEL_CAPS[name] === undefined) return;
+  seenFor(name).add(value); // deliberate: seeding may exceed the cap rather than drop a CONFIGURED session
+}
+
 // Latency buckets tuned for an in-process pipeline: sub-ms to half a second.
 const LATENCY_BUCKETS = [
   0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1,
@@ -175,7 +229,7 @@ export const metrics = {
   dropped: registry.register(
     new Counter(
       'ft_telemetry_dropped_total',
-      'Telemetry packets dropped before fan-out, by reason (bad_topic|bad_json|bad_payload|id_mismatch|out_of_range|rate|no_fix)',
+      'Telemetry packets dropped before fan-out, by reason (bad_topic|too_large|bad_json|bad_payload|id_mismatch|out_of_range|rate|no_fix)',
     ),
   ),
   published: registry.register(

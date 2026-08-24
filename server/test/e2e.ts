@@ -88,6 +88,7 @@ try {
   await Bun.write(
     CONF_FILE,
     'listener 1883 127.0.0.1\n' +
+    'message_size_limit 1024\n' +   // the shipped broker bound; the server enforces its own copy too
     'allow_anonymous false\n' +
     `password_file ${PW_FILE}\n` +
     `acl_file ${ACL_FILE}\n`,
@@ -246,9 +247,14 @@ try {
     const m = metricsText.match(re);
     return m ? Number(m[1]) : undefined;
   };
-  // player 01 received good + id_mismatch + fix<2 = 3; player 02 never reached the server (ACL).
-  assert(num(/ft_telemetry_received_total\{[^}]*player="01"[^}]*\}\s+(\d+)/) === 4,
-    'metrics: received_total{player="01"} should be 4');
+  // player 01 received id_mismatch + fix<2 + out_of_range = 3 under its own label; the GOOD packet was the
+  // stream's FIRST, and `received` fires before validation, so it counted under `_other` — the admitting
+  // packet itself is the one-packet accounting blur that keeps unvalidated traffic from reserving label
+  // slots (see metrics.ts capLabelPeek). player 02 never reached the server (ACL).
+  assert(num(/ft_telemetry_received_total\{[^}]*player="01"[^}]*\}\s+(\d+)/) === 3,
+    'metrics: received_total{player="01"} should be 3 (the first/admitting packet counts under _other)');
+  assert((num(/ft_telemetry_received_total\{[^}]*player="_other"[^}]*\}\s+(\d+)/) ?? 0) >= 1,
+    'metrics: the admitting packet is counted under player="_other"');
   assert(!/ft_telemetry_received_total\{[^}]*player="02"[^}]*\}/.test(metricsText),
     'metrics: player "02" must never have been received (ACL should have blocked it)');
   assert(num(/ft_telemetry_published_total\{[^}]*\}\s+(\d+)/) === 1,
@@ -282,7 +288,119 @@ try {
   const pubStatus = await fetch(`http://127.0.0.1:${PORT}/metrics`).then((r) => r.status).catch(() => 0);
   assert(pubStatus !== 200, `/metrics must not be served on the public port; got status ${pubStatus}`);
 
-  console.log('\n✅ E2E PASSED — authed broker, cookie-gated WS, id_mismatch + ACL spoof blocked, 1 row persisted, /metrics correct');
+  // ═══ Phase 3 — boundary correctness (audit S-1, S-2, S-4, S-5) ═══════════════════════════════════
+  const scrape = async (): Promise<string> => (await fetch(`http://127.0.0.1:${METRICS_PORT}/metrics`)).text();
+  /** Every sample line of an exposition must end in a finite decimal — never NaN/undefined/Infinity/text. */
+  const assertWellFormed = (text: string, label: string): void => {
+    for (const line of text.split('\n')) {
+      if (!line || line.startsWith('#')) continue;
+      const m = /^[a-zA-Z_:][a-zA-Z0-9_:]*(\{.*\})?\s+(\S+)$/.exec(line);
+      assert(m !== null, `${label}: malformed exposition line: ${JSON.stringify(line)}`);
+      assert(/^-?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(m[2]), `${label}: non-numeric sample value in: ${JSON.stringify(line)}`);
+    }
+    assert(!/undefined|NaN|Infinity/.test(text.replace(/le="\+Inf"/g, '')), `${label}: exposition contains undefined/NaN/Infinity`);
+  };
+
+  // --- 12. (S-1) a device cannot inject into /metrics through a non-numeric wire field ----------------
+  const rowsBefore = (new Database(DB_PATH, { readonly: true }).query('SELECT COUNT(*) AS n FROM telemetry').get() as { n: number }).n;
+  const framesBefore = received.length;
+  for (const bad of [
+    { ...good, fix: '3\nft_injected_metric 999' },          // the audit's live injection
+    { ...good, sats: '11' },                                  // numeric-looking string
+    { ...good, pdop: null },                                  // missing/invalid optional field
+    { ...good, hdg: 'NaN' },
+    { ...good, lat: '44.8' },
+    { ...good, ts: { $gt: 0 } },
+  ]) pub.publish(TOPIC_01, JSON.stringify(bad), { qos: 0 });
+  await sleep(600);
+  assert(received.length === framesBefore, `(S-1) no non-numeric packet may reach the WS room; got ${received.length - framesBefore} extra frames`);
+  const rowsAfter = (new Database(DB_PATH, { readonly: true }).query('SELECT COUNT(*) AS n FROM telemetry').get() as { n: number }).n;
+  assert(rowsAfter === rowsBefore, `(S-1) no non-numeric packet may be persisted; rows ${rowsBefore} -> ${rowsAfter}`);
+  // An oversized frame is bounded by the SERVER as well as the broker (a host-run broker may lack the limit).
+  pub.publish(TOPIC_01, JSON.stringify({ ...good, pad: 'x'.repeat(4000) }), { qos: 0 });
+  await sleep(300);
+  let text = await scrape();
+  assert(!/ft_injected_metric/.test(text), '(S-1) the injected metric line must not appear in /metrics');
+  assertWellFormed(text, '(S-1)');
+  assert((num(/ft_telemetry_dropped_total\{reason="bad_payload"\}\s+(\d+)/) ?? 0) >= 0, 'sanity');
+  const badPayload = Number((text.match(/ft_telemetry_dropped_total\{reason="bad_payload"\}\s+(\d+)/) ?? [])[1] ?? 0);
+  assert(badPayload >= 6, `(S-1) all six malformed packets must be counted as bad_payload, got ${badPayload}`);
+
+  // --- 13. (S-2) a status frame from a skewed firmware (fields missing) must not poison the scrape -----
+  const STATUS_01 = `football-trackers/session/${SESSION}/player/01/status`;
+  const statusFramesBefore = received.filter((m) => m.event === 'status').length;
+  pub.publish(STATUS_01, JSON.stringify({ id: 'trk-01', pl: '01', ts: 1, up: 12 }), { qos: 0 }); // no batt/pct/rssi/…
+  pub.publish(STATUS_01, JSON.stringify({ id: 'trk-01', pl: '01', ts: 2, up: '12' }), { qos: 0 }); // up not a number → drop
+  await sleep(600);
+  text = await scrape();
+  assertWellFormed(text, '(S-2)');
+  assert(/ft_device_uptime_seconds\{[^}]*player="01"[^}]*\}\s+12$/m.test(text), '(S-2) the numeric field that WAS present is exported');
+  assert(/ft_device_battery_percent\{[^}]*player="01"[^}]*\}\s+-1$/m.test(text), '(S-2) a missing battery percent is exported as the unmetered sentinel -1, not undefined');
+  const statusFrames = received.filter((m) => m.event === 'status');
+  assert(statusFrames.length === statusFramesBefore + 1, `(S-2) the skewed-but-valid status frame reaches coaches once, the invalid one never; got +${statusFrames.length - statusFramesBefore}`);
+  const h = statusFrames[statusFrames.length - 1].data as Record<string, unknown>;
+  for (const k of ['battPct', 'battVolts', 'rssi', 'fix', 'sats', 'backlogBytes', 'serverTs']) {
+    assert(typeof h[k] === 'number' && Number.isFinite(h[k] as number), `(S-2) health envelope field ${k} must be a finite number, got ${JSON.stringify(h[k])}`);
+  }
+
+  // --- 14. (S-5) label cardinality is bounded: 500 novel session ids must not become 500 series --------
+  // The ACL leaves the session segment as `+`, so one device can publish under any session id.
+  for (let i = 0; i < 500; i++) {
+    pub.publish(`football-trackers/session/junk-${i}/player/01/telemetry`, JSON.stringify({ ...good, fix: 0 }), { qos: 0 });
+  }
+  await sleep(1500);
+  text = await scrape();
+  const sessionLabels = new Set<string>();
+  for (const m of text.matchAll(/^ft_telemetry_received_total\{[^}]*session="([^"]*)"[^}]*\}/gm)) sessionLabels.add(m[1]);
+  assert(sessionLabels.size <= 33, `(S-5) 500 novel sessions must collapse into a bounded label set (≤ 33 incl. the overflow bucket), got ${sessionLabels.size}`);
+  assert(sessionLabels.has(SESSION), '(S-5) the real session keeps its own label');
+  // Admission is a privilege: the junk frames above had no fix, so they never validated — NONE of them may
+  // reserve a label slot (32 junk publishes used to evict the real session into `_other` for the process
+  // lifetime). Everything unadmitted reads `_other`.
+  for (const l of sessionLabels) assert(l === SESSION || l === '_other',
+    `(S-5) an unvalidated junk session must never claim its own label slot, found session="${l}"`);
+  // …and a session that DOES produce a valid frame admits itself (bounded by the cap).
+  pub.publish(`football-trackers/session/late-real/player/01/telemetry`, JSON.stringify(good), { qos: 0 });
+  await sleep(400);
+  text = await scrape();
+  assert(/ft_fix_type\{[^}]*session="late-real"[^}]*\}/.test(text), '(S-5) a validated new session gets its own label');
+  assert(/ft_fix_type\{[^}]*session="test"[^}]*\}\s+3$/m.test(text), '(S-5) the real session was not evicted by the flood');
+  assertWellFormed(text, '(S-5)');
+
+  // --- 15. (S-4) /health tells the truth: 200 + ok while subscribed, 503 + mqtt:false within 5 s of broker loss
+  const healthy = await fetch(`http://127.0.0.1:${METRICS_PORT}/health`);
+  const hb = (await healthy.json()) as { ok: boolean; mqtt: boolean; db: boolean };
+  assert(healthy.status === 200 && hb.ok && hb.mqtt && hb.db === true, `(S-4) healthy: expected 200 {ok,mqtt,db:true}, got ${healthy.status} ${JSON.stringify(hb)}`);
+  broker.kill();
+  let flipped = false;
+  const tKill = Date.now();
+  while (Date.now() - tKill < 5_000) {
+    const r = await fetch(`http://127.0.0.1:${METRICS_PORT}/health`);
+    const b = (await r.json()) as { ok: boolean; mqtt: boolean };
+    if (b.mqtt === false) {
+      assert(r.status === 503 && b.ok === false, `(S-4) once mqtt is down /health must be 503 {ok:false}, got ${r.status} ${JSON.stringify(b)}`);
+      flipped = true;
+      break;
+    }
+    await sleep(100);
+  }
+  assert(flipped, '(S-4) /health must flip to mqtt:false within 5 s of the broker dying (it used to latch true forever)');
+  text = await scrape();
+  assert(/^ft_mqtt_connected\s+0$/m.test(text), '(S-4) ft_mqtt_connected must read 0 after broker loss');
+
+  // --- 16. (S-4) the db half is not vacuous: a dropped table must flip db:false (a SELECT 1 cannot fail) ---
+  {
+    const wrecker = new Database(DB_PATH);
+    wrecker.exec('PRAGMA busy_timeout = 5000; DROP TABLE telemetry;');
+    wrecker.close();
+    const r = await fetch(`http://127.0.0.1:${METRICS_PORT}/health`);
+    const b = (await r.json()) as { ok: boolean; db: boolean };
+    assert(r.status === 503 && b.ok === false && b.db === false,
+      `(S-4) with the telemetry table dropped /health must say db:false, got ${r.status} ${JSON.stringify(b)}`);
+  }
+
+  console.log('\n✅ E2E PASSED — authed broker, cookie-gated WS, id_mismatch + ACL spoof blocked, 1 row persisted, /metrics correct, '
+    + 'wire fields coerced (no injection), skewed status harmless, session labels bounded, /health truthful');
   pub.end();
   ws.close();
   unauth.close();
