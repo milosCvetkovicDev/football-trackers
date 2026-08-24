@@ -1,9 +1,11 @@
 # Firmware CI — the ESP32 wearable (firmware/).
 #
-# Compile-only (`pio run`). There is no hardware in CI and no host-runnable firmware test, so the
-# honest gate is "does the image still build for lolin32_lite". That is worth having: main.cpp is
-# the one component with no other automated check at all, and a build break currently surfaces only
-# when someone next flashes a device.
+# Two gates since Phase 4:
+#   1. host-test — firmware/src/resilience.h (the crash-safety logic: seq high-water, backlog
+#      rotation/cursor, id validation, backoff, record expiry) compiles and passes its assertions
+#      on the runner with plain clang++. This is the part hardware can't easily prove.
+#   2. build — `pio run`. There is no hardware in CI, so this half of the gate is "does the image
+#      still build for lolin32_lite"; the bench proves the I/O around the logic.
 #
 # PlatformIO is installed into a venv with pip rather than via a marketplace action, so no unverified
 # action SHA is introduced. PlatformIO Core is pinned to the version that builds this firmware today
@@ -38,6 +40,22 @@ permissions:
   contents: read
 
 jobs:
+  host-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          filter: tree:0
+
+      - name: Host tests for resilience.h (crash-safety logic)
+        working-directory: firmware/test/host
+        # clang++ is preinstalled on ubuntu-latest. -Werror: the header must stay warning-clean on
+        # a strict host compiler, which also keeps it honest about hidden Arduino dependencies.
+        run: |
+          clang++ -std=c++17 -Wall -Wextra -Werror -I ../../src -o test_resilience test_resilience.cpp
+          ./test_resilience
+
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30 # first run downloads the espressif32 platform + xtensa toolchain (~hundreds of MB)

@@ -68,7 +68,9 @@ pio run                                   # compile only
 pio run -t upload && pio device monitor   # flash + serial @115200
 ```
 Non-secret config is at the top of `firmware/src/main.cpp` (`DEVICE CONFIG`): `MQTT_HOST`,
-`MQTT_PORT`, `SESSION_ID` — identical on every device. **Secrets are NOT in source:** the WiFi PSK
+`MQTT_PORT` — with `MQTT_HOST` and `SESSION_ID` as compiled DEFAULTS only (both live in NVS since
+ADR-0022 / audit Phase 4 F-6: `set host` / `set session` in the enroll console; session is the unit of
+coach access control, so real fixtures set it per device). **Secrets are NOT in source:** the WiFi PSK
 and per-device MQTT username (= `PLAYER_ID`) / password live in NVS, set once via the serial `enroll`
 console, so one image flashes to every device ([ADR-0014](docs/decisions/0014-firmware-secret-provisioning.md),
 [firmware/README.md](firmware/README.md)).
@@ -101,18 +103,23 @@ broker → server. Change either side and you change both:
 
 - Topic: `football-trackers/session/{sessionId}/player/{playerId}/telemetry`
 - Packet (terse keys, `RawTelemetry` in `server/src/types.ts`):
-  `{id, pl, ts, lat, lon, spd, hdg, fix, sats, pdop}`
+  `{id, pl, ts, lat, lon, spd, hdg, fix, sats, pdop, sq, gts}` — `sq` = per-device monotonic sequence
+  (server dedupes replays on `(player_id, seq)`), `gts` = the fix's GPS-UTC epoch ms (0 = GPS time not
+  yet valid; a sane `gts` becomes the row's `serverTs`, so replayed outages keep their real span)
 - The firmware builds topic+packet in `main.cpp`; the server subscribes with the MQTT `+`
   wildcard (`TELEMETRY_TOPIC`) and recovers `sessionId`/`playerId` by re-matching the
   concrete topic with `TOPIC_RE` (`server/src/ingest.ts`).
 - **Second topic, same shape rule:** `.../status` carries device health (`DeviceStatus` in
   `types.ts`, recovered with `STATUS_TOPIC_RE`) ~every 5 s — battery, RSSI, heap, backlog,
-  fix quality, device-side pub/stash counters. Best-effort, **not** backlogged.
+  fix quality, device-side pub/stash counters, plus (Phase 4) `rst` (reset reason), `boot`
+  (boot count) and `ver` (firmware version). Best-effort, **not** backlogged.
 
-**Two timestamps, by design.** `ts` is the *device* clock (`millis()`), ordering only and
-explicitly **not** authoritative. The server stamps `serverTs = Date.now()` at ingest;
-that is the source of truth. The split lives across `main.cpp`, `types.ts`
-(`RawTelemetry` vs enriched `Telemetry`), and `ingest.ts` — preserve it.
+**Three timestamps, by design (Phase 4).** `ts` is the *device* clock (`millis()`), ordering only and
+explicitly **not** authoritative. `gts` is the fix's GPS-UTC time — near-exact when valid, and the
+server TRUSTS it as the row's `serverTs` only inside a sanity window (≤ 2 s ahead, ≤ 6 h behind
+arrival; `wire.ts`), which is what lets a replayed outage span its real duration (audit F-2). Outside
+that window — or when `gts` is 0/absent — `serverTs = Date.now()` at ingest, the fallback source of
+truth. The split lives across `main.cpp`, `types.ts` and `wire.ts` — preserve it.
 
 **Ingest → fan-out → persist** (`server/src/ingest.ts`): MQTT QoS0 → JSON-parse → validate every field at the
 boundary (`src/wire.ts`: finite numbers + bounded ids, else `bad_payload`; `fix < 2` → `no_fix`) → enrich into `Telemetry` →
@@ -141,10 +148,13 @@ follows the broker client's connect/close events (true once subscribed, false on
 (no batching needed at ~100 msg/s). This is the "local SQLite" option from the original
 plan; swap this module for a TimescaleDB writer later without touching `ingest.ts`.
 
-**Field resilience** (`firmware/src/main.cpp`): when WiFi/MQTT is down, each fix is appended
-to a size-capped (256 KB) LittleFS backlog (newline-delimited JSON) and replayed on
-reconnect. Reconnect is edge-detected (`!wasConnected` → `backlogFlush()`); flush stops and
-keeps the file on the first failed publish so nothing is lost across repeated dropouts.
+**Field resilience** (`firmware/src/main.cpp` + `firmware/src/resilience.h`, Phase 4): connectivity
+is a non-blocking state machine (jittered backoff; the GPS drain never stalls more than one ~3 s TCP
+attempt, absorbed by an 8 KB RX buffer). Offline fixes go to a TWO-file LittleFS backlog (2×128 KB,
+drop-OLDEST when full) and are replayed PACED (~30 msg/s) from an NVS cursor checkpointed every 20
+records — a crash mid-flush re-sends at most one window, which the server dedupes via `sq`. Records
+older than 6 h are skipped/purged; `wipe` over serial erases the backlog. The pure logic is
+host-tested in `firmware/test/host/` (clang++, also in firmware-ci).
 
 **GPS bring-up** (`main.cpp::gpsBegin`): the NEO-M8N ships at 9600 baud / 1 Hz / NMEA. The
 code talks UBX to raise serial baud to 115200, switches to UBX-only output, sets 10 Hz,

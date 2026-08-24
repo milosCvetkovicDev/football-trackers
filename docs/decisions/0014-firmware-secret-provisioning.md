@@ -16,6 +16,10 @@ removed (PSK loaded from NVS, not committed source)*.
   are read from ESP32 NVS (Arduino `Preferences`, namespace `ft-cfg`) in `setup()`. The compiled image is
   **identical** on every device; only NVS differs. Non-secret deployment config (`MQTT_HOST`, `MQTT_PORT`,
   `SESSION_ID`) stays in source — it is the same on every device, so the "one image" goal still holds.
+  > **Amended (audit Phase 4, 2026-08-24):** `SESSION_ID` moved to NVS (`session_id`, `set session` in the
+  > enroll console + a portal field, compiled value now only the fallback) — session is the unit of coach
+  > access control, so per-fixture sessions must not require a reflash (audit F-6). The "one image" goal
+  > still holds: the image stays identical; one more NVS key differs.
 - **`PLAYER_ID` is the single source of truth.** It is the topic segment, the MQTT username (broker ACL `%u`,
   see [`server/mosquitto/ft.acl`](../../server/mosquitto/ft.acl)) and the packet `pl` field — one NVS value,
   used everywhere.

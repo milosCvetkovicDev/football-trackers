@@ -3,7 +3,7 @@ name: production-readiness-audit
 description: Severity-ranked production-readiness audit of firmware/server/client/vision/infra, with a phased hardening roadmap
 status: in-progress
 created: 2026-08-03T08:34:07Z
-updated: 2026-08-23T19:10:00Z
+updated: 2026-08-24T10:30:00Z
 ---
 
 # Production-Readiness Audit — football-trackers
@@ -640,6 +640,45 @@ Non-blocking connect state machine + jittered backoff · GPS drain loop + larger
 **in the same phase** (they must land together).
 
 **Accept:** 60 s AP outage preserves ≥92% of fixes · no duplicate `(player_id, seq)` rows · replayed rows span ~60 s, not ~1 s · invalid ids rejected at enrollment.
+
+> **✅ DONE 2026-08-24 — code + server-side acceptance; the hardware halves await the bench drill (runbook §7).**
+> What is PROVEN today, by execution: **no duplicate rows** — 30 publishes with 10 duplicate `(player, device,
+> seq)` triples persist exactly 20 rows, the re-sends counted as `dropped{duplicate}`, and a *replacement
+> tracker's* fresh sequence is NOT swallowed (the dedupe key is per-device — `server/test/e2e.ts` P4a, plus a
+> server-restart dedupe check in the checker pass) · **replayed rows span the outage** — a 20-fix backlog with
+> `gts` spread over ~57 s persists with that span, not the arrival second, and `/history` aggregates computed
+> over spanned vs collapsed timestamps differ exactly as F-2 predicted (e2e P4a + checker) · **a sustained
+> ~45/s replay+live load is fully accepted** (cap raised 15→50; the test outlasts the burst window, so a cap
+> regression fails it — e2e P4b) · **invalid ids are rejected at enrollment** — `ft_id_valid` (charset-exact
+> with the server's `TOPIC_ID_RE`, host-tested incl. `07/b`, 65 chars, `+`, `#`) gates `save`, the portal
+> and `configLoad`, so a badly-provisioned device refuses to run rather than black-hole · the crash-safety
+> logic (seq high-water, two-file rotation, cursor windows, expiry, backoff bounds) is host-tested C++ run
+> locally and in firmware-ci; `pio run` compiles (flash 72.5%). PENDING THE BENCH (no device on USB): the
+> literal ≥92%-of-60 s measurement and the mid-replay power-cut drill — the runbook's §7 is the script.
+>
+> The five-lens checker pass (host-compiled C++ probes + live server probes) found **real defects in this
+> phase's own first cut**, all fixed and re-verified:
+> - **The both-full rotation deleted BOTH backlog halves** — `main.cpp` deleted `1 - plan.target` while the
+>   plan's older half sits AT `target`, so a >22 min outage would have destroyed all 256 KB and kept one
+>   record, logging "dropped the OLDEST half". The plan flag is renamed (`drop_oldest_at_target`) with an
+>   I/O contract comment, and the host test now pins which slot the sacrifice sits in.
+> - **The "8 KB buffer rides out the stall" theory was wrong** — the SparkFun driver parses the whole UART
+>   ring into ONE PVT struct, so fixes buffered during a blocking `mqtt.connect` collapse to the last one
+>   (~71–76% preserved in a broker-down outage). The stall itself is now short: a 400 ms TCP pre-connect
+>   (PubSubClient then skips its own blocking connect), a 1 s CONNACK bound, and a cached mDNS result —
+>   ~4–14 fixes lost per backoff attempt, ~5 attempts per 60 s ⇒ ≥92% with margin.
+> - **The player-scoped dedupe would have swallowed a replacement tracker** (and a `clear`-re-enrolled one)
+>   for up to 30 days. The index is now `(player_id, device_id, seq)`; `clear` no longer wipes `seq_hw`
+>   (keys are removed individually); a device with no stored high-water starts from a random base.
+> - Smaller, each reproduced: torn-append tails are healed at boot (`\n` terminator) so they can't merge
+>   with — and destroy — the next record; only position fixes (2/3/4) are stashed (pre-match indoor no-fix
+>   churn at 10 Hz was evicting real fixes); u-blox **signed** `gSpeed`/`headMot` are clamped/normalised at
+>   the source AND tolerated by the server (a near-stationary fix is no longer dropped whole); fixType 5
+>   (time-only, no position) is `no_fix`, not a dot in the Atlantic; a session change at re-enrollment wipes
+>   the pending backlog (those fixes belong to the OLD session's access-control scope); the freshness gauge
+>   uses arrival time (a backlog drain no longer false-fires the staleness SLO); a poison record can't wedge
+>   the flush; the reset-reason legend was off by one (sw=3, panic=4, task-wdt=6 — now correct in /metrics
+>   HELP and the docs); per-file checkpoint counters; the `wipe` message no longer overclaims flash erasure.
 
 ### Phase 5 — Coach-view reliability
 `serverClock.ts` skew correction · `reconnectNow()` + `online` listener + retry button · root and

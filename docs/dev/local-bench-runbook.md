@@ -157,6 +157,37 @@ and `localhost` can resolve to `::1` first. Two consequences worth knowing befor
 
 ---
 
+## 7. Phase 4 acceptance: the 60 s outage drill (bench, real device)
+
+The audit's Phase 4 accepts on hardware evidence: **a 60 s AP/broker outage preserves ≥ 92 % of fixes,
+no duplicate `(player_id, seq)` rows, and the replayed rows span ~60 s** (not the reconnect second).
+With the device flashed (`pio run -t upload`), enrolled, publishing on the bench (§1–§6):
+
+```sh
+# 1. baseline — note the counters (metrics are loopback INSIDE the container; a counter that has never
+#    incremented is ABSENT from the scrape — absent = 0)
+docker compose exec -T server bun -e "fetch('http://127.0.0.1:9464/metrics').then(r=>r.text()).then(t=>console.log(t.split('\n').filter(l=>/^ft_telemetry_(received|published|replayed|dropped)/.test(l)).join('\n')))"
+
+# 2. the outage: stop the broker for 60 s, then bring it back
+docker compose stop mosquitto && sleep 60 && docker compose start mosquitto
+
+# 3. watch the replay drain (paced ~30 msg/s; ft_telemetry_replayed_total should rise by ~600,
+#    ft_device_backlog_bytes should fall back to 0, dropped{duplicate} stays 0 unless the device rebooted)
+docker compose exec -T server bun -e "fetch('http://127.0.0.1:9464/metrics').then(r=>r.text()).then(t=>console.log(t.split('\n').filter(l=>/^ft_(telemetry_(received|published|replayed|dropped)|device_backlog)/.test(l)).join('\n')))"
+
+# 4. verify in the store: rows in the last 3 min (outage + surrounding live traffic) span the outage and
+#    hold no (player, device, seq) duplicates. The ≥92% preservation evidence is ft_telemetry_replayed_total
+#    rising by ~≥552 in step 3 — the raw row count below includes live traffic and is not the criterion.
+cd server && bun -e "
+const {Database}=require('bun:sqlite');const d=new Database('./data/telemetry.db',{readonly:true});
+const r=d.query(\"SELECT COUNT(*) n, MAX(server_ts)-MIN(server_ts) span FROM telemetry WHERE server_ts > (strftime('%s','now')-180)*1000\").get();
+const dup=d.query('SELECT COUNT(*) c FROM (SELECT player_id,device_id,seq FROM telemetry WHERE seq IS NOT NULL GROUP BY player_id,device_id,seq HAVING COUNT(*)>1)').get();
+console.log('rows last 3 min:',r.n,'span ms:',r.span,'dup (player,seq):',dup.c)"
+```
+
+Mid-replay, kill power to the device and re-boot it to exercise the crash path: the re-sent window
+must show up as `ft_telemetry_dropped_total{reason="duplicate"}` (bounded ≤ 20), never as extra rows.
+
 ## Troubleshooting (symptoms seen during bring-up)
 
 | Symptom | Cause | Fix |

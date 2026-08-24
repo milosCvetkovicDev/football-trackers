@@ -106,7 +106,7 @@ try {
   const goodRaw = { id: 'trk-01', pl: '01', ts: 1, lat: 44.8125, lon: 20.4612, spd: 3.2, hdg: 90, fix: 3, sats: 11, pdop: 1.2 };
   const okT = coerceTelemetry(goodRaw, 'test', '01', 1_700_000_000_000);
   assert(okT.ok && okT.value.lat === 44.8125 && okT.value.serverTs === 1_700_000_000_000 && okT.value.sessionId === 'test', 'a well-formed frame coerces');
-  assert(okT.ok && !('displayName' in okT.value) && Object.keys(okT.value).sort().join() === 'fix,hdg,id,lat,lon,pdop,pl,playerId,sats,serverTs,sessionId,spd,ts', `explicit fields only, got ${okT.ok ? Object.keys(okT.value).join() : 'drop'}`);
+  assert(okT.ok && !('displayName' in okT.value) && Object.keys(okT.value).sort().join() === 'fix,gts,hdg,id,lat,lon,pdop,pl,playerId,sats,serverTs,sessionId,spd,sq,ts', `explicit fields only, got ${okT.ok ? Object.keys(okT.value).join() : 'drop'}`);
   const dropT = (over: Record<string, unknown>, why: string): void => {
     const r = coerceTelemetry({ ...goodRaw, ...over }, 'test', '01', 0);
     assert(!r.ok, `${why} must be dropped`);
@@ -132,11 +132,21 @@ try {
   assert(!nofix.ok && nofix.reason === 'no_fix', 'fix 1 is no_fix');
 
   // Range bounds (checker findings): physically impossible values must not reach the DB/WS/gauges.
-  dropT({ spd: -5 }, 'a negative speed');
+  dropT({ spd: -5 }, 'a grossly negative speed');
   dropT({ hdg: 361 }, 'a heading over 360');
-  dropT({ hdg: -1 }, 'a negative heading');
+  dropT({ hdg: -361 }, 'a heading below -360');
   dropT({ fix: 9 }, 'a fix type over 5');
   dropT({ fix: 2.5 }, 'a non-integer fix');
+  // u-blox signed wire types (checker finding): a hair-negative gSpeed and a signed headMot are REAL
+  // near-stationary/legacy-firmware emissions — clamp/normalise, never lose the whole fix.
+  const nearZero = coerceTelemetry({ ...goodRaw, spd: -0.2 }, 'test', '01', 0);
+  assert(nearZero.ok && nearZero.value.spd === 0, 'a near-zero negative speed clamps to 0 (stationary noise)');
+  const negHdg = coerceTelemetry({ ...goodRaw, hdg: -90 }, 'test', '01', 0);
+  assert(negHdg.ok && negHdg.value.hdg === 270, 'a signed heading normalises by +360');
+  const satPdop = coerceTelemetry({ ...goodRaw, pdop: 300 }, 'test', '01', 0);
+  assert(satPdop.ok && satPdop.value.pdop === 300, 'pdop up to the wire type max (655.35) is a quality annotation, not a drop');
+  const timeOnly = coerceTelemetry({ ...goodRaw, fix: 5 }, 'test', '01', 0);
+  assert(!timeOnly.ok && timeOnly.reason === 'no_fix', 'fix 5 (TIME-ONLY — no position) must be no_fix, not a dot in the Atlantic');
   dropT({ sats: 1e9 }, 'a satellite count beyond hardware');
   dropT({ pdop: -1 }, 'a negative pdop');
   dropT({ ts: -1 }, 'a negative device ts');
@@ -145,6 +155,27 @@ try {
     assert(!r.ok && r.reason === 'out_of_range', `${why} must be out_of_range, got ${r.ok ? 'ok' : r.reason}`);
   }
   dropT2({ lat: 91 }, 'lat 91');
+
+  // ── Phase 4 wire v2: sq (sequence) + gts (GPS-UTC ms) on telemetry ─────────────────────────────
+  const NOW = 1_700_000_000_000;
+  const v2 = coerceTelemetry({ ...goodRaw, sq: 41, gts: NOW - 60_000 }, 'test', '01', NOW);
+  assert(v2.ok && v2.value.sq === 41, 'sq is carried when present');
+  assert(v2.ok && v2.value.serverTs === NOW - 60_000,
+    `a sane gts becomes the row time — a replayed 60 s-old fix must not collapse into "now" (audit F-2), got ${v2.ok ? v2.value.serverTs : 'drop'}`);
+  const live = coerceTelemetry({ ...goodRaw, sq: 42, gts: NOW - 150 }, 'test', '01', NOW);
+  assert(live.ok && live.value.serverTs === NOW - 150, 'a live fix with fresh gts uses it too (≈ arrival)');
+  const noGts = coerceTelemetry({ ...goodRaw, sq: 43, gts: 0 }, 'test', '01', NOW);
+  assert(noGts.ok && noGts.value.serverTs === NOW, 'gts 0 (GPS time not yet valid) falls back to arrival time');
+  const oldFw = coerceTelemetry(goodRaw, 'test', '01', NOW);
+  assert(oldFw.ok && oldFw.value.sq === undefined && oldFw.value.serverTs === NOW, 'pre-Phase-4 firmware (no sq/gts) still works');
+  const future = coerceTelemetry({ ...goodRaw, gts: NOW + 60_000 }, 'test', '01', NOW);
+  assert(future.ok && future.value.serverTs === NOW, 'a FUTURE gts (bad device clock) must not be trusted — arrival time wins');
+  const ancient = coerceTelemetry({ ...goodRaw, gts: NOW - 7 * 86_400_000 }, 'test', '01', NOW);
+  assert(ancient.ok && ancient.value.serverTs === NOW, 'a gts older than the replay window must not be trusted (a forged backdate cannot rewrite history)');
+  for (const bad of [{ sq: 1.5 }, { sq: -1 }, { sq: '41' }, { gts: '5' }, { gts: -1 }, { gts: Number.NaN }]) {
+    const r = coerceTelemetry({ ...goodRaw, ...bad }, 'test', '01', NOW);
+    assert(!r.ok && r.reason === 'bad_payload', `an invalid ${Object.keys(bad)[0]} (${JSON.stringify(Object.values(bad)[0])}) must be bad_payload`);
+  }
 
   const skewed = coerceStatus({ id: 'trk-01', pl: '01', ts: 1, up: 12 }, 'test', '01', 5);
   assert(skewed.ok, 'a status frame missing optional fields is ACCEPTED (a firmware skew must not blind the health card)');
@@ -172,6 +203,14 @@ try {
   assert(!negUp.ok && negUp.reason === 'bad_payload', 'a negative uptime is bad_payload (up is the required liveness field)');
   const statusMism = coerceStatus({ id: 'trk-01', pl: '02', ts: 1, up: 12 }, 'test', '01', 5);
   assert(!statusMism.ok && statusMism.reason === 'id_mismatch', 'status body pl ≠ topic player is id_mismatch');
+  // Phase 4 status v2: reset reason, boot count, firmware version (F-4 — a wedged/brownout-looping device
+  // must be visible). ver is a bounded STRING, never a metric label (unbounded label = cardinality hole).
+  const v2s = coerceStatus({ id: 'trk-01', pl: '01', ts: 1, up: 12, rst: 3, boot: 17, ver: 'ft-fw/2.0.0' }, 'test', '01', 5);
+  assert(v2s.ok && v2s.value.rst === 3 && v2s.value.boot === 17 && v2s.value.ver === 'ft-fw/2.0.0', `status carries rst/boot/ver, got ${JSON.stringify(v2s)}`);
+  const v1s = coerceStatus({ id: 'trk-01', pl: '01', ts: 1, up: 12 }, 'test', '01', 5);
+  assert(v1s.ok && v1s.value.rst === -1 && v1s.value.boot === 0 && v1s.value.ver === 'unknown', `pre-Phase-4 status takes sentinels (rst -1 = unknown), got ${JSON.stringify(v1s)}`);
+  const badVer = coerceStatus({ id: 'trk-01', pl: '01', ts: 1, up: 12, ver: 'x'.repeat(200) }, 'test', '01', 5);
+  assert(badVer.ok && badVer.value.ver === 'unknown', 'an over-long/invalid ver takes the sentinel (it is logged, never a label)');
 
   console.log('\n✅ BOUNDARY PASSED — non-finite values never reach /metrics, labels capped with an overflow bucket, '
     + 'env knobs fall back loudly (never NaN), wire frames validated field by field with sentinels for skewed status');

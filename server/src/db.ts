@@ -58,14 +58,32 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_telemetry_server_ts ON telemetry(server_
 // during a match (audit §4.5). (player_id, session_id) serves both the all-sessions and the one-session
 // form, and the rowid-subquery batching below keeps each statement short.
 db.exec('CREATE INDEX IF NOT EXISTS idx_telemetry_player ON telemetry(player_id, session_id);');
+// Phase 4 (audit F-1): the firmware's crash-safe backlog replay re-sends up to one checkpoint window of
+// records after a reboot; dedupe them here. `seq` is the device's monotonic sequence (nullable — pre-Phase-4
+// firmware sends none, and NULLs are exempt from the unique index). ALTER-if-missing keeps existing stores
+// working without a migration framework (that's Phase 6).
+//
+// The key is (player_id, DEVICE_ID, seq), not (player_id, seq): the crash re-send this exists to catch always
+// comes from the SAME device, while a replacement tracker enrolled for the same player starts its sequence
+// fresh — with a player-scoped key its real fixes would collide with the dead device's retained rows and be
+// silently swallowed for up to the retention window (checker finding). device_id embeds the MAC tail, so a
+// replacement never collides; a full-NVS-erase of the SAME device is covered by the firmware's random seq base.
+{
+  const cols = db.query("PRAGMA table_info(telemetry)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === 'seq')) db.exec('ALTER TABLE telemetry ADD COLUMN seq INTEGER;');
+}
+db.exec('DROP INDEX IF EXISTS idx_telemetry_dedupe;'); // v1 (player-scoped) — superseded; no-op once gone
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_dedupe2 ON telemetry(player_id, device_id, seq) WHERE seq IS NOT NULL;');
 
+// OR IGNORE: a conflict on the (player_id, seq) dedupe index is a replay re-send, not an error — the caller
+// reads `changes` to tell "inserted" from "duplicate" (and only fans out the former).
 const insert = db.query(`
-  INSERT INTO telemetry
+  INSERT OR IGNORE INTO telemetry
     (server_ts, session_id, player_id, device_id, device_ts,
-     lat, lon, spd, hdg, fix, sats, pdop)
+     lat, lon, spd, hdg, fix, sats, pdop, seq)
   VALUES
     ($serverTs, $sessionId, $playerId, $deviceId, $deviceTs,
-     $lat, $lon, $spd, $hdg, $fix, $sats, $pdop)
+     $lat, $lon, $spd, $hdg, $fix, $sats, $pdop, $seq)
 `);
 
 // /health's `db` signal (checker finding: `SELECT 1` runs entirely in SQLite's VM and cannot fail with the
@@ -76,18 +94,20 @@ let lastInsertOkTs = 0;
 let lastInsertErrorTs = 0;
 const INSERT_ERROR_HOLD_MS = 60_000;
 
-export function insertTelemetry(t: Telemetry): void {
+/** True = row persisted; false = a (player_id, device_id, seq) DUPLICATE was ignored (crash-mid-flush re-send). */
+export function insertTelemetry(t: Telemetry): boolean {
   try {
-    insertRow(t);
+    const inserted = insertRow(t);
     lastInsertOkTs = Date.now();
+    return inserted;
   } catch (err) {
     lastInsertErrorTs = Date.now();
     throw err;
   }
 }
 
-function insertRow(t: Telemetry): void {
-  insert.run({
+function insertRow(t: Telemetry): boolean {
+  return insert.run({
     $serverTs: t.serverTs,
     $sessionId: t.sessionId,
     $playerId: t.playerId,
@@ -100,7 +120,8 @@ function insertRow(t: Telemetry): void {
     $fix: t.fix,
     $sats: t.sats,
     $pdop: t.pdop,
-  });
+    $seq: t.sq ?? null,
+  }).changes === 1;
 }
 
 // --- retention & erasure (ADR-0010): raw fixes are children's location, so the

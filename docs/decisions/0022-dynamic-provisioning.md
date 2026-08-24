@@ -2,6 +2,11 @@
 
 Date: 2026-06-17
 
+> **Amended (audit Phase 4, 2026-08-24):** the setup portal and the serial console now also collect a
+> per-fixture **Session ID** (`session_id` in NVS, mirroring `mqtt_host`'s default-with-override pattern) —
+> see audit F-6 and firmware/README.md. Player/session ids are validated to `[A-Za-z0-9._-]{1,64}` at
+> enrollment (audit F-3).
+
 ## Status
 
 Accepted — implemented and **verified on real hardware 2026-06-17** (mDNS resolve + connect, captive-portal AP

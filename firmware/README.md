@@ -26,9 +26,10 @@ No WiFi PSK or MQTT credential is built into the image — the **same compiled b
 device**, and only NVS differs. This is the [ADR-0013](../docs/decisions/0013-field-network-security.md)
 hard gate for tracking real children; the design is [ADR-0014](../docs/decisions/0014-firmware-secret-provisioning.md).
 
-In-source (non-secret, identical on every device, at the top of `main.cpp`): `MQTT_HOST` (the **default**
-broker host — overridable per device via the NVS `mqtt_host` below), `MQTT_PORT`, `SESSION_ID`, plus GPS/battery
-pin config.
+In-source (non-secret, identical on every device, at the top of `main.cpp`): `MQTT_HOST` and `SESSION_ID`
+(**defaults only** — both overridable per device via the NVS keys below; since Phase 4 the session id is a
+per-fixture NVS setting, because session is the unit of coach access control — audit F-6), `MQTT_PORT`,
+plus GPS/battery pin config.
 
 In NVS (per-device, set by enrollment — namespace `ft-cfg`):
 
@@ -39,6 +40,7 @@ In NVS (per-device, set by enrollment — namespace `ft-cfg`):
 | `player_id`  | this device's `PLAYER_ID` — **also the MQTT username** (ACL `%u`) |
 | `mqtt_pass`  | this device's MQTT password                                   |
 | `mqtt_host`  | broker host: IP or `name.local` (mDNS). **Optional** — falls back to the compiled `MQTT_HOST` ([ADR-0022](../docs/decisions/0022-dynamic-provisioning.md)) |
+| `session_id` | the fixture's session (`set session u14-sat`). **Optional** — falls back to the compiled `SESSION_ID`; set it per real fixture, since session is what coach access is scoped to (Phase 4, audit F-6). Changing it wipes any pending backlog (those fixes belong to the old session) |
 
 `player_id` is the single source of truth: it is the topic segment, the MQTT username (broker ACL,
 [`../server/mosquitto/ft.acl`](../server/mosquitto/ft.acl)), and the packet `pl` field.
@@ -76,6 +78,39 @@ non-interactively (keep the secrets out of shell history):
 printf 'set ssid net-7f3a\nset wifipass %s\nset player 01\nset mqttpass %s\nsave\n' \
   "$WIFI_PSK" "$MQTT_PW" > /dev/cu.SLAB_USBtoUART   # your board's serial device
 ```
+
+## Field resilience (Phase 4 — audit F-1..F-6)
+
+The wearable's job is to not lose a child's session when the field Wi-Fi drops. Since Phase 4:
+
+- **Connectivity never blocks the GPS.** Wi-Fi association and MQTT connects run as a non-blocking
+  state machine with jittered backoff (1→15 s ±25%); the GPS RX buffer is 8 KB (~8 s of 10 Hz UBX-PVT)
+  and every queued solution is drained per loop, so the longest remaining stall (one ~3 s TCP attempt)
+  loses nothing. The old blocking reconnect lost ~99 % of an outage.
+- **Offline fixes go to a two-file flash backlog** (2 × 128 KB): append to the newest half; when both
+  are full the **oldest** half is dropped (the old code silently dropped every *new* fix once full).
+- **Replay is paced (~30 msg/s) and crash-safe**: the flush cursor is checkpointed to NVS every 20
+  records, so a reboot mid-replay re-sends at most one window — the server dedupes by `sq`.
+- **`sq` + `gts` ride every packet**: a per-device monotonic sequence (NVS high-water, never reused
+  across reboots) and the fix's GPS-UTC time in ms, so replayed fixes keep their real timestamps
+  server-side instead of collapsing into the reconnect second.
+- **Stale location does not linger on flash**: records older than 6 h are skipped at replay and purged
+  once GPS time is valid; `wipe` over serial erases the whole backlog (lost-device privacy path).
+- **A wedged device reboots itself**: a 20 s task watchdog, with `rst` (reset reason), `boot` (NVS
+  boot count) and `ver` (firmware version) in every `.../status` frame — a brownout loop is a climbing
+  boot count on `/metrics`, not a mystery.
+- **Ids are validated at enrollment**: player and session ids must match `[A-Za-z0-9._-]{1,64}` — an
+  id with `/` used to publish into a topic the server never matches, a silent black hole.
+
+The pure logic (rotation, cursor, seq, expiry, backoff, id charset) lives in
+[`src/resilience.h`](src/resilience.h) and is host-tested — `firmware/test/host/`:
+
+```
+cd firmware/test/host && clang++ -std=c++17 -Wall -Wextra -Werror -I ../../src -o test_resilience test_resilience.cpp && ./test_resilience
+```
+
+Serial commands during normal operation: `enroll` (re-provision), `portal` (phone setup AP), `wipe`
+(erase the backlog).
 
 ## Phone setup portal + mDNS broker (ADR-0022)
 
