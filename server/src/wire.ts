@@ -27,9 +27,22 @@ export type Coerced<T> = { ok: true; value: T } | { ok: false; reason: DropReaso
 const isFinite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
-export function coerceTelemetry(body: unknown, sessionId: string, playerId: string, serverTs: number, maxSpeed = Infinity): Coerced<Telemetry> {
+/** How far in the past a device-supplied GPS timestamp may claim to be (the backlog replay window). */
+export const GTS_MAX_AGE_MS_DEFAULT = 6 * 3_600_000;
+/** How far ahead of the server clock a gts may run before it is distrusted (GPS time is near-exact; this absorbs network+server skew). */
+export const GTS_MAX_SKEW_MS_DEFAULT = 2_000;
+
+export function coerceTelemetry(
+  body: unknown,
+  sessionId: string,
+  playerId: string,
+  serverTs: number,
+  maxSpeed = Infinity,
+  gtsMaxAgeMs = GTS_MAX_AGE_MS_DEFAULT,
+  gtsMaxSkewMs = GTS_MAX_SKEW_MS_DEFAULT,
+): Coerced<Telemetry> {
   if (!isObject(body)) return { ok: false, reason: 'bad_payload' };
-  const { id, pl, ts, lat, lon, spd, hdg, fix, sats, pdop } = body;
+  const { id, pl, ts, lat, lon, spd, hdg, fix, sats, pdop, sq, gts } = body;
   if (typeof id !== 'string' || !DEVICE_ID_RE.test(id) || typeof pl !== 'string') return { ok: false, reason: 'bad_payload' };
   // Wrong TYPE (string, null, object, NaN) is bad_payload — the frame is not the shape the contract names.
   if (!isFinite(ts) || !isFinite(lat) || !isFinite(lon) || !isFinite(spd) || !isFinite(hdg) || !isFinite(fix) || !isFinite(sats) || !isFinite(pdop)) {
@@ -37,20 +50,43 @@ export function coerceTelemetry(body: unknown, sessionId: string, playerId: stri
   }
   // Physically impossible VALUES are bad_payload too (checker finding): a negative speed once overflowed the
   // /history average to -Infinity → null; fix 2.5 / sats 1e9 / ts 2^63 have no meaning on this hardware.
+  // Tolerances for u-blox SIGNED wire types (the firmware clamps at source since Phase 4, but pre-Phase-4
+  // devices in the field do not): near-stationary noise can put gSpeed a hair below 0 — clamp, don't lose the
+  // whole fix; headMot's wire type is signed — normalise a negative heading by +360. pdop's wire type runs to
+  // 655.35 (u-blox saturates the report at 99.99): it is a QUALITY annotation, not a reason to drop a fix.
   if (!Number.isInteger(fix) || fix < 0 || fix > 5) return { ok: false, reason: 'bad_payload' };
-  if (spd < 0 || hdg < 0 || hdg > 360 || sats < 0 || sats > 128 || pdop < 0 || pdop > 100 || ts < 0 || ts > Number.MAX_SAFE_INTEGER) {
+  const spdN = spd < 0 && spd >= -1 ? 0 : spd;
+  const hdgN = hdg < 0 && hdg >= -360 ? hdg + 360 : hdg;
+  if (spdN < 0 || hdgN < 0 || hdgN > 360 || sats < 0 || sats > 128 || pdop < 0 || pdop > 656 || ts < 0 || ts > Number.MAX_SAFE_INTEGER) {
+    return { ok: false, reason: 'bad_payload' };
+  }
+  // Phase 4 wire v2 — OPTIONAL fields; present-but-malformed is a device bug to surface, not tolerate.
+  if (sq !== undefined && (!isFinite(sq) || !Number.isInteger(sq) || sq < 0 || sq > Number.MAX_SAFE_INTEGER)) {
+    return { ok: false, reason: 'bad_payload' };
+  }
+  if (gts !== undefined && (!isFinite(gts) || gts < 0 || gts > Number.MAX_SAFE_INTEGER)) {
     return { ok: false, reason: 'bad_payload' };
   }
   // Identity is authoritative from the broker-routed *topic*, never the device body. The per-device MQTT
   // ACL already confines a device to its own player topic; this rejects any packet whose body disagrees.
   if (pl !== playerId) return { ok: false, reason: 'id_mismatch' };
   // Possible-but-implausible coordinates / speeds must not poison the DB or the live canvas.
-  if (lat < -90 || lat > 90 || lon < -180 || lon > 180 || spd > maxSpeed) return { ok: false, reason: 'out_of_range' };
-  // No real 2D/3D fix → nothing to place on the pitch.
-  if (fix < 2) return { ok: false, reason: 'no_fix' };
+  if (lat < -90 || lat > 90 || lon < -180 || lon > 180 || spdN > maxSpeed) return { ok: false, reason: 'out_of_range' };
+  // Only POSITION fixes may place a dot: 2=2D, 3=3D, 4=GNSS+dead-reckoning. u-blox fixType 5 is
+  // TIME-ONLY — the module has a clock but no position, and its stale/zero lat/lon would render a
+  // dot in the Atlantic (checker finding). 0/1/5 are all no_fix.
+  if (fix < 2 || fix === 5) return { ok: false, reason: 'no_fix' };
+  // Audit F-2: the row's time is the FIX's GPS-UTC time when the device supplies a sane one — a replayed
+  // 90 s outage then spans 90 s instead of collapsing into the arrival second (which fabricated teleports
+  // and "high-intensity effort" bursts). Sanity window: never in the future beyond clock skew (GPS time is
+  // near-exact — a future gts means a lying device), never older than the replay window (a forged backdate
+  // must not rewrite history). Outside the window (or gts 0 = GPS time not yet valid) → arrival time.
+  const eventTs = gts !== undefined && gts > 0 && gts <= serverTs + gtsMaxSkewMs && gts >= serverTs - gtsMaxAgeMs
+    ? Math.min(gts, serverTs)
+    : serverTs;
   return {
     ok: true,
-    value: { id, pl, ts, lat, lon, spd, hdg, fix, sats, pdop, sessionId, playerId, serverTs },
+    value: { id, pl, ts, lat, lon, spd: spdN, hdg: hdgN, fix, sats, pdop, sq, gts, sessionId, playerId, serverTs: eventTs },
   };
 }
 
@@ -62,6 +98,8 @@ export function coerceTelemetry(body: unknown, sessionId: string, playerId: stri
  * "ok" on the card or in an alert rule, so out-of-range values take the sentinel too.
  */
 const STATUS_FIELDS = {
+  rst: { sentinel: -1, min: 0, max: 64 },
+  boot: { sentinel: 0, min: 0, max: Number.MAX_SAFE_INTEGER },
   heap: { sentinel: 0, min: 0, max: 16 * 1024 * 1024 },
   rssi: { sentinel: -127, min: -120, max: 0 },
   batt: { sentinel: 0, min: 0, max: 10 },
@@ -85,6 +123,7 @@ export function coerceStatus(body: unknown, _sessionId: string, playerId: string
     const f = STATUS_FIELDS[k];
     return isFinite(v) && v >= f.min && v <= f.max ? v : f.sentinel;
   };
+  const ver = (body as { ver?: unknown }).ver;
   return {
     ok: true,
     value: {
@@ -92,6 +131,10 @@ export function coerceStatus(body: unknown, _sessionId: string, playerId: string
       pl,
       ts: num('ts'),
       up,
+      rst: num('rst'),
+      boot: num('boot'),
+      // Bounded printable string or the sentinel — logged for diagnosis, NEVER a metric label (cardinality).
+      ver: typeof ver === 'string' && /^[\x20-\x7e]{1,32}$/.test(ver) ? ver : 'unknown',
       heap: num('heap'),
       rssi: num('rssi'),
       batt: num('batt'),

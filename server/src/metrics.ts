@@ -229,11 +229,17 @@ export const metrics = {
   dropped: registry.register(
     new Counter(
       'ft_telemetry_dropped_total',
-      'Telemetry packets dropped before fan-out, by reason (bad_topic|too_large|bad_json|bad_payload|id_mismatch|out_of_range|rate|no_fix)',
+      'Telemetry packets dropped before fan-out, by reason (bad_topic|too_large|bad_json|bad_payload|id_mismatch|out_of_range|rate|no_fix|duplicate)',
     ),
   ),
   published: registry.register(
     new Counter('ft_telemetry_published_total', 'Telemetry packets fanned out to WS rooms'),
+  ),
+  replayed: registry.register(
+    new Counter(
+      'ft_telemetry_replayed_total',
+      'Accepted fixes whose GPS time (gts) predates arrival by >5 s — i.e. backlog replay after an outage (Phase 4, audit F-2)',
+    ),
   ),
   ingestLatency: registry.register(
     new Histogram(
@@ -411,6 +417,12 @@ export const metrics = {
   ),
   devStashed: registry.register(
     new Gauge('ft_device_stashed', 'Device-side cumulative backlog appends (resets on reboot)'),
+  ),
+  devBootCount: registry.register(
+    new Gauge('ft_device_boot_count', 'NVS boot counter per device (Phase 4; a climbing count with short uptimes = brownout/watchdog loop)'),
+  ),
+  devResetReason: registry.register(
+    new Gauge('ft_device_reset_reason', 'esp_reset_reason() code of the LAST boot per device (Phase 4; -1 unknown/old-firmware, 0 unknown, 1 poweron, 3 sw, 4 panic, 5 int-wdt, 6 task-wdt (the Phase-4 watchdog fired), 7 other-wdt, 9 brownout)'),
   ),
   devStatusLastSeen: registry.register(
     new Gauge('ft_device_status_last_seen_timestamp_seconds', 'Unix time of the last status frame'),

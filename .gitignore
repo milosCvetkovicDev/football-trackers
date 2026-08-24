@@ -63,6 +63,9 @@ id_ed25519
 *.jks
 *.keystore
 
+# Host-compiled firmware test binary (firmware/test/host/ README command builds it in place)
+/firmware/test/host/test_resilience
+
 # ── Data at rest (telemetry is children's positions, timestamped) ────────────────────
 *.db
 *.db-wal

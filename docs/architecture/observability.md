@@ -83,7 +83,8 @@ The registry itself refuses non-finite values as a last line of defence (a strin
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `ft_telemetry_received_total` | counter | session, player | Packets received from MQTT |
-| `ft_telemetry_dropped_total` | counter | reason | Dropped pre-fan-out: `bad_topic`, `bad_json`, `bad_payload`, `id_mismatch`, `out_of_range`, `rate`, `no_fix` |
+| `ft_telemetry_replayed_total` | counter | — | Accepted fixes whose GPS time predates arrival by >5 s — backlog replay after an outage (Phase 4) |
+| `ft_telemetry_dropped_total` | counter | reason | Dropped pre-fan-out: `bad_topic`, `too_large`, `bad_json`, `bad_payload`, `id_mismatch`, `out_of_range`, `rate`, `no_fix`, `duplicate` (a crash-mid-flush re-send, already stored) |
 | `ft_telemetry_published_total` | counter | session | Fanned out to WS rooms |
 | `ft_ingest_duration_seconds` | histogram | — | Server-side time: receipt → persisted → fanned out |
 | `ft_db_write_duration_seconds` | histogram | — | SQLite insert latency |
@@ -172,6 +173,8 @@ in any label or HELP line" guard that holds for the rest of the catalogue holds 
 | `ft_device_free_heap_bytes` | gauge | Free heap (memory-leak / crash early warning) |
 | `ft_device_uptime_seconds` | gauge | Uptime (resets reveal brown-outs/reboots) |
 | `ft_device_backlog_bytes` | gauge | **Flash backlog size — rising = can buffer but can't reach broker** |
+| `ft_device_boot_count` | gauge | NVS boot counter (Phase 4) — climbing with short uptimes = brownout/watchdog loop |
+| `ft_device_reset_reason` | gauge | Last boot's `esp_reset_reason()` code (Phase 4): 0 unknown, 1 poweron, 3 sw, 4 panic, 5 int-wdt, **6 task-wdt (the Phase-4 watchdog fired)**, 7 other-wdt, 9 brownout; -1 = pre-Phase-4 firmware |
 | `ft_device_published` / `ft_device_stashed` | gauge | Device-side cumulative publish vs stash (reset on reboot) |
 | `ft_device_status_last_seen_timestamp_seconds` | gauge | Last status frame → device-silence detector |
 

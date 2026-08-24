@@ -269,7 +269,7 @@ cd client && VITE_PROXY_TARGET=http://127.0.0.1:3007 bun run dev   # coach view 
 
 ## Status / next
 - [x] Hardware ordered (1-2 prototype sets)
-- [x] Firmware skeleton (10 Hz -> MQTT, LittleFS backlog on dropout)
+- [x] Firmware skeleton (10 Hz -> MQTT, LittleFS backlog on dropout); **hardened in audit Phase 4** (2026-08-24): non-blocking reconnect + jittered backoff + 8 KB GPS buffer (an outage no longer starves the drain), crash-safe paced replay (NVS cursor + `sq` dedupe server-side), GPS-UTC `gts` so replays keep their real timestamps, watchdog + reset-reason/boot-count/version in `.../status`, id validation at enrollment, NVS `session_id`, backlog age purge + `wipe` — bench acceptance run pending (see the runbook §7)
 - [x] Bun/Elysia ingest + WS fan-out + bun:sqlite persist (e2e verified, no hardware)
 - [x] Observability: Prometheus `/metrics`, JSON logs, device `.../status` health topic (e2e verified)
 - [x] Security MSI: token-gated `/live` (+ Origin/CSWSH check), per-device MQTT creds + topic ACLs, server-side `id_mismatch` reject (e2e verified). Architecture-board reviewed — see [target-architecture](docs/architecture/target-architecture.md) + [ADRs 0006–0014](docs/decisions/README.md)

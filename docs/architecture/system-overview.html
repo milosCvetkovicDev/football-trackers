@@ -355,7 +355,7 @@
         <ul class="tight">
           <li><b>GPS bring-up</b> (<code>gpsBegin</code>): raise serial to 115200, switch to UBX-only output, set <b>10&nbsp;Hz</b>, enable <code>autoPVT</code>, persist to module flash — with a 9600 fallback.</li>
           <li><b>Publish loop</b>: on each fresh PVT, build the JSON packet and <code>mqtt.publish()</code>. Unit conversions happen here: lat/lon ÷1e7 (7 dp), speed mm/s→m/s, heading ÷1e5, pdop ÷100.</li>
-          <li><b>Field resilience</b>: Wi-Fi/MQTT down → append each fix to a <b>256&nbsp;KB LittleFS backlog</b> (ndjson). Reconnect is edge-detected → <code>backlogFlush()</code> replays it; stops &amp; keeps the file on the first failed publish, so nothing is lost across repeated dropouts.</li>
+          <li><b>Field resilience</b> (Phase 4): Wi-Fi/MQTT down → position fixes append to a <b>two-file 2×128&nbsp;KB LittleFS backlog</b> (drop-<i>oldest</i> when full). Replay is <b>paced (~30&nbsp;msg/s)</b> from an NVS cursor (checkpoint every 20 records) — a crash mid-replay re-sends at most one window, deduped server-side by <code>sq</code>; records keep their GPS-UTC time (<code>gts</code>), so a replayed outage spans its real duration.</li>
           <li><b>Status heartbeat</b> (~5&nbsp;s): battery / RSSI / heap / backlog / fix to <code>.../status</code>. Best-effort, <b>never</b> backlogged — health only matters live.</li>
         </ul>
         <div class="files"><span>firmware/src/main.cpp</span><span>platformio.ini</span></div>
@@ -432,7 +432,7 @@
       </div>
       <div class="card">
         <span class="pill gps">the invariant</span>
-        <h3>Two timestamps, by design</h3>
+        <h3>Three timestamps, by design (Phase 4)</h3>
         <p class="sub">A system-wide rule, not an accident:</p>
         <ul class="tight">
           <li><code>ts</code> = the <b>device</b> clock (<code>millis()</code>). <b>Ordering only</b>, explicitly NOT authoritative — clocks drift, devices reboot.</li>

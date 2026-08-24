@@ -97,9 +97,16 @@ const boundedId = (v: string): boolean => TOPIC_ID_RE.test(v);
 
 // --- abuse bounds (the broker also caps message size; these guard the pipeline) ---
 // All via env.ts (audit S-3): a typo here used to become NaN and silently disable the cap.
-const MAX_SPD = envNumber('INGEST_MAX_SPEED', 40, { min: 1 }); // min 1: 0 would silently drop every moving fix // m/s (~144 km/h): a GPS glitch, not a child
-const RATE_CAP = envNumber('INGEST_RATE_CAP', 15, { min: 0.001 }); // accepted packets/sec per player (10 Hz + headroom)
-const RATE_BURST = envNumber('INGEST_RATE_BURST', 30, { min: 1 });
+const MAX_SPD = envNumber('INGEST_MAX_SPEED', 40, { min: 1 }); // m/s (~144 km/h): a GPS glitch, not a child; min 1 — 0 would drop every moving fix
+// Phase 4: raised from 15/30 — the firmware's paced backlog flush (~30 msg/s) plus live 10 Hz must fit
+// (audit: "raise ingest rate cap in the same phase; they must land together"). Still tiny for the DB.
+const RATE_CAP = envNumber('INGEST_RATE_CAP', 50, { min: 0.001 }); // accepted packets/sec per player
+const RATE_BURST = envNumber('INGEST_RATE_BURST', 100, { min: 1 });
+// How far in the past / future a device gts is trusted as the row time (wire.ts; audit F-2).
+const GTS_MAX_AGE_MS = envNumber('INGEST_GTS_MAX_AGE_MS', 6 * 3_600_000, { min: 1_000 });
+const GTS_MAX_SKEW_MS = envNumber('INGEST_GTS_MAX_SKEW_MS', 2_000, { min: 0 });
+/** A fix stamped this far before arrival is a backlog replay (counted; the row time is the GPS time). */
+const REPLAY_LAG_MS = 5_000;
 // Status frames are ~0.2 Hz from the firmware; cap them well below the telemetry rate. Without this a
 // compromised/mis-ACL'd device flooding .../status would flood the WS fan-out (publishStatus broadcasts to
 // every coach in the room) and thrash the device gauges — handleTelemetry already has this guard; mirror it.
@@ -161,7 +168,8 @@ function handleTelemetry(
   }
   // Every field validated at the boundary (wire.ts, audit S-1): a string `fix`, a missing `sats`, an object
   // `ts` are bad_payload here — never a row, a WS frame, or a metric sample. Explicit fields only (§0.1).
-  const coerced = coerceTelemetry(body, session, player, Date.now(), MAX_SPD);
+  const arrivalTs = Date.now();
+  const coerced = coerceTelemetry(body, session, player, arrivalTs, MAX_SPD, GTS_MAX_AGE_MS, GTS_MAX_SKEW_MS);
   if (!coerced.ok) {
     metrics.dropped.inc({ reason: coerced.reason });
     return;
@@ -177,13 +185,20 @@ function handleTelemetry(
 
   try {
     const dbStart = performance.now();
-    insertTelemetry(t);
+    const inserted = insertTelemetry(t);
     metrics.dbWrite.observe({}, (performance.now() - dbStart) / 1000);
+    if (!inserted) {
+      // A (player, seq) already stored: the firmware's crash-mid-flush re-send (its NVS cursor checkpoints
+      // every N records). Already persisted AND already fanned out the first time — drop silently here.
+      metrics.dropped.inc({ reason: 'duplicate' });
+      return;
+    }
   } catch (err) {
     metrics.dbErrors.inc();
     log.error('db insert failed', { err: String(err), session, player });
     return; // a fix we couldn't persist still shouldn't crash the loop
   }
+  if (arrivalTs - t.serverTs > REPLAY_LAG_MS) metrics.replayed.inc();
 
   publish(session, t);
   metrics.published.inc({ session: L.session });
@@ -192,10 +207,15 @@ function handleTelemetry(
   metrics.fixType.set(L, t.fix);
   metrics.sats.set(L, t.sats);
   metrics.pdop.set(L, t.pdop);
-  metrics.lastSeen.set(L, t.serverTs / 1000);
+  // Freshness is about ARRIVAL, not event time: during a backlog drain t.serverTs is the (old) GPS
+  // time, and stamping the gauge with it made a just-recovered tracker read as silent — false-firing
+  // the freshness SLO at exactly the moment the operator is watching the recovery (checker finding).
+  metrics.lastSeen.set(L, arrivalTs / 1000);
 
   metrics.ingestLatency.observe({}, (performance.now() - t0) / 1000);
 }
+
+const lastVer = new Map<string, string>();
 
 function handleStatus(
   session: string,
@@ -233,7 +253,15 @@ function handleStatus(
   metrics.devBacklogBytes.set(L, s.backlog);
   metrics.devPublished.set(L, s.pub);
   metrics.devStashed.set(L, s.stash);
+  metrics.devBootCount.set(L, s.boot);
+  metrics.devResetReason.set(L, s.rst);
   metrics.devStatusLastSeen.set(L, now / 1000);
+  // Firmware version: LOGGED on change (bounded string), deliberately never a metric label (cardinality).
+  const prevVer = lastVer.get(player);
+  if (s.ver !== 'unknown' && s.ver !== prevVer) {
+    lastVer.set(player, s.ver);
+    log.info('device firmware version', { session, player, ver: s.ver, rst: s.rst, boot: s.boot });
+  }
 
   // Phase 3: fan a MINIMISED health envelope out to coaches on /live — battery/GPS/WiFi/backlog only, so a
   // coach can tell a stationary player from a dropped tracker. Device internals (heap/uptime/pub/stash) stay

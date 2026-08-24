@@ -18,6 +18,13 @@ export interface RawTelemetry {
   fix: number; // 0 = none, 2 = 2D, 3 = 3D
   sats: number;
   pdop: number;
+  /** Phase 4 (audit F-1): per-device monotonic sequence (survives reboot via an NVS high-water mark).
+   *  Optional — pre-Phase-4 firmware doesn't send it; without it there is no replay dedupe. */
+  sq?: number;
+  /** Phase 4 (audit F-2): GPS-UTC epoch ms of the FIX (0 = GPS time not yet valid). Optional. A sane gts
+   *  becomes the row's serverTs, so a replayed outage spans its real duration instead of collapsing into
+   *  the arrival second. */
+  gts?: number;
 }
 
 export interface Telemetry extends RawTelemetry {
@@ -46,6 +53,9 @@ export interface DeviceStatus {
   pub: number; // device-side cumulative successful publishes
   stash: number; // device-side cumulative backlog appends
   backlog: number; // current flash backlog size, bytes
+  rst: number; // Phase 4 (F-4): esp_reset_reason() code (-1 = unknown/pre-Phase-4 firmware)
+  boot: number; // Phase 4 (F-4): NVS boot counter (0 = unknown)
+  ver: string; // Phase 4 (F-4): firmware version string, bounded; logged, NEVER a metric label
 }
 
 /**

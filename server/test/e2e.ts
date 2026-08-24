@@ -367,6 +367,64 @@ try {
   assert(/ft_fix_type\{[^}]*session="test"[^}]*\}\s+3$/m.test(text), '(S-5) the real session was not evicted by the flood');
   assertWellFormed(text, '(S-5)');
 
+  // ═══ Phase 4 — field resilience, the server half (audit F-1/F-2 + the rate-cap raise) ═══════════════
+  // These run BEFORE §15/§16 (they need the broker alive and the table present).
+  // --- P4a. (F-1) crash-safe replay: a re-sent (player, device, seq) row is deduped, never double-counted
+  const P4S = 'p4';
+  const p4 = (sq: number, gts: number, lat = 44.8130): string => JSON.stringify({
+    id: 'trk-01', pl: '01', ts: 1, lat, lon: 20.4615, spd: 2.0, hdg: 45, fix: 3, sats: 10, pdop: 1.1, sq, gts,
+  });
+  const p4db = () => new Database(DB_PATH, { readonly: true });
+  const nowMs = Date.now();
+  // A 60 s outage's backlog, replayed: 20 fixes whose gts SPANS the outage (audit F-2: they used to collapse
+  // into ~1 s of arrival time, fabricating a teleport + a burst of "high-intensity efforts").
+  for (let i = 0; i < 20; i++) pub.publish(`football-trackers/session/${P4S}/player/01/telemetry`, p4(100 + i, nowMs - 60_000 + i * 3_000), { qos: 0 });
+  // The crash-mid-flush re-send: the same first 10 seqs again (the NVS cursor checkpoints every N records).
+  for (let i = 0; i < 10; i++) pub.publish(`football-trackers/session/${P4S}/player/01/telemetry`, p4(100 + i, nowMs - 60_000 + i * 3_000), { qos: 0 });
+  await sleep(1200);
+  {
+    const rows = p4db().query('SELECT server_ts AS t, seq FROM telemetry WHERE session_id = ? ORDER BY seq').all(P4S) as { t: number; seq: number }[];
+    assert(rows.length === 20, `(F-1) 30 publishes with 10 duplicate seqs must persist exactly 20 rows, got ${rows.length}`);
+    const seqs = new Set(rows.map((r) => r.seq));
+    assert(seqs.size === 20, `(F-1) every (player, seq) must be unique, got ${seqs.size} distinct of ${rows.length}`);
+    const spanMs = rows[rows.length - 1].t - rows[0].t;
+    assert(spanMs > 50_000 && spanMs < 70_000,
+      `(F-2) replayed rows must SPAN the outage (~57 s of gts spread), not collapse into arrival time — got ${Math.round(spanMs / 1000)} s`);
+    assert(rows[0].t < nowMs - 50_000, `(F-2) the oldest replayed row keeps its GPS time, got ${rows[0].t} vs now ${nowMs}`);
+  }
+  // The dedupe key is (player, DEVICE, seq): a REPLACEMENT tracker (fresh NVS, same player, new MAC)
+  // starts its sequence over — its fixes must NOT be swallowed by the dead device's retained rows.
+  pub.publish(`football-trackers/session/${P4S}/player/01/telemetry`, JSON.stringify({
+    id: 'trk-01-NEW', pl: '01', ts: 1, lat: 44.8130, lon: 20.4615, spd: 2.0, hdg: 45, fix: 3, sats: 10, pdop: 1.1, sq: 100, gts: nowMs - 1000,
+  }), { qos: 0 });
+  await sleep(400);
+  {
+    const n = (p4db().query('SELECT COUNT(*) AS n FROM telemetry WHERE session_id = ? AND seq = 100').get(P4S) as { n: number }).n;
+    assert(n === 2, `(F-1) the same (player, seq) from a DIFFERENT device must persist (replacement tracker), got ${n} rows for seq 100`);
+  }
+  text = await scrape();
+  const dupDropped = Number((text.match(/ft_telemetry_dropped_total\{reason="duplicate"\}\s+(\d+)/) ?? [])[1] ?? 0);
+  assert(dupDropped === 10, `(F-1) the 10 same-device re-sent records must be counted as dropped{duplicate}, got ${dupDropped}`);
+  const replayed = Number((text.match(/ft_telemetry_replayed_total\s+(\d+)/) ?? [])[1] ?? 0);
+  assert(replayed >= 19, `(F-2) fixes stamped >5 s before arrival must count as replayed, got ${replayed}`);
+  assertWellFormed(text, '(P4)');
+
+  // --- P4b. the ingest rate CAP (not just the burst) sustains a paced backlog flush + live traffic —
+  // they must land together: the firmware paces its flush at ~30 msg/s with live 10 Hz on top (~40/s
+  // sustained), and the old cap of 15/s would have silently dropped the replay. A burst-sized test
+  // passes on burst tokens alone (checker finding), so this runs LONGER than the burst window:
+  // 270 packets at ~45/s ≈ 6 s. At cap 50 all are admitted; at the old cap 15 the bucket dries up
+  // after ~2.6 s and ~½ would drop.
+  {
+    for (let i = 0; i < 270; i++) {
+      pub.publish(`football-trackers/session/${P4S}/player/01/telemetry`, p4(300 + i, nowMs - 30_000 + i * 100), { qos: 0 });
+      await sleep(21);
+    }
+    await sleep(1000);
+    const n = (p4db().query('SELECT COUNT(*) AS n FROM telemetry WHERE session_id = ? AND seq >= 300').get(P4S) as { n: number }).n;
+    assert(n === 270, `(P4) a ~45/s sustained replay+live load must be fully accepted (cap 50/s) — a cap regression to 15/s drops ~half; got ${n}/270`);
+  }
+
   // --- 15. (S-4) /health tells the truth: 200 + ok while subscribed, 503 + mqtt:false within 5 s of broker loss
   const healthy = await fetch(`http://127.0.0.1:${METRICS_PORT}/health`);
   const hb = (await healthy.json()) as { ok: boolean; mqtt: boolean; db: boolean };

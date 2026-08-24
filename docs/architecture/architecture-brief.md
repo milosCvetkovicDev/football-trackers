@@ -40,7 +40,9 @@ MQTT** → **Bun + Elysia** ingest (server-stamps, validates, enriches, persists
 **The bindings that must be respected** (changing either side changes both):
 - **Topic:** `football-trackers/session/{sessionId}/player/{playerId}/telemetry` (+ `.../status` health).
 - **Packet:** terse JSON `{id, pl, ts, lat, lon, spd, hdg, fix, sats, pdop}`.
-- **Two timestamps:** device `ts` (`millis()`) is **ordering only, non-authoritative**; the server stamps
+- **Three timestamps (Phase 4):** device `ts` (`millis()`) is **ordering only, non-authoritative**; `gts` is
+  the fix's GPS-UTC time, trusted as the row's time only inside a sanity window (≤ 2 s ahead / ≤ 6 h behind
+  arrival) so a replayed outage keeps its real span; otherwise the server stamps
   `serverTs = Date.now()` at ingest — that is the source of truth.
 
 Already built and verified without hardware: firmware (10 Hz + LittleFS backlog + `.../status`), the
@@ -167,12 +169,14 @@ right-sized alternative or justify the exception against the drivers.
 ## 7. Invariants — do NOT break these
 
 - **One pipeline, one wire contract** (topic + packet shape) across firmware → broker → server.
-- **Two-timestamp design** (device `ts` non-authoritative; `serverTs` authoritative).
+- **Three-timestamp design (Phase 4)** (device `ts` non-authoritative; `serverTs` authoritative).
 - **bun:sqlite now, TimescaleDB-swappable later** via the `db.ts` seam.
 - **Native Bun WS pub/sub** for fan-out — **not** socket.io; the client uses a plain `WebSocket`.
 - **Self-hosted observability** (Prometheus `/metrics`, JSON logs, device `.../status`) — already in place;
   the architecture must keep it working in both profiles.
-- **Field resilience:** LittleFS backlog + replay on reconnect ([NFR-RES-1]) — a dropout loses nothing.
+- **Field resilience:** two-file LittleFS backlog (2×128 KB, drop-oldest when full) + paced, cursor-resumable
+  replay deduped by `sq` server-side ([NFR-RES-1]) — a dropout loses at most the fixes arriving during the
+  short bounded connect attempts (bench target: ≥ 92 % of a 60 s outage preserved).
 - Stack: **Bun + Elysia** server, **ESP32/Arduino** firmware, **React + Vite** client. Private project; **no**
   coupling to any work platform.
 
