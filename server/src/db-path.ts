@@ -7,8 +7,9 @@
  */
 import { openSync, readSync, closeSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { envString } from './env';
 
-export const DB_PATH = process.env.DB_PATH ?? 'telemetry.db';
+export const DB_PATH = envString('DB_PATH', 'telemetry.db');
 
 const SQLITE_MAGIC = 'SQLite format 3\0';
 

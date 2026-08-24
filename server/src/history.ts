@@ -18,6 +18,7 @@
  */
 
 import { readFixesPage, type FixRow } from './db';
+import { envInt, envNumber } from './env';
 import { ageBandFor, thresholdsForSession } from './sessionConfig';
 import type { AgeBand, ZoneThresholds } from './types';
 import { acquireScanSlot, releaseScanSlot, _scanInflight } from './scanLoad';
@@ -27,11 +28,11 @@ import { log } from './log';
 // ----- config (env) — bounds on the scan + the DoS controls -----------------------------
 const DAY_MS = 86_400_000;
 /** Max query window: bounds how much of the raw trace one request can scan. Default 24h. */
-const HISTORY_MAX_SPAN_MS = Math.max(1, Number(process.env.HISTORY_MAX_SPAN_MS ?? DAY_MS));
+const HISTORY_MAX_SPAN_MS = envNumber('HISTORY_MAX_SPAN_MS', DAY_MS, { min: 1, max: 7 * DAY_MS }); // max 7 d: the S-3 '10-year export'
 /** Rows per keyset page. Default 1000 ≈ a ~1–2 ms synchronous hold ≈ the 50p×10Hz fan-out
  * interval, so a page never burst-starves live fan-out; we await-yield between pages. The §5
  * SLO test is the gate — if it fails, drop this further (env-overridable) or go to a worker. */
-const HISTORY_SCAN_CHUNK = Math.max(1, Number(process.env.HISTORY_SCAN_CHUNK ?? 1000));
+const HISTORY_SCAN_CHUNK = envInt('HISTORY_SCAN_CHUNK', 1000, { min: 1 });
 /** Default + hard-max page size for a raw replay request (one page per call). */
 const HISTORY_RAW_LIMIT_DEFAULT = 2000;
 const HISTORY_RAW_LIMIT_MAX = 10_000;
@@ -42,8 +43,8 @@ const HEATMAP_ROWS = 20;
 // DoS controls (mirror auth.ts: a global inflight cap + per-principal token buckets). PM-1: the inflight cap is
 // now the SHARED scanLoad slot (history + events combined), so concurrent off-loop scans across BOTH surfaces
 // can't gang up past the loop-protection bound. The per-principal RATE bucket below stays history-local.
-const HISTORY_RATE_BURST = Math.max(1, Number(process.env.HISTORY_RATE_BURST ?? 30));
-const HISTORY_RATE_PER_MIN = Math.max(1, Number(process.env.HISTORY_RATE_PER_MIN ?? 60));
+const HISTORY_RATE_BURST = envNumber('HISTORY_RATE_BURST', 30, { min: 1 });
+const HISTORY_RATE_PER_MIN = envNumber('HISTORY_RATE_PER_MIN', 60, { min: 1 });
 const RATE_WINDOW_MS = 60_000; // the per-minute refill window the bucket measures against
 
 const SESSION_ID_RE = /^[A-Za-z0-9._-]{1,64}$/; // playerId shares the session-id charset bound

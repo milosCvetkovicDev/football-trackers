@@ -24,19 +24,19 @@ import { purgeOlderThan, oldestServerTs, sessionHasTelemetry } from './db';
 import { pruneRosterSessions } from './roster';
 import { metrics } from './metrics';
 import { log } from './log';
+import { envInt, envNumber, envTimerMs } from './env';
 
 const DAY_MS = 86_400_000;
 
 // Fail SAFE on a malformed value: a typo like RETENTION_DAYS="30d"/"abc"/"Infinity"
 // coerces to NaN/Infinity, which must NOT silently disable the purge (the exact
 // unbounded-retention failure ADR-0010 exists to prevent). Non-finite -> 30-day default.
-const parsedDays = Number(process.env.RETENTION_DAYS ?? 30);
-/** Retention window in days; <= 0 disables the time-based purge (keeps raw indefinitely). */
-export const RETENTION_DAYS = Number.isFinite(parsedDays) ? parsedDays : 30;
+/** Retention window in days; <= 0 disables the time-based purge (keeps raw indefinitely). Non-finite → 30. */
+export const RETENTION_DAYS = envNumber('RETENTION_DAYS', 30, { max: 3650 });
 /** How often the sweep runs (default hourly); the window, not the cadence, is what matters. */
-const SWEEP_MS = Number(process.env.RETENTION_SWEEP_MS ?? 3_600_000);
+const SWEEP_MS = envTimerMs('RETENTION_SWEEP_MS', 3_600_000, { min: 1_000 });
 /** Rows per DELETE batch — bounds how long a single synchronous statement holds the loop. */
-const BATCH = Number(process.env.RETENTION_BATCH ?? 50_000);
+const BATCH = envInt('RETENTION_BATCH', 50_000, { min: 1 });
 
 /**
  * Refresh the data-minimisation gauge: how old is the oldest raw fix we still hold.
@@ -99,10 +99,6 @@ export async function runRetention(now: number = Date.now()): Promise<number> {
 
 /** Start the periodic retention job: an immediate sweep, then one every SWEEP_MS. */
 export function startRetention(): ReturnType<typeof setInterval> {
-  const raw = process.env.RETENTION_DAYS;
-  if (raw !== undefined && !Number.isFinite(Number(raw))) {
-    log.warn('RETENTION_DAYS is not a finite number — falling back to the 30-day default', { provided: raw });
-  }
   if (!(RETENTION_DAYS > 0)) {
     log.warn('RETENTION_DAYS <= 0 — time-based purge is DISABLED; raw fixes are kept indefinitely');
   }

@@ -1,3 +1,4 @@
+import { envInt } from './env';
 /**
  * Shared off-loop-scan admission (PM-1; event-detection-contract §0.4/§1.5).
  *
@@ -14,7 +15,7 @@
  */
 
 // Default 3 — the value history's cap historically used; covers history + events combined now.
-const OFFLOOP_MAX_INFLIGHT = Math.max(1, Number(process.env.OFFLOOP_MAX_INFLIGHT ?? 3));
+const OFFLOOP_MAX_INFLIGHT = envInt('OFFLOOP_MAX_INFLIGHT', 3, { min: 1 });
 
 let inflight = 0;
 

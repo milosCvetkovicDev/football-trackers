@@ -23,7 +23,9 @@
 import { Elysia, t } from 'elysia';
 import { wsRoom, type Telemetry } from './types';
 import { startIngest } from './ingest';
-import { metrics, registry, updateRuntimeMetrics } from './metrics';
+import { metrics, registry, updateRuntimeMetrics, capLabel, seedLabel } from './metrics';
+import { envInt, envNumber, envString, envBool, logResolvedConfig } from './env';
+import { dbProbe } from './db';
 import { startRetention, refreshRetentionGauges } from './retention';
 import { log } from './log';
 import {
@@ -39,10 +41,12 @@ import {
   clearCookieHeader,
   validSessionId,
   ANON_MODE,
+  ANON_SESSIONS,
+  accountSessionIds,
   type Principal,
 } from './auth';
-import { initRoster, rosterFor } from './roster';
-import { initSessionConfig, ageBandFor, thresholdsFor } from './sessionConfig';
+import { initRoster, rosterFor, rosterSessionIds } from './roster';
+import { initSessionConfig, ageBandFor, thresholdsFor, configuredSessionIds } from './sessionConfig';
 import {
   validateHistoryParams,
   readHistory,
@@ -60,9 +64,9 @@ import {
   type EventsParams,
 } from './events';
 
-const PORT = Number(process.env.PORT ?? 3000);
-const METRICS_PORT = Number(process.env.METRICS_PORT ?? 9464);
-const VERSION = process.env.APP_VERSION ?? 'dev';
+const PORT = envInt('PORT', 3000, { min: 1, max: 65535 });
+const METRICS_PORT = envInt('METRICS_PORT', 9464, { min: 1, max: 65535 });
+const VERSION = envString('APP_VERSION', 'dev');
 
 // --- BIND INTERFACE (§4.1) ---------------------------------------------------------------------------
 // ANON_MODE means "the live feed needs no login". A feed of children's live positions that needs no login
@@ -75,7 +79,7 @@ const VERSION = process.env.APP_VERSION ?? 'dev';
 // 0.0.0.0 reaches only the compose network, and the real exposure boundary is the Docker port publish
 // (docker-compose.yml pins that to 127.0.0.1). The override is deliberately loud — see the boot warning.
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
-const PUBLIC_HOST = process.env.PUBLIC_HOST ?? (ANON_MODE ? '127.0.0.1' : '0.0.0.0');
+const PUBLIC_HOST = envString('PUBLIC_HOST', ANON_MODE ? '127.0.0.1' : '0.0.0.0');
 const MAX_BODY_BYTES = 4096; // /auth POST bodies are tiny; reject anything bigger BEFORE parse/hash.
 
 // --- CSWSH / CSRF Origin allow-list (children's live location must never be world-readable) ----------
@@ -83,7 +87,7 @@ const MAX_BODY_BYTES = 4096; // /auth POST bodies are tiny; reject anything bigg
 // surfaces (/auth POST and the /live upgrade): an ABSENT Origin is now REJECTED, not allowed — the old
 // lenient "no Origin → ok" branch (for the retired shared-token machine clients) would otherwise let any
 // header-omitting curl bypass the CSWSH/CSRF layer. See ADR-0015 + the pre-mortem.
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? '')
+const ALLOWED_ORIGINS = envString('ALLOWED_ORIGINS', '')
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
@@ -108,7 +112,7 @@ function originOkLenient(origin: string | undefined): boolean {
 // spoofable — trusting it would let an attacker rotate it to dodge the per-IP login rate-limiter — so we
 // default to the unspoofable socket peer and only consult XFF (the RIGHTMOST hop, added by the trusted proxy)
 // when TRUST_PROXY is explicitly set.
-const TRUST_PROXY = process.env.TRUST_PROXY === 'true';
+const TRUST_PROXY = envBool('TRUST_PROXY', false);
 
 /** Client IP for the login rate-limiter. Socket peer by default; the rightmost XFF hop iff TRUST_PROXY. */
 function clientIp(request: Request, server: { requestIP?: (r: Request) => { address: string } | null } | null): string {
@@ -190,8 +194,8 @@ function sessionGetGate(request: Request, id: string, allowAnonymous = false): G
 // Per-principal token bucket for the name-bearing /roster reads (bulk-export bound; ADR-0016 §1.2). Mirrors
 // auth.ts's ipBuckets. Keyed on the principal (username, or 'anon') so one coach can never starve another.
 // The map is naturally bounded by the (tiny) account count + the single 'anon' key, so it needs no sweep.
-const ROSTER_RATE_BURST = Math.max(1, Number(process.env.ROSTER_RATE_BURST ?? 20));
-const ROSTER_RATE_PER_MIN = Math.max(1, Number(process.env.ROSTER_RATE_PER_MIN ?? 30));
+const ROSTER_RATE_BURST = envNumber('ROSTER_RATE_BURST', 20, { min: 1 });
+const ROSTER_RATE_PER_MIN = envNumber('ROSTER_RATE_PER_MIN', 30, { min: 1 });
 const rosterBuckets = new Map<string, { tokens: number; last: number }>();
 function rosterRateOk(key: string): boolean {
   const now = Date.now();
@@ -207,8 +211,14 @@ function rosterRateOk(key: string): boolean {
   return true;
 }
 
+// Audit S-4: /health used to latch `mqtt:true` once and never reset — broker down, /health still green while
+// ft_mqtt_connected read 0. Now it follows the client's connect/close events, and it probes the DB too.
 let mqttReady = false;
 const startedAt = Date.now();
+// The probe (db.ts dbProbe) touches the telemetry table AND folds in the last insert outcome — a plain
+// SELECT 1 runs entirely in SQLite's VM and stayed green with the table dropped (checker finding). Honest
+// limit: an idle server with an intact file reads true; what it catches is a dropped/corrupt table, a closed
+// handle, and a store failing its writes (full disk, unlinked file).
 
 // One admit-record per accepted /live socket. Set ONLY when a socket passes every check, so close() can
 // (a) decrement ft_ws_clients exactly once and only for admitted sockets, and (b) unregister it from the
@@ -486,7 +496,7 @@ export function createApp() {
             });
           }
           admitted.set(ws.data as object, admit);
-          metrics.wsClients.inc({ session: sessionId });
+          metrics.wsClients.inc({ session: capLabel('session', sessionId) });
           log.info('ws open', { session: sessionId, username: principal.username });
         },
         close(ws) {
@@ -496,7 +506,7 @@ export function createApp() {
           if (!a) return;
           admitted.delete(ws.data as object);
           a.unregister?.();
-          metrics.wsClients.dec({ session: a.sessionId });
+          metrics.wsClients.dec({ session: capLabel('session', a.sessionId) });
           log.info('ws close', { session: a.sessionId });
         },
         // The coach UI is receive-only; inbound frames are ignored.
@@ -509,12 +519,15 @@ export function createApp() {
 // port — never the public/relay interface. Prometheus scrapes them locally; Caddy must not proxy them.
 function createInternalApp() {
   return new Elysia()
-    .get('/health', () => ({
-      ok: true,
-      mqtt: mqttReady,
-      version: VERSION,
-      uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
-    }))
+    .get('/health', ({ set }) => {
+      const mqtt = mqttReady;
+      const dbUp = dbProbe();
+      const ok = mqtt && dbUp;
+      // 503 when not ok: Playwright's webServer wait (200–403 = available) and a compose healthcheck
+      // (`curl -f`) then both mean what they say. Every consumer in this repo parses the body regardless.
+      set.status = ok ? 200 : 503;
+      return { ok, mqtt, db: dbUp, version: VERSION, uptimeSeconds: Math.round((Date.now() - startedAt) / 1000) };
+    })
     .get('/metrics', ({ set }) => {
       updateRuntimeMetrics();
       refreshRetentionGauges(); // keep oldest-fix age current between hourly sweeps
@@ -555,21 +568,37 @@ if (!ANON_MODE && ALLOWED_ORIGINS.length === 0) {
 startIngest({
   publish: (session: string, telemetry: Telemetry) => {
     server.publish(wsRoom(session), JSON.stringify({ event: 'telemetry', data: telemetry }));
-    metrics.wsSent.inc({ session });
+    metrics.wsSent.inc({ session: capLabel('session', session) });
   },
   // Phase 3: the minimised device-health envelope rides the SAME session room, so only sockets already
   // authorised for that session (the /live open() gate) ever receive it. No name on the wire.
   publishStatus: (session: string, h) => {
     server.publish(wsRoom(session), JSON.stringify({ event: 'status', data: h }));
-    metrics.wsStatusSent.inc({ session });
+    metrics.wsStatusSent.inc({ session: capLabel('session', session) });
   },
   onSubscribed: () => {
     mqttReady = true;
   },
+  onDisconnected: () => {
+    mqttReady = false;
+  },
 });
+
+// Seed the metric label slots with every session the CONFIGURATION names (checker finding): admission into
+// the capped label set is otherwise first-come, and a device flooding junk session ids before kick-off could
+// take the slots — configured sessions must never end up as `_other`. (roster/session-config/accounts load
+// just above; ANON_SESSIONS is the bench.)
+for (const sid of ANON_SESSIONS) seedLabel('session', sid);
+for (const sid of rosterSessionIds()) seedLabel('session', sid);
+for (const sid of configuredSessionIds()) seedLabel('session', sid);
+for (const sid of accountSessionIds()) seedLabel('session', sid);
 
 // Bound the raw-fix store in time (children's location must not linger). See ADR-0010.
 startRetention();
+
+// Audit S-3: print the whole resolved configuration once, where an operator looks — and shout about any env
+// value that was rejected in favour of a default (a typo'd cap is otherwise invisible until it matters).
+logResolvedConfig();
 
 log.info('http listening', {
   host: PUBLIC_HOST, // logged so "which interface is this on" is answerable from the log alone

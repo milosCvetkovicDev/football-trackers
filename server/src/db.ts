@@ -10,6 +10,7 @@
 import { Database } from 'bun:sqlite';
 import type { Telemetry } from './types';
 import { DB_PATH } from './db-path';
+import { envInt } from './env';
 
 const db = new Database(DB_PATH, { create: true });
 db.exec('PRAGMA journal_mode = WAL;');
@@ -67,7 +68,25 @@ const insert = db.query(`
      $lat, $lon, $spd, $hdg, $fix, $sats, $pdop)
 `);
 
+// /health's `db` signal (checker finding: `SELECT 1` runs entirely in SQLite's VM and cannot fail with the
+// table dropped or the disk full — a probe that cannot fail proves nothing). Two inputs instead: the last
+// insert outcome (a store that cannot persist is not healthy, whatever a read probe says) and a read that
+// actually touches the telemetry table.
+let lastInsertOkTs = 0;
+let lastInsertErrorTs = 0;
+const INSERT_ERROR_HOLD_MS = 60_000;
+
 export function insertTelemetry(t: Telemetry): void {
+  try {
+    insertRow(t);
+    lastInsertOkTs = Date.now();
+  } catch (err) {
+    lastInsertErrorTs = Date.now();
+    throw err;
+  }
+}
+
+function insertRow(t: Telemetry): void {
   insert.run({
     $serverTs: t.serverTs,
     $sessionId: t.sessionId,
@@ -109,10 +128,7 @@ const walCheckpointTruncate = db.query('PRAGMA wal_checkpoint(TRUNCATE)');
 const walCheckpointPassive = db.query('PRAGMA wal_checkpoint(PASSIVE)');
 
 /** Rows per erasure DELETE batch — bounds how long one statement holds the write lock. */
-export const PURGE_BATCH_DEFAULT = (() => {
-  const n = Number(process.env.PURGE_BATCH ?? 5_000);
-  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 5_000;
-})();
+export const PURGE_BATCH_DEFAULT = envInt('PURGE_BATCH', 5_000, { min: 1 });
 
 /**
  * Delete up to `limit` raw fixes stamped before `cutoffMs` (server_ts). Returns rows
@@ -199,6 +215,23 @@ export function vacuum(): number {
   const t0 = performance.now();
   db.exec('VACUUM');
   return Math.round(performance.now() - t0);
+}
+
+/**
+ * Is the store usable? True when (a) a read that touches the telemetry table succeeds AND (b) the most
+ * recent insert outcome is not a failure (a failure "holds" for INSERT_ERROR_HOLD_MS unless a later insert
+ * succeeded). Honest limits: with no traffic and an intact file this stays true; it exists to catch a
+ * dropped/corrupt table, a closed handle, and a store that is failing every write (full disk, unlinked file).
+ */
+export function dbProbe(): boolean {
+  try {
+    db.query('SELECT 1 FROM telemetry LIMIT 1').get(); // null on an empty table is fine — not throwing is the signal
+  } catch {
+    return false;
+  }
+  const now = Date.now();
+  if (lastInsertErrorTs > lastInsertOkTs && now - lastInsertErrorTs < INSERT_ERROR_HOLD_MS) return false;
+  return true;
 }
 
 /** Does this session still have at least one stored fix? One indexed seek. */

@@ -164,6 +164,7 @@ bun run test/roster-cli.ts       # roster-user.ts set/remove/list (mode 0600, no
 bun run test/roster-e2e.ts       # GET /sessions/:id/roster authz matrix + per-principal 429 + no-store + no name leak
 bun run test/erasure-e2e.ts      # right-to-erasure: roster set -> purge-player -> rosterEntriesErased + DB rows + file
 bun run test/erasure-audit.ts    # the five audit-2026-08-03 §4.5 erasure defects stay fixed (WAL residue, dup id, collateral, bad file, missing DB)
+bun run test/boundary.ts         # Phase 3: wire fields coerced, env knobs fall back loudly, metrics never non-finite, labels capped
 bun run test/history.ts          # GET /sessions/:id/history: aggregate/raw correctness, composite cursor, DoS gates, SLO
 bun run test/history-e2e.ts      # live history endpoint: authz, rate-limit/inflight caps, opaque errors, no-store
 bun run test/device-health-e2e.ts # a .../status frame -> minimised {event:'status'} on /live (no heap/up/pub/stash/name)
