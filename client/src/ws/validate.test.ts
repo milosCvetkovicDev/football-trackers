@@ -139,3 +139,63 @@ test('telemetry validation structurally strips a stray displayName (§0.1)', () 
   expect(live!.kind).toBe('telemetry');
   expect((live!.data as Record<string, unknown>).displayName).toBeUndefined();
 });
+
+// --- Phase 5: the subscribed-session check (audit §6 "Client": inbound frames not checked against
+// the subscribed sessionId). The room is server-side, so a cross-session frame should be impossible
+// — which is exactly why a silent one would go unnoticed. Defence in depth: if a fan-out bug (or a
+// future multi-room feature) ever delivered another session's children onto this pitch, the frame is
+// dropped here, before it can reach a store keyed only by playerId. ------------------------------
+
+test('parseLiveFrame drops a frame belonging to another session when one is expected', () => {
+  expect(parseLiveFrame(frame(VALID), 'test')).not.toBeNull(); // matching session -> accepted
+  expect(parseLiveFrame(frame(VALID), 'other-session')).toBeNull();
+  const status = JSON.stringify({ event: 'status', data: HEALTH });
+  expect(parseLiveFrame(status, HEALTH.sessionId)).not.toBeNull();
+  expect(parseLiveFrame(status, 'other-session')).toBeNull();
+});
+
+test('omitting the expected session keeps the previous behaviour (accept any well-formed frame)', () => {
+  // The parameter is optional so the pure parser stays usable without a subscription context.
+  expect(parseLiveFrame(frame(VALID))).not.toBeNull();
+  expect(parseLiveFrame(frame(VALID), undefined)).not.toBeNull();
+});
+
+// --- Phase 5: the `hello` envelope — the server's clock, sent once as the socket opens (audit C-1).
+// It is the client's TRUSTED skew reference precisely because it cannot be anything else: a telemetry
+// frame's serverTs may be a replayed fix's GPS time (Phase 4 `gts`), which would let a backlog drain
+// convince the view that hours-old positions are live. -----------------------------------------------
+
+const HELLO = { sessionId: 'test', serverTs: 1_700_000_000_000 };
+const helloFrame = (data: unknown) => JSON.stringify({ event: 'hello', data });
+
+test('parseLiveFrame accepts a well-formed hello and returns exactly {sessionId, serverTs}', () => {
+  const r = parseLiveFrame(helloFrame(HELLO));
+  expect(r).not.toBeNull();
+  expect(r!.kind).toBe('hello');
+  expect(Object.keys(r!.data).sort()).toEqual(['serverTs', 'sessionId']);
+  expect((r!.data as { serverTs: number }).serverTs).toBe(HELLO.serverTs);
+});
+
+test('a hello with a junk clock is dropped rather than allowed to set the skew', () => {
+  // Every one of these would, if accepted, move the whole view's sense of "now".
+  expect(parseLiveFrame(helloFrame({ ...HELLO, serverTs: null }))).toBeNull();
+  expect(parseLiveFrame(helloFrame({ ...HELLO, serverTs: '1700000000000' }))).toBeNull();
+  expect(parseLiveFrame(helloFrame({ ...HELLO, serverTs: 0 }))).toBeNull();
+  expect(parseLiveFrame(helloFrame({ ...HELLO, serverTs: -1 }))).toBeNull();
+  expect(parseLiveFrame(helloFrame(helloFrame(HELLO).replace('1700000000000', 'Infinity')))).toBeNull();
+  expect(parseLiveFrame(helloFrame({ serverTs: HELLO.serverTs }))).toBeNull(); // no sessionId
+  expect(parseLiveFrame(helloFrame(null))).toBeNull();
+  expect(parseLiveFrame(helloFrame('nope'))).toBeNull();
+});
+
+test('a hello for another session is dropped like any other foreign frame', () => {
+  expect(parseLiveFrame(helloFrame(HELLO), 'test')).not.toBeNull();
+  expect(parseLiveFrame(helloFrame(HELLO), 'other-session')).toBeNull();
+});
+
+test('a hello is structurally stripped — nothing rides along on the clock frame', () => {
+  const r = parseLiveFrame(helloFrame({ ...HELLO, displayName: 'Alex M.', lat: 44.8 }));
+  expect(r).not.toBeNull();
+  expect((r!.data as Record<string, unknown>).displayName).toBeUndefined();
+  expect((r!.data as Record<string, unknown>).lat).toBeUndefined();
+});

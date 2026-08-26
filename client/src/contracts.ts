@@ -40,6 +40,13 @@ export interface ConnectionState {
   attempt: number;
   /** False for terminal phases (unauthorized / forbidden / error) — the UI must not imply "reconnecting…". */
   willRetry: boolean;
+  /**
+   * Whether a MANUAL retry is worth offering (Phase 5, audit C-2). True for the network states — a
+   * drop being backed off, and the terminal give-up after MAX_RECONNECT_ATTEMPTS — and FALSE for the
+   * policy terminals (unauthorized / forbidden / bad session), where reconnecting cannot possibly
+   * help and a button would just invite the coach to jab at a door that is locked, not stuck.
+   */
+  retryable: boolean;
 }
 
 /** What `useLiveTelemetry` returns: refs read each rAF frame + the re-render-driving conn. */
@@ -51,6 +58,12 @@ export interface LiveTelemetry {
   /** Per-player LIVE running distance (Phase 4). Best-effort glance; resets on reconnect. Cleared on switch. */
   dist: RefObject<Map<string, LiveDist>>;
   conn: ConnectionState;
+  /**
+   * Reconnect NOW: abandon any pending backoff, reset the attempt budget, and reopen the socket
+   * (Phase 5, audit C-2). Wired to the "Reconnect now" button and to the browser's `online` event.
+   * A no-op while the connection is live or in a non-retryable terminal state.
+   */
+  reconnectNow: () => void;
 }
 
 export type PlayerFreshness = 'fresh' | 'stale' | 'lost';
@@ -90,6 +103,8 @@ export function describeConnection(
         : { label: 'connected · waiting for players', tone: 'warn' };
     case 'disconnected':
       return { label: conn.willRetry ? 'disconnected · reconnecting…' : 'disconnected', tone: 'bad' };
+    // NB 'error' below carries the give-up detail ("gave up after N reconnect attempts"), which is the
+    // text the Phase-5 e2e reads — the terminal state must be legible, not merely coloured red.
     case 'unauthorized':
       return { label: conn.detail ?? 'unauthorized — check access', tone: 'bad' };
     case 'forbidden':
@@ -97,6 +112,26 @@ export function describeConnection(
     case 'error':
       return { label: conn.detail ?? 'connection failed', tone: 'bad' };
   }
+}
+
+/**
+ * Should the UI offer a manual "Reconnect now" (Phase 5, audit C-2)? One rule, stated once, so the
+ * banner and any future surface can't drift apart.
+ *
+ * TRUE for the states a coach can actually act on: a drop being backed off, a reconnect attempt that
+ * has already failed at least once, and the terminal give-up.
+ * FALSE for:
+ *   - 'live' — nothing to fix;
+ *   - the FIRST connect ('connecting', attempt 0) — that is the normal path, and flashing a recovery
+ *     button during it teaches a coach to distrust a healthy load;
+ *   - every policy terminal (`retryable: false` — unauthorized / forbidden / bad session), where
+ *     reopening the socket repeats the same rejection and the button would misdirect the coach at the
+ *     network when the problem is the account.
+ */
+export function shouldOfferReconnect(conn: ConnectionState): boolean {
+  if (!conn.retryable || conn.phase === 'live') return false;
+  if (conn.phase === 'connecting') return conn.attempt > 0;
+  return conn.phase === 'disconnected' || conn.phase === 'error';
 }
 
 // --- Device health (Phase 3) — one classifier so the canvas cue + the accessible mirror agree -----------

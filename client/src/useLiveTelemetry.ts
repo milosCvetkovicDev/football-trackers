@@ -1,8 +1,16 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Telemetry, DeviceHealth, LiveDist } from './types';
 import type { ConnectionState, LiveTelemetry } from './contracts';
-import { liveWsUrl, MAX_TRACKED_PLAYERS, WALK_FLOOR_MPS, PDOP_MAX } from './config';
+import {
+  liveWsUrl,
+  MAX_TRACKED_PLAYERS,
+  MAX_RECONNECT_ATTEMPTS,
+  WALK_FLOOR_MPS,
+  PDOP_MAX,
+} from './config';
 import { parseLiveFrame } from './ws/validate';
+import { noteServerTime, clockSampleFrom } from './serverClock';
+import { sendBeacon } from './beacon';
 
 // Earth mean radius (m) for the haversine below. Matches metric-definitions §2.1; over a ~105x68 m pitch
 // haversine and the client's planar projector agree to < 1 cm, but the contract (§3.3) pins haversine for the
@@ -31,9 +39,19 @@ const haversineM = (
 // relay blip. Policy rejects (1008) never reach this path — they're terminal (see onclose below).
 const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_CAP_MS = 15_000;
+/**
+ * Silence (no telemetry AND no status frame) on an OPEN socket that has already carried data, after
+ * which the transport is treated as dead — see the watchdog in the effect below. Comfortably above
+ * both the 10 Hz telemetry cadence and the ~5 s `.../status` cadence, and above DROP_MS (10 s), so a
+ * feed is only called stalled once the pitch has visibly emptied.
+ */
+const LIVE_STALL_MS = 15_000;
+const STALL_CHECK_MS = 2_000;
 // After this many consecutive failed network reconnects, settle into a terminal 'error' rather than
-// retrying forever — a visibly-stopped state, the opposite of the old silent infinite loop.
-const MAX_RETRIES = 8;
+// retrying forever — a visibly-stopped state, the opposite of the old silent infinite loop. Phase 5
+// makes that state RECOVERABLE (reconnectNow + the `online` listener); before it, the view was dead
+// for the rest of the match unless the coach happened to toggle to Review and back.
+const MAX_RETRIES = MAX_RECONNECT_ATTEMPTS;
 
 // Human-readable detail for each terminal 1008 reason the server emits (ADR-0015 §5). Mapped here so
 // the contract's a11y/HUD layers get a sentence, not a wire string. The Phase-2 server emits exactly
@@ -71,6 +89,16 @@ const CLOSE_DETAIL: Record<string, string> = {
  * Network drops (1000/1001/1006/etc.) reconnect with capped backoff + jitter, then settle into a
  * terminal 'error' after MAX_RETRIES.
  *
+ * Phase 5 (audit C-1/C-2 + §6) adds three things to that:
+ *   - RECOVERY. The terminal give-up is no longer the end of the match: `reconnectNow()` (the coach's
+ *     button) and the browser's `online` event both reopen the socket with a fresh attempt budget.
+ *     `conn.retryable` says whether that is worth offering — false for the policy terminals.
+ *   - A CLOCK. Every accepted frame's server timestamp feeds `serverClock`, so freshness is judged
+ *     against the SERVER's clock rather than a tablet's (a 10 s-fast tablet used to render an empty
+ *     pitch over a healthy feed).
+ *   - A SESSION CHECK on inbound frames, so a frame for another session can never land in stores that
+ *     are keyed by playerId alone.
+ *
  * @param sessionId   the match session to subscribe to. Falsy → no socket is opened (idle).
  * @param onUnauthorized  invoked on a 1008 'unauthorized' close so App can refresh auth state.
  */
@@ -93,17 +121,61 @@ export function useLiveTelemetry(
     phase: 'connecting',
     attempt: 0,
     willRetry: true,
+    retryable: true,
   });
+  /**
+   * Manual-reconnect epoch (Phase 5, audit C-2). Bumping it re-runs the effect below, which tears the
+   * old socket down and connects again from a clean state. Going through the effect — rather than
+   * poking the closure's `connect` from outside — means a manual retry uses the SAME setup/teardown
+   * path as a session change, so there is no second, subtly-different lifecycle to keep correct.
+   */
+  const [retryEpoch, setRetryEpoch] = useState(0);
+  // The live conn, readable from the stable `reconnectNow` callback without making it change identity.
+  const connRef = useRef(conn);
+  connRef.current = conn;
 
   // Keep onUnauthorized in a ref so a changing callback identity doesn't tear down and reopen the
   // socket — the effect intentionally depends only on sessionId.
   const onUnauthorizedRef = useRef(onUnauthorized);
   onUnauthorizedRef.current = onUnauthorized;
 
+  /**
+   * Reconnect NOW. Deliberately a NO-OP while the socket is live (nothing to fix) or in a policy
+   * terminal (unauthorized / forbidden / bad session): reopening the socket there just repeats the
+   * same rejection, and offering it would suggest the problem is the network when it is the account.
+   *
+   * `byUser` decides whether this is REPORTED. Only a human pressing the button counts as
+   * `ws_manual_retry` — the metric's whole meaning (ADR-0024) is "the automatic path failed a coach
+   * badly enough that they intervened", and an `online`-triggered reconnect is the automatic path
+   * WORKING. Counting both would make a healthy Wi-Fi flap look like a UX failure.
+   */
+  const doReconnect = useCallback(
+    (byUser: boolean) => {
+      const c = connRef.current;
+      if (c.phase === 'live' || !c.retryable) return;
+      if (byUser) sendBeacon('ws_manual_retry', sessionId);
+      setRetryEpoch((e) => e + 1);
+    },
+    [sessionId],
+  );
+
+  // The coach's button. Wrapped rather than passed straight through so a click event can never arrive
+  // as the `byUser` argument.
+  const reconnectNow = useCallback(() => doReconnect(true), [doReconnect]);
+
+  // The browser telling us the network came back does the same job without anyone having to notice
+  // the pitch went quiet — `online` fires on regaining an interface, which is exactly the pitch-side
+  // "walked back into Wi-Fi range" case. Not reported (see doReconnect).
+  useEffect(() => {
+    const onOnline = () => doReconnect(false);
+    window.addEventListener('online', onOnline);
+    return () => window.removeEventListener('online', onOnline);
+  }, [doReconnect]);
+
   useEffect(() => {
     // No session chosen yet (e.g. admin hasn't typed one) → stay idle; don't open a socket.
     if (!sessionId) {
-      setConn({ phase: 'connecting', attempt: 0, willRetry: true });
+      setConn({ phase: 'connecting', attempt: 0, willRetry: true, retryable: true });
       return;
     }
 
@@ -111,6 +183,9 @@ export function useLiveTelemetry(
     let retry: ReturnType<typeof setTimeout> | null = null;
     let attempt = 0; // consecutive reconnect attempts; 0 once live
     let disposed = false;
+    // Wall-clock ms of the last TRACKER frame (telemetry or status) on the current socket, or 0 while
+    // none has arrived. Drives the stall watchdog below; deliberately not set by the `hello` frame.
+    let lastDataAt = 0;
     // Capture the two stable ref Maps up front so the cleanup clears the SAME objects the effect wrote to
     // (the refs are never reassigned, so this is equivalent — and it satisfies the exhaustive-deps lint
     // that flags reading `.current` in a cleanup closure).
@@ -220,7 +295,8 @@ export function useLiveTelemetry(
 
     const connect = () => {
       // attempt: 0 on the first connect, n>0 on the nth reconnect — drives the "reconnecting (try n)" label.
-      setConn({ phase: 'connecting', attempt, willRetry: true });
+      lastDataAt = 0; // a fresh socket has not proved itself yet — the watchdog re-arms on its first frame
+      setConn({ phase: 'connecting', attempt, willRetry: true, retryable: true });
       // Same-origin URL; the HttpOnly session cookie is attached by the browser on the upgrade.
       ws = new WebSocket(liveWsUrl(sessionId));
 
@@ -230,14 +306,34 @@ export function useLiveTelemetry(
         // optimistic only — onclose is the source of truth and will overwrite it if the upgrade was
         // rejected. A clean open resets the backoff sequence.
         attempt = 0;
-        setConn({ phase: 'live', attempt: 0, willRetry: true });
+        setConn({ phase: 'live', attempt: 0, willRetry: true, retryable: true });
       };
 
       ws.onmessage = (ev) => {
         if (disposed || typeof ev.data !== 'string') return;
-        // Route on the validated envelope kind: telemetry -> store, status -> health, null -> drop.
-        const frame = parseLiveFrame(ev.data);
-        if (!frame) return; // malformed/hostile/unknown frame -> dropped, never stored
+        // Route on the validated envelope kind: telemetry -> store, status -> health, hello -> clock,
+        // null -> drop. The subscribed sessionId is passed so a frame for ANOTHER session is dropped
+        // here too (Phase 5, defence in depth — the stores are keyed by playerId alone, so a stray
+        // frame would simply put another session's child on this coach's pitch).
+        const frame = parseLiveFrame(ev.data, sessionId);
+        if (!frame) return; // malformed/hostile/foreign frame -> dropped, never stored
+
+        // CLOCK SOURCES (audit C-1) — deliberately NOT telemetry. Since Phase 4 a replayed backlog fix
+        // carries its GPS time as `serverTs` (`Math.min(gts, arrival)`, up to 6 h behind), so feeding
+        // telemetry to the estimator would let a page that loads during a backlog drain infer an
+        // offset of HOURS — and then draw hours-old positions as live dots, the precise dishonesty
+        // ADR-0018 forbids. `hello` (the server's clock, sent once on connect) and `status` (stamped
+        // at arrival, never backlogged) cannot carry an event time, so only those two feed it.
+        const sample = clockSampleFrom(frame); // null for telemetry — the rule lives in serverClock.ts
+        if (sample !== null) noteServerTime(sample);
+        if (frame.kind === 'hello') return; // no store, no liveness — a hello is not data from a tracker
+
+        // DATA LIVENESS (audit C-2, checker): the socket being OPEN is not the same as the feed
+        // flowing. Record every real frame so the watchdog below can tell a stalled transport from a
+        // healthy-but-quiet one. Set only by tracker data — never by `hello` — so a pre-match session
+        // with no publishers never arms the watchdog and never flaps.
+        lastDataAt = Date.now();
+
         if (frame.kind === 'telemetry') {
           upsert(frame.data);
           upsertDist(frame.data); // accumulate the per-player live running distance (§3.3, gated)
@@ -265,26 +361,14 @@ export function useLiveTelemetry(
             // 'bad session' (and any unknown 1008 reason) → a non-auth terminal failure.
             phase = 'error';
           }
-          setConn({ phase, detail, attempt, willRetry: false });
+          // A policy reject is NOT retryable: the socket would be refused identically every time, so
+          // the UI must not offer a button that pretends otherwise.
+          setConn({ phase, detail, attempt, willRetry: false, retryable: false });
           return;
         }
 
         // Any other close is a network drop (1000/1001/1006/etc.) — retry with capped backoff + jitter.
-        attempt += 1;
-        if (attempt > MAX_RETRIES) {
-          // Stop the (capped) retries and show a terminal, visibly-stopped failure — never a tight loop.
-          setConn({
-            phase: 'error',
-            detail: `gave up after ${MAX_RETRIES} reconnect attempts`,
-            attempt,
-            willRetry: false,
-          });
-          return;
-        }
-        setConn({ phase: 'disconnected', attempt, willRetry: true });
-        const backoff = Math.min(BACKOFF_BASE_MS * 2 ** (attempt - 1), BACKOFF_CAP_MS);
-        const delay = Math.random() * backoff; // full jitter
-        retry = setTimeout(connect, delay);
+        scheduleReconnect();
       };
 
       // A socket error is followed by a close; route everything through onclose so the retry/terminal
@@ -292,12 +376,82 @@ export function useLiveTelemetry(
       ws.onerror = () => ws?.close();
     };
 
+    /**
+     * The network-drop path: count the attempt, either give up terminally or back off and reconnect.
+     * Factored out of `onclose` because the STALL WATCHDOG (below) must take exactly this path WITHOUT
+     * waiting for a close event — see its comment for why a close event may never arrive.
+     */
+    const scheduleReconnect = () => {
+      attempt += 1;
+      if (attempt > MAX_RETRIES) {
+        // Stop the (capped) retries and show a terminal, visibly-stopped failure — never a tight loop.
+        // RETRYABLE: this is the one terminal state a coach can act on, so it carries a button, and
+        // the server hears about it (a dark tablet is otherwise invisible from the outside).
+        sendBeacon('ws_gave_up', sessionId);
+        setConn({
+          phase: 'error',
+          detail: `gave up after ${MAX_RETRIES} reconnect attempts`,
+          attempt,
+          willRetry: false,
+          retryable: true,
+        });
+        return;
+      }
+      setConn({ phase: 'disconnected', attempt, willRetry: true, retryable: true });
+      const backoff = Math.min(BACKOFF_BASE_MS * 2 ** (attempt - 1), BACKOFF_CAP_MS);
+      const delay = Math.random() * backoff; // full jitter
+      retry = setTimeout(connect, delay);
+    };
+
     connect();
+
+    /**
+     * STALL WATCHDOG (Phase 5 checker finding, closing audit C-2 properly).
+     *
+     * `conn.phase` was driven only by the socket's own lifecycle events — and the most common way a
+     * pitch-side feed dies produces NO event at all: the tablet walks behind the clubhouse, the AP or
+     * a NAT silently drops the flow, and the browser keeps a socket in readyState OPEN forever. The
+     * pitch empties as every dot ages past DROP_MS, the banner reads "connected · waiting for
+     * players", and BOTH recovery paths were no-ops in exactly that state (`doReconnect` and
+     * `shouldOfferReconnect` both bail while the phase says 'live'). The coach was left with a view
+     * that looked connected and was not.
+     *
+     * So: once this socket has actually delivered a frame, silence longer than LIVE_STALL_MS means the
+     * transport is dead regardless of what readyState claims. Closing the socket is all this does —
+     * onclose then runs the SAME backoff/terminal machinery a real drop uses, rather than a second
+     * recovery path that would have to be kept correct separately.
+     *
+     * It arms only AFTER the first frame, so a legitimately quiet session (no trackers switched on
+     * yet) is never mistaken for a stall and never flaps.
+     */
+    const watchdog = setInterval(() => {
+      if (disposed || lastDataAt === 0) return;
+      if (Date.now() - lastDataAt <= LIVE_STALL_MS) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return; // a real close is already being handled
+      lastDataAt = 0; // don't fire again for this socket
+
+      // DO NOT rely on close() to get us out of 'live'. Measured against a SIGSTOPped server (the
+      // faithful stand-in for a wedged host or a silently dropped flow): calling close() moves the
+      // socket to CLOSING and the browser then waits for a close frame that never comes, so `onclose`
+      // did not fire for at least 40 s — the view kept saying "connected" the whole time, which is the
+      // very thing this watchdog exists to prevent. So: detach the handlers, close best-effort, and
+      // drive the reconnect ourselves through the same path a real drop takes.
+      const dead = ws;
+      ws = null;
+      dead.onopen = dead.onmessage = dead.onclose = dead.onerror = null;
+      try {
+        dead.close();
+      } catch {
+        /* already gone */
+      }
+      scheduleReconnect();
+    }, STALL_CHECK_MS);
 
     return () => {
       // Tear down cleanly on unmount / sessionId change: cancel the pending retry, drop handlers so a
       // late close can't fire after disposal, and close the socket.
       disposed = true;
+      clearInterval(watchdog);
       if (retry) clearTimeout(retry);
       if (ws) {
         ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
@@ -313,7 +467,9 @@ export function useLiveTelemetry(
       // player's live distance from 0 — a documented "fresh live view", not "the player stopped".
       liveDist.clear();
     };
-  }, [sessionId]);
+    // retryEpoch is a dep on purpose: a manual reconnect re-runs this effect, reusing the exact
+    // teardown/setup path a session change uses (see the reconnectNow doc-comment above).
+  }, [sessionId, retryEpoch]);
 
-  return { store, health, dist, conn };
+  return { store, health, dist, conn, reconnectNow };
 }

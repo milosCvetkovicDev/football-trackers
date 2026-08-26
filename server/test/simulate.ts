@@ -109,7 +109,16 @@ const simDisplayName = (pl: string) => `Player ${pl}`; // DEV fixture, e.g. "Pla
 const SIM_SESSION_CONFIG_FILE = '/tmp/ft-sim-session-config.json';
 const SIM_AGE_BAND = 'U14'; // a representative youth band for the dev/e2e session
 
-// ----- pitch geometry (keep the same rectangle as client/src/config.ts so dots render) ---
+// ----- pitch geometry -------------------------------------------------------------------
+// These four corners define where the virtual fleet moves. Since Phase 5 they are also PUBLISHED to
+// the coach view: the simulator writes them into its session-config fixture (below), so the client
+// draws the pitch the players are actually on.
+//
+// It used to say "keep the same rectangle as client/src/config.ts so dots render" — and that comment
+// had been false for a long time: this rectangle sits 7.1 km from the client's built-in fallback, so
+// EVERY hardware-free run rendered the whole fleet outside the pitch (invisible before Phase 5, and
+// pinned to the canvas edge as "off pitch" markers after it). Publishing the corners removes the
+// duplication that drifted, instead of restoring it.
 const CORNERS = [
   { lat: 44.812806, lon: 20.460535 },
   { lat: 44.812806, lon: 20.461865 },
@@ -371,7 +380,22 @@ async function startStandaloneStack(secure: boolean) {
   // postures; the server is pointed at it via SESSION_CONFIG_FILE below; out-of-band from the published stream.
   await Bun.write(
     SIM_SESSION_CONFIG_FILE,
-    JSON.stringify({ sessions: { [SESSION]: { ageBand: SIM_AGE_BAND } } }, null, 2) + '\n',
+    JSON.stringify(
+      {
+        sessions: {
+          [SESSION]: {
+            ageBand: SIM_AGE_BAND,
+            // Phase 5: the pitch the virtual fleet actually moves on (CORNERS above), in on-screen
+            // order TL,TR,BR,BL. Without this the coach view falls back to its built-in corners — 7.1 km
+            // away — and every simulated player renders as an off-pitch marker. Publishing them also
+            // means every hardware-free run exercises the real per-session pitch path end to end.
+            pitch: { corners: CORNERS },
+          },
+        },
+      },
+      null,
+      2,
+    ) + '\n',
   );
 
   const broker = Bun.spawn([Bun.which('mosquitto') ?? 'mosquitto', '-c', CONF], { stdout: 'ignore', stderr: 'ignore' });

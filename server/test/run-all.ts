@@ -71,7 +71,8 @@ const SUITES: Array<[file: string, proves: string]> = [
   ['history-e2e.ts', 'GET /sessions/:id/history end to end'],
   ['events-e2e.ts', 'GET /sessions/:id/events end to end'],
   ['device-health-e2e.ts', 'the .../status topic reaches /live as {event:"status"}'],
-  ['config-e2e.ts', 'GET /sessions/:id/config serves the age band'],
+  ['config-e2e.ts', 'GET /sessions/:id/config serves the age band + the pitch corners'],
+  ['beacon-e2e.ts', 'POST /sessions/:id/client-beacon counts coach-view failures, gated + minimised'],
   ['erasure-e2e.ts', 'right-to-erasure: purge removes the player and the name'],
   ['erasure-audit.ts', 'the five audit §4.5 erasure defects stay fixed (WAL, dup id, collateral, bad file, missing DB)'],
 ];

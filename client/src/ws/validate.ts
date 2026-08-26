@@ -5,11 +5,12 @@
  * that matches the envelope contract AND a strictly-typed, range-checked Telemetry, and otherwise
  * return null (never throw, never store). Kept pure so it's trivially unit-testable.
  *
- * The accepted envelopes are exactly what `server.ts` publishes: {event:'telemetry', data:Telemetry}
- * and {event:'status', data:DeviceHealth} (Phase 3). Unknown event types are ignored (return null) so
- * the wire contract can grow without crashing here.
+ * The accepted envelopes are exactly what `server.ts` publishes: {event:'telemetry', data:Telemetry},
+ * {event:'status', data:DeviceHealth} (Phase 3) and {event:'hello', data:ServerHello} (Phase 5 — the
+ * server's clock, sent once on connect). Unknown event types are ignored (return null) so the wire
+ * contract can grow without crashing here.
  */
-import type { Telemetry, DeviceHealth } from '../types';
+import type { Telemetry, DeviceHealth, ServerHello } from '../types';
 
 // Bound on id-string length — a real playerId/sessionId is short. Cap it so a hostile feed can't
 // hand us megabyte strings that bloat the Map keys/values (defence in depth alongside MAX_TRACKED_PLAYERS).
@@ -119,6 +120,20 @@ function validateDeviceHealth(data: unknown): DeviceHealth | null {
 }
 
 /**
+ * Validate the Phase-5 `hello` envelope: the SERVER's clock reading at the moment this socket opened.
+ * It is the client's primary clock-skew reference (audit C-1) precisely because it cannot be anything
+ * else — unlike a telemetry frame's `serverTs`, which since Phase 4 may be a replayed fix's GPS time.
+ * Two fields, no child data; anything else -> null.
+ */
+function validateHello(data: unknown): ServerHello | null {
+  if (typeof data !== 'object' || data === null) return null;
+  const d = data as Record<string, unknown>;
+  if (!isBoundedString(d.sessionId)) return null;
+  if (!isFiniteNumber(d.serverTs) || d.serverTs <= 0) return null;
+  return { sessionId: d.sessionId, serverTs: d.serverTs }; // fresh literal — nothing else rides along
+}
+
+/**
  * Parse one raw WS frame into a validated Telemetry, or null if it's malformed, the wrong event,
  * or fails the strict validator. Pure: no side effects, no throws — the caller drops null silently.
  */
@@ -143,10 +158,22 @@ export function parseTelemetryFrame(raw: string): Telemetry | null {
  *   - 'status'    -> {kind:'status',    data:DeviceHealth}  (structurally name-stripped, §0.1)
  * Anything else — non-JSON, non-object, unknown event, or a payload that fails its validator — is
  * null, which the caller drops silently. Pure: no side effects, no throws.
+ *
+ * @param expectedSessionId  when given, a frame whose `sessionId` is not this one is DROPPED
+ *   (Phase 5, audit §6 "Client"). Rooms are server-side, so a cross-session frame should be
+ *   impossible — which is exactly why a silent one would go unnoticed: the stores here are keyed by
+ *   playerId alone, so another session's child would simply appear on this coach's pitch. Defence in
+ *   depth against a fan-out bug or a future multi-room feature; omit it and the previous
+ *   accept-any-well-formed-frame behaviour applies (the pure parser stays usable without a context).
  */
 export function parseLiveFrame(
   raw: string,
-): { kind: 'telemetry'; data: Telemetry } | { kind: 'status'; data: DeviceHealth } | null {
+  expectedSessionId?: string,
+):
+  | { kind: 'telemetry'; data: Telemetry }
+  | { kind: 'status'; data: DeviceHealth }
+  | { kind: 'hello'; data: ServerHello }
+  | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -158,11 +185,21 @@ export function parseLiveFrame(
   const env = parsed as Record<string, unknown>;
   if (env.event === 'telemetry') {
     const t = validateTelemetry(env.data);
-    return t ? { kind: 'telemetry', data: t } : null;
+    if (!t) return null;
+    if (expectedSessionId !== undefined && t.sessionId !== expectedSessionId) return null;
+    return { kind: 'telemetry', data: t };
   }
   if (env.event === 'status') {
     const h = validateDeviceHealth(env.data);
-    return h ? { kind: 'status', data: h } : null;
+    if (!h) return null;
+    if (expectedSessionId !== undefined && h.sessionId !== expectedSessionId) return null;
+    return { kind: 'status', data: h };
+  }
+  if (env.event === 'hello') {
+    const hello = validateHello(env.data);
+    if (!hello) return null;
+    if (expectedSessionId !== undefined && hello.sessionId !== expectedSessionId) return null;
+    return { kind: 'hello', data: hello };
   }
   return null; // unknown / future event type
 }

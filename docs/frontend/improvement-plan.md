@@ -114,16 +114,41 @@ posture and a **shared** off-loop inflight cap (`scanLoad.ts`). The naive readin
 and is deferred (ADR-0020 §6). Same flow as the phases: frozen contract → 5-lens pre-mortem (6 must-fix) →
 parallel slices → post-build review (3 confirmed + 5 nits, all test-coverage/env-hardening).
 
+### Beyond the roadmap — coach-view reliability · **shipped 2026-08-26** (audit Phase 5, [ADR-0024](../decisions/0024-client-reliability-signals.md))
+Not a feature phase: the [2026-08-03 production-readiness audit](../audit/2026-08-03-production-readiness.md)
+found that several things this plan assumed were true only on a desk. **C-1** — a match-day LAN has no NTP, so
+every freshness comparison mixed the TABLET's clock with a SERVER-stamped `serverTs`; a tablet 10 s fast
+rendered an EMPTY PITCH over a healthy 10 Hz feed, and a slow one kept a dead tracker alive forever, defeating
+[ADR-0018](../decisions/0018-live-position-smoothing-honesty.md)'s honesty rule outright. Fixed with
+`serverClock.ts` (a running minimum of `Date.now() - serverTs`) feeding every age computation — fed ONLY
+by the new `{event:'hello'}` envelope (the server's clock, first frame on every socket) and by `.../status`
+frames, never by telemetry: a Phase-4 replayed fix carries its GPS time, and an adversarial review showed a
+page loading during a backlog drain would otherwise infer an offset of hours and draw stale fixes as live
+dots — the honesty rule failing in its dangerous direction. **C-2** — the
+reconnect give-up was terminal for the rest of the match, with no button and no `online` listener; recovery
+existed only by accident (toggle to Review and back). Now `conn.retryable` + `reconnectNow()` + a "Reconnect
+now" control — plus a **stall watchdog**, because the same review found the recovery unreachable in the
+commonest field failure of all: a transport that stops carrying bytes without ever closing (the tablet
+behind the clubhouse, the AP dropping the flow), where the socket stays OPEN and the phase stayed 'live'
+while the pitch quietly emptied. And from §6: the pitch's four corners moved out of the bundle into per-session config (they were
+pointing at a bench in Belgrade); error boundaries scoped so a Review crash no longer white-screens the shell;
+a deadline on every fetch; retries that actually re-fetch (re-pressing Apply was a no-op); off-pitch players
+pinned to the canvas edge instead of silently clipped while still being counted; 44 px touch targets; and the
+first client→server write — a four-value beacon so a dark tablet is visible from `/metrics` (ADR-0024). Gated
+by a Playwright `reliability` project that kills and restarts a real server, skews the browser clock 30 s, and
+induces a real Review crash.
+
 ## Server contracts the FE depends on
 | Endpoint | Purpose | Auth / shape |
 |---|---|---|
 | `POST /auth/login` (+ session cookie) | named login | argon2id; HTTP-only/Secure/`SameSite=Lax` |
 | `GET /sessions` | principal-scoped list (no-rebuild switcher) | principal-authed |
 | `GET /sessions/:id/roster` | `playerId → displayName` | principal-authed, session-scoped, in-memory only |
-| `GET /sessions/:id/config` | age band → youth zone thresholds (Phase 4) | principal-authed, session-scoped |
+| `GET /sessions/:id/config` | age band → youth zone thresholds (Phase 4) **+ the session's four pitch corners** (Phase 5) | principal-authed, session-scoped; `pitch` omitted when unset |
 | `GET /sessions/:id/history?…` | review/replay source (+ Phase-4 zone/sprint/effort aggregates) | principal-authed, session-scoped, **off-loop/paged** |
 | `GET /sessions/:id/events?…` | tactical events ([ADR-0020](../decisions/0020-tactical-event-detection.md)): team-shape series + heuristic phases | principal-authed, session-scoped, **off-loop**, inflight cap **shared** with history |
 | device-health on `/live` | per-player battery/GPS/backlog | second envelope from `.../status` |
+| `POST /sessions/:id/client-beacon` | the coach view reports its OWN failures ([ADR-0024](../decisions/0024-client-reliability-signals.md)) | principal-authed, session-scoped, **strict Origin**, closed four-value body, rate-limited |
 
 ## Testing & verification
 Drive everything from the **simulator** ([`server/test/simulate.ts`](../../server/test/simulate.ts)):

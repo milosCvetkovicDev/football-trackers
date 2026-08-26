@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AuthState, Principal, Role, UseAuth } from './contracts';
 import { apiUrl } from './config';
+import { fetchWithDeadline } from './fetchDeadline';
 
 /**
  * Phase 2 (ADR-0015/0008): named operator login over a SAME-ORIGIN HttpOnly session cookie.
@@ -66,10 +67,14 @@ export function useAuth(): UseAuth {
     const seq = ++meSeq.current;
     let next: AuthState;
     try {
-      const res = await fetch(apiUrl('/auth/me'), {
+      // Deadline (Phase 5): this probe gates the ENTIRE app — without one, a half-open socket leaves
+      // the coach on "connecting…" with no error and no way forward. A timeout fails closed to the
+      // login gate, which is at least an actionable screen.
+      const res = await fetchWithDeadline(apiUrl('/auth/me'), {
         method: 'GET',
         credentials: 'same-origin',
         headers: { Accept: 'application/json' },
+        signal: new AbortController().signal, // no caller-side cancellation here; the deadline is the bound
       });
       if (res.ok) {
         const me = (await res.json()) as AuthMeOk;
@@ -99,11 +104,12 @@ export function useAuth(): UseAuth {
     async (username, password) => {
       let res: Response;
       try {
-        res = await fetch(apiUrl('/auth/login'), {
+        res = await fetchWithDeadline(apiUrl('/auth/login'), {
           method: 'POST',
           credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
           body: JSON.stringify({ username, password }),
+          signal: new AbortController().signal,
         });
       } catch {
         return { ok: false, error: 'Could not reach the server. Check your connection and try again.' };
@@ -132,10 +138,11 @@ export function useAuth(): UseAuth {
     // The CSRF synchronizer token is required by the server (§3/§4); read it from the live principal.
     const csrf = auth.status === 'authed' ? auth.principal.csrf : '';
     try {
-      await fetch(apiUrl('/auth/logout'), {
+      await fetchWithDeadline(apiUrl('/auth/logout'), {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'X-CSRF-Token': csrf },
+        signal: new AbortController().signal,
       });
     } catch {
       // Best-effort: even if the network call fails, we drop the local principal below so the UI

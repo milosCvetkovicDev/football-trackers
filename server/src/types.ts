@@ -95,6 +95,16 @@ export interface ZoneThresholds {
   sprintMps: number; // Z4→Z5 (Sprint), per band
 }
 
+/**
+ * One GPS point. Used for the per-session PITCH corners (Phase 5; audit §6 "Client") served by
+ * GET /sessions/:id/config — a PLACE, never a person: these are the four corners of a football pitch,
+ * measured once by an adult, and they carry no child's position.
+ */
+export interface LatLon {
+  lat: number;
+  lon: number;
+}
+
 // ----- Tactical event detection (Track A; ADR-0020, event-detection-contract) --------------
 /**
  * One time-bucket team-shape snapshot (contract §2.2). Reconstructed OFF the live loop from stored fixes by

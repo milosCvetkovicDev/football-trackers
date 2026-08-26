@@ -2,10 +2,12 @@ import { useEffect, useRef } from 'react';
 import type { RefObject } from 'react';
 import type { Telemetry, DeviceHealth, LiveDist, ZoneThresholds } from './types';
 import { applyHomography, computeHomography, type Pt } from './homography';
-import { makeProjector } from './geo';
+import { makeProjector, type LatLon } from './geo';
 // STALE_MS / DROP_MS aren't imported directly: playerFreshness() (contracts.ts) owns those
 // thresholds so the canvas and the accessible mirror can never disagree about a player's state.
-import { PITCH_CORNERS, MAX_TRACKED_PLAYERS, ISOLATION_M, ISOLATION_MS } from './config';
+import { MAX_TRACKED_PLAYERS, ISOLATION_M, ISOLATION_MS } from './config';
+import { makePitchFrame } from './pitchFrame';
+import { serverNow } from './serverClock';
 import { speedZone, ZONE_COLOR } from './zones';
 import {
   describeConnection,
@@ -97,6 +99,7 @@ export function PitchCanvas({
   reducedMotion,
   roster,
   thresholds,
+  corners,
 }: {
   store: RefObject<Map<string, Telemetry>>;
   health: RefObject<Map<string, DeviceHealth>>;
@@ -108,6 +111,10 @@ export function PitchCanvas({
   roster: Map<string, string>;
   /** Session speed-zone thresholds (Phase 4) — fetched config or U14 defaults; drive the dot's zone colour. */
   thresholds: ZoneThresholds;
+  /** The pitch's four GPS corners, TL/TR/BR/BL (Phase 5) — this session's measured ones, else the
+   *  built-in fallback. Validated upstream; a degenerate quad throws in the solve below and is caught
+   *  by this subtree's ErrorBoundary rather than white-screening the shell. */
+  corners: LatLon[];
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -161,8 +168,11 @@ export function PitchCanvas({
     let dst: Pt[] = [];
     let pxPerM = 1;
     // Projector is box-independent (GPS→metres around corner 0); build it once.
-    const project = makeProjector(PITCH_CORNERS[0]);
-    const srcM = PITCH_CORNERS.map(project);
+    const project = makeProjector(corners[0]);
+    const srcM = corners.map(project);
+    // The SAME pitch frame the accessible mirror uses, so the two can never disagree about who is off
+    // the pitch (Phase 5, audit §6: off-pitch players were clipped invisibly while still counted).
+    const pitchFrame = makePitchFrame(corners);
 
     // Offscreen static layer (pitch lines). Re-rendered only on resize/theme change, blitted/frame.
     const staticLayer = document.createElement('canvas');
@@ -241,7 +251,10 @@ export function PitchCanvas({
       ctx.clearRect(0, 0, cssW, cssH);
       ctx.drawImage(staticLayer, 0, 0, cssW, cssH); // blit the cached lines, then dynamic layer
 
-      const now = Date.now();
+      // serverNow(), not Date.now(): ages are measured against SERVER-stamped fixes, so a tablet whose
+      // clock runs fast would otherwise age every fix past DROP_MS and draw an empty pitch over a
+      // perfectly healthy feed (audit C-1). Inert until the first frame has been seen.
+      const now = serverNow();
       const live = store.current;
       const distMap = dist.current;
       const thr = thresholdsRef.current;
@@ -277,6 +290,18 @@ export function PitchCanvas({
 
           const pos = resolvePosition(buf, now, project, snapOnly) ?? { lat: t.lat, lon: t.lon };
           const [x, y] = toPx(pos.lat, pos.lon);
+
+          // OFF PITCH (Phase 5, audit §6): a player outside the drawn rectangle used to be CLIPPED —
+          // invisible, while the HUD kept counting them, so the coach read "11 players" over a pitch
+          // showing ten. Now they are pinned to the nearest edge with a distinct marker, which is the
+          // honest rendering: we know where they are, and it is not on the pitch.
+          if (pitchFrame.isOffPitch(pos.lat, pos.lon)) {
+            isoSince.set(t.playerId, null); // not on the pitch ⇒ not part of the teammate-distance scan
+            const [cx2, cy2] = clampToBox(x, y, cssW, cssH, pal.dotRadius + 6);
+            drawOffPitch(ctx, cx2, cy2, label, x, y, pal);
+            if (healthLevel && healthLevel !== 'ok') drawHealthCue(ctx, cx2, cy2, healthLevel, pal);
+            continue;
+          }
 
           if (!snapOnly) {
             let trail = trails.get(t.playerId);
@@ -319,8 +344,12 @@ export function PitchCanvas({
           // clock would keep running across the stale gap and, on recovery within ISOLATION_MS, draw an
           // instant false-positive cue. Clearing here mirrors the "not isolated this frame" reset below.
           isoSince.set(t.playerId, null);
-          const [x, y] = toPx(t.lat, t.lon);
-          drawStale(ctx, x, y, label, age, pal);
+          const [rawX, rawY] = toPx(t.lat, t.lon);
+          // A stale player who is ALSO off the pitch is pinned to the edge for the same reason as a
+          // fresh one — otherwise the "last known" ring is drawn outside the canvas and simply vanishes.
+          const offPitch = pitchFrame.isOffPitch(t.lat, t.lon);
+          const [x, y] = offPitch ? clampToBox(rawX, rawY, cssW, cssH, pal.dotRadius + 6) : [rawX, rawY];
+          drawStale(ctx, x, y, label, age, pal, offPitch);
           if (healthLevel && healthLevel !== 'ok') drawHealthCue(ctx, x, y, healthLevel, pal);
         }
       }
@@ -399,7 +428,10 @@ export function PitchCanvas({
     // store + health + dist are stable refs (read inside the rAF loop); roster/conn/theme/thresholds are
     // mirrored into refs above so the loop sees the latest without restarting. Listing the refs satisfies
     // exhaustive-deps (dist is added for Phase 4 — same stable-ref discipline as store/health).
-  }, [store, health, dist]);
+    // `corners` (Phase 5) is NOT mirrored into a ref: the pitch geometry is baked into the homography
+    // and the static layer, so a new pitch must rebuild both — i.e. re-run this effect. Its identity is
+    // stable between renders (a session-config object or the module constant), so this cannot thrash.
+  }, [store, health, dist, corners]);
 
   return (
     <div
@@ -574,6 +606,8 @@ function drawStale(
   label: string,
   ageMs: number,
   pal: Palette,
+  /** Pinned to the canvas edge because the last known position is off the pitch (Phase 5). */
+  offPitch = false,
 ) {
   ctx.beginPath();
   ctx.arc(x, y, pal.dotRadius, 0, Math.PI * 2);
@@ -589,7 +623,64 @@ function drawStale(
 
   ctx.font = '9px ui-monospace, SFMono-Regular, monospace';
   ctx.textBaseline = 'top';
-  ctx.fillText(`${Math.round(ageMs / 1000)}s`, x, y + pal.dotRadius + 2);
+  ctx.fillText(`${Math.round(ageMs / 1000)}s${offPitch ? ' · off pitch' : ''}`, x, y + pal.dotRadius + 2);
+}
+
+/** Keep a point inside the canvas box, inset by `pad`. Used to pin an off-pitch player to the edge. */
+function clampToBox(x: number, y: number, w: number, h: number, pad: number): [number, number] {
+  const cx = Number.isFinite(x) ? Math.min(Math.max(x, pad), Math.max(pad, w - pad)) : pad;
+  const cy = Number.isFinite(y) ? Math.min(Math.max(y, pad), Math.max(pad, h - pad)) : pad;
+  return [cx, cy];
+}
+
+/**
+ * Off-pitch player (Phase 5; audit §6 "Client"): pinned to the nearest canvas edge and drawn as a
+ * DIAMOND — a shape nothing else on the pitch uses, so it reads as "not a normal dot" at a glance —
+ * with a short arrow pointing the way they actually are. The accessible mirror carries the same fact
+ * as the word "off pitch", so shape is never the only signal.
+ */
+function drawOffPitch(
+  ctx: CanvasRenderingContext2D,
+  x: number,
+  y: number,
+  label: string,
+  trueX: number,
+  trueY: number,
+  pal: Palette,
+) {
+  const r = pal.dotRadius;
+  // Direction from the pinned point toward where the player really is (may be far off-canvas).
+  const dx = trueX - x;
+  const dy = trueY - y;
+  const len = Math.hypot(dx, dy);
+  if (len > 1) {
+    ctx.strokeStyle = pal.staleRing;
+    ctx.lineWidth = pal.lineWidth;
+    ctx.beginPath();
+    ctx.moveTo(x + (dx / len) * (r + 2), y + (dy / len) * (r + 2));
+    ctx.lineTo(x + (dx / len) * (r + 10), y + (dy / len) * (r + 10));
+    ctx.stroke();
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(x, y - r);
+  ctx.lineTo(x + r, y);
+  ctx.lineTo(x, y + r);
+  ctx.lineTo(x - r, y);
+  ctx.closePath();
+  ctx.lineWidth = pal.lineWidth;
+  ctx.strokeStyle = pal.staleRing;
+  ctx.stroke(); // hollow: an off-pitch player is not a live position ON the pitch
+
+  ctx.fillStyle = pal.staleRing;
+  ctx.font = `bold ${Math.round(r * 0.95)}px ui-sans-serif, system-ui, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(label, x, y);
+
+  ctx.font = '9px ui-monospace, SFMono-Regular, monospace';
+  ctx.textBaseline = 'top';
+  ctx.fillText('off pitch', x, y + r + 2);
 }
 
 /**

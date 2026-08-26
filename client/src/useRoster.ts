@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { apiUrl } from './config';
+import { fetchWithDeadline } from './fetchDeadline';
 
 /**
  * Phase 3 (ADR-0016): resolve a session's pseudonymous playerIds → coach-facing display names.
@@ -48,7 +49,9 @@ export function useRoster(sessionId: string, identity: string): Map<string, stri
 
     void (async () => {
       try {
-        const res = await fetch(apiUrl(`/sessions/${encodeURIComponent(sessionId)}/roster`), {
+        // Deadline (Phase 5): names are an enhancement, so a hung roster read degrades to ids-only
+        // instead of holding a socket open for minutes behind a tablet that walked out of range.
+        const res = await fetchWithDeadline(apiUrl(`/sessions/${encodeURIComponent(sessionId)}/roster`), {
           method: 'GET',
           credentials: 'same-origin', // send the HttpOnly session cookie (same-origin transport, ADR-0015)
           headers: { Accept: 'application/json' },

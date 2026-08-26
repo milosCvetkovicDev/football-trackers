@@ -36,6 +36,21 @@ function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(`ASSERTION FAILED: ${msg}`);
 }
 
+// Phase 5: a synthetic ~105 x 68 m pitch in on-screen corner order (TL, TR, BR, BL), built from metre
+// offsets so the geometry is legible. The CLI takes each corner as one "lat,lon" argument.
+const BASE = { lat: 44.812806, lon: 20.460535 };
+const M_PER_DEG_LAT = 111_320;
+const M_PER_DEG_LON = M_PER_DEG_LAT * Math.cos((BASE.lat * Math.PI) / 180);
+const pt = (east: number, north: number) => ({
+  lat: BASE.lat + north / M_PER_DEG_LAT,
+  lon: BASE.lon + east / M_PER_DEG_LON,
+});
+const PITCH = [pt(0, 0), pt(105, 0), pt(105, -68), pt(0, -68)];
+const asArgs = (corners: Array<{ lat: number; lon: number }>) => corners.map((c) => `${c.lat},${c.lon}`);
+const PITCH_ARGS = asArgs(PITCH);
+// Three collinear corners — the geometry that makes the client's homography solve throw.
+const BAD_PITCH_ARGS = asArgs([pt(0, 0), pt(50, 0), pt(105, 0), pt(0, -68)]);
+
 /** Run the CLI as a subprocess from server/, pointed at our temp config file. */
 async function runCli(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn(['bun', 'run', 'session-config.ts', ...args], {
@@ -53,7 +68,10 @@ async function runCli(args: string[]): Promise<{ code: number; stdout: string; s
   return { code, stdout, stderr };
 }
 
-interface SessionConfigEntry { ageBand: string }
+interface SessionConfigEntry {
+  ageBand: string;
+  pitch?: { corners: Array<{ lat: number; lon: number }> };
+}
 function readConfig(): Record<string, SessionConfigEntry> {
   const parsed = JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) as { sessions?: Record<string, SessionConfigEntry> };
   assert(parsed.sessions && typeof parsed.sessions === 'object', 'config file JSON must have a sessions object');
@@ -107,6 +125,64 @@ try {
   assert(listAll.stdout.includes(SESSION_B) && listAll.stdout.includes(BAND_B),
     `list must show ${SESSION_B} → ${BAND_B}; got stdout:\n${listAll.stdout}`);
 
+  // --- 4b. PHASE 5 (audit §6 "Client"): the pitch corners live here too now -----------------------------
+  // `set-pitch` writes the four GPS corners in on-screen order (TL, TR, BR, BL). Same validate-before-write
+  // discipline as the band: an unusable quad is refused with the file untouched, because the client solves a
+  // homography from these four points and a degenerate one throws.
+  {
+    const setPitch = await runCli(['set-pitch', SESSION_A, ...PITCH_ARGS]);
+    assert(setPitch.code === 0, `set-pitch should exit 0, got ${setPitch.code} (stderr: ${setPitch.stderr.trim()})`);
+    let s = readConfig();
+    assert(s[SESSION_A].pitch?.corners?.length === 4,
+      `${SESSION_A} must carry 4 corners, got ${JSON.stringify(s[SESSION_A].pitch)}`);
+    assert(s[SESSION_A].pitch!.corners[1].lat === PITCH[1].lat && s[SESSION_A].pitch!.corners[1].lon === PITCH[1].lon,
+      'corner order (TL,TR,BR,BL) must be preserved exactly as given');
+    assert(s[SESSION_A].ageBand === BAND_A_UPDATED, 'set-pitch must not disturb the band');
+    assert((statSync(CONFIG_FILE).mode & 0o777) === 0o600, 'set-pitch must keep the file 0o600');
+
+    // THE MERGE PROPERTY: setting the band later must PRESERVE the pitch. (The pre-Phase-5 `set` replaced
+    // the whole entry — a routine band correction would have silently wiped a measured pitch.)
+    const reband = await runCli(['set', SESSION_A, BAND_A]);
+    assert(reband.code === 0, `re-setting the band should exit 0, got ${reband.code}`);
+    s = readConfig();
+    assert(s[SESSION_A].ageBand === BAND_A, 'the band must be updated');
+    assert(s[SESSION_A].pitch?.corners?.length === 4, 'setting the band must NOT wipe a configured pitch');
+
+    // A degenerate quad (three collinear corners) is refused, and the previously-good pitch survives intact.
+    const bad = await runCli(['set-pitch', SESSION_A, ...BAD_PITCH_ARGS]);
+    assert(bad.code !== 0, `set-pitch with a degenerate quad must exit nonzero, got ${bad.code}`);
+    assert(bad.stderr.length > 0, 'a rejected pitch must explain itself on stderr');
+    s = readConfig();
+    assert(s[SESSION_A].pitch?.corners?.[1].lat === PITCH[1].lat,
+      'a rejected set-pitch must leave the existing pitch untouched');
+
+    // Wrong arity / non-numeric input is refused the same way.
+    const short = await runCli(['set-pitch', SESSION_A, PITCH_ARGS[0], PITCH_ARGS[1], PITCH_ARGS[2]]);
+    assert(short.code !== 0, 'set-pitch with three corners must exit nonzero');
+    const junk = await runCli(['set-pitch', SESSION_A, 'a,b', ...PITCH_ARGS.slice(1)]);
+    assert(junk.code !== 0, 'set-pitch with a non-numeric corner must exit nonzero');
+    s = readConfig();
+    assert(s[SESSION_A].pitch?.corners?.length === 4, 'rejected set-pitch calls must not corrupt the file');
+
+    // `list` must make it visible that a session HAS a measured pitch — otherwise the only way to find out
+    // is to read the JSON, and "is this the real pitch or the built-in placeholder?" is the exact question
+    // the audit finding is about.
+    const listed = await runCli(['list']);
+    assert(/pitch/i.test(listed.stdout), `list must indicate which sessions have a pitch; got:\n${listed.stdout}`);
+
+    // clear-pitch drops the corners and keeps the band.
+    const clear = await runCli(['clear-pitch', SESSION_A]);
+    assert(clear.code === 0, `clear-pitch should exit 0, got ${clear.code} (stderr: ${clear.stderr.trim()})`);
+    s = readConfig();
+    assert(s[SESSION_A].pitch === undefined, 'clear-pitch must remove the pitch');
+    assert(s[SESSION_A].ageBand === BAND_A, 'clear-pitch must keep the band');
+    const clearAgain = await runCli(['clear-pitch', SESSION_A]);
+    assert(clearAgain.code !== 0, 'clearing an absent pitch must exit nonzero rather than silently succeed');
+
+    // Put the pitch back so case 5 proves `remove` takes the whole entry with it.
+    assert((await runCli(['set-pitch', SESSION_A, ...PITCH_ARGS])).code === 0, 're-set the pitch for case 5');
+  }
+
   // --- 5. remove s1 -> exit 0; later list drops s1 but keeps s2 ----------------------------------------
   const rm = await runCli(['remove', SESSION_A]);
   assert(rm.code === 0, `remove ${SESSION_A} should exit 0, got ${rm.code} (stderr: ${rm.stderr.trim()})`);
@@ -129,7 +205,9 @@ try {
 
   console.log('\n✅ SESSION-CONFIG CLI PASSED — set writes 0o600 {sessions:{<id>:{ageBand}}} JSON (upsert, not dup), '
     + 'a bad band exits nonzero WITHOUT corrupting the file, list shows each session → band, '
-    + 'remove drops one & keeps the other, and remove-absent errors without corrupting the file');
+    + 'remove drops one & keeps the other, remove-absent errors without corrupting the file, and (Phase 5) '
+    + 'set-pitch/clear-pitch round-trip four corners in order, a band set PRESERVES the pitch, and a '
+    + 'degenerate/short/non-numeric quad is refused with the file left intact');
   if (existsSync(CONFIG_FILE)) rmSync(CONFIG_FILE);
   process.exit(0);
 } catch (err) {

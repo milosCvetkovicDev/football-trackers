@@ -28,6 +28,7 @@ requirements discussion (June 2026).
 | [0021](0021-local-dev-docker-stack.md) | Local dev stack: Docker Compose backend + host-run coach view |
 | [0022](0022-dynamic-provisioning.md) | Dynamic provisioning: NVS broker host + mDNS (`name.local`) + captive-portal Wi-Fi setup |
 | [0023](0023-camera-cv-offline-analysis.md) | Offline camera/CV match analysis (`vision/`, build-spec form): realises Track B / Path 2; prototyped on public footage, youth-footage gate deferred |
+| [0024](0024-client-reliability-signals.md) | The coach view reports its own failures: a four-value client beacon, no free text (no error/RUM SDK) |
 
 Format: Context → Decision → Consequences → Alternatives considered.
 
@@ -44,3 +45,8 @@ the first real-device bring-up ([local-bench-runbook](../dev/local-bench-runbook
 ADR-0023 realises 0020's deferred Track B / 0005's camera Path 2 as a standalone offline `vision/` CV subproject
 (Veo/Trace-style player+ball tracking → top-down radar + stats), prototyped on **public** footage only; it
 **inherits, does not discharge**, 0020 §6's child-video DPIA — the real-youth-footage gate stays deferred to a future ADR.
+ADR-0024 (audit Phase 5) adds the first browser→server write: a four-value client beacon so a coach whose view
+has gone dark is visible from `/metrics` at all — deliberately not an error/RUM SDK, whose default payload
+(stack traces, URLs, DOM context) is exactly what 0010/0016 exist to keep children out of. The same phase
+amends **0019**, which now also stores each session's four measured **pitch corners** (they were compiled into
+the client bundle, pointing at a bench in Belgrade).

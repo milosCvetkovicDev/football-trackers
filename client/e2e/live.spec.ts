@@ -194,6 +194,43 @@ test.describe('coach live view — smoke + a11y (anonymous simulator stack)', ()
     await expect(firstRow.getByText(/3D · \d+ sats/).first()).toBeVisible({ timeout: 30_000 });
   });
 
+  // ── Phase 5 (audit §6 "Client"): the players must render ON the pitch, not beside it.
+  //
+  // This assertion exists because the drift it catches was live and invisible for months: the
+  // simulator's rectangle sits 7.1 km from the client's built-in fallback corners, so every
+  // hardware-free run mapped the whole fleet outside the drawn box. Before Phase 5 those dots were
+  // simply CLIPPED — the HUD said "live · 12 players" over an empty pitch and no test noticed, because
+  // nothing asserted anything about where a dot landed. Phase 5 both surfaces it (an off-pitch player
+  // is now pinned to the canvas edge and says "off pitch" in the mirror) and fixes it (the simulator
+  // publishes its own corners through the session config). This is the gate that keeps it fixed.
+  test('every tracked player renders ON the pitch (the session-config corners are in use)', async ({
+    page,
+  }) => {
+    const liveRegion = page.locator('[aria-live="polite"], [role="status"]').first();
+    await expect(liveRegion).toContainText(/live/i, { timeout: 20_000 });
+    await expect
+      .poll(async () => playerRows(page).count(), { timeout: 20_000, intervals: [500] })
+      .toBeGreaterThanOrEqual(Math.ceil(PLAYERS * 0.5));
+
+    // The Status cell (index 1) reads "fresh"/"stale" — and appends " · off pitch" for a player
+    // outside the pitch rectangle. Not one of them should be.
+    await expect
+      .poll(
+        async () => {
+          const rows = playerRows(page);
+          const n = await rows.count();
+          let off = 0;
+          for (let i = 0; i < n; i++) {
+            const texts = await rows.nth(i).locator('td').allInnerTexts();
+            if (/off pitch/i.test(texts[1] ?? '')) off++;
+          }
+          return off;
+        },
+        { timeout: 20_000, intervals: [1_000] },
+      )
+      .toBe(0);
+  });
+
   // ── Phase 4 (ADR-0019): the mirror gains a Zone WORD + a live Distance value per tracked player.
   test('the mirror shows a speed-zone WORD + a live Distance for a tracked player (§3.4)', async ({
     page,

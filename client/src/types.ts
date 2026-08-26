@@ -1,3 +1,5 @@
+import type { LatLon } from './geo';
+
 /**
  * Mirrors the server's enriched Telemetry (server/src/types.ts) and the WS
  * envelope shape that server.ts publishes: {event:'telemetry', data:Telemetry}.
@@ -35,10 +37,22 @@ export interface DeviceHealth {
   backlogBytes: number;
 }
 
-/** What server.ts publishes on /live — a discriminated union over the two envelope kinds. */
+/**
+ * The server's clock, sent ONCE on connect (Phase 5, audit C-1). This is the client's trusted skew
+ * reference: a telemetry frame's `serverTs` may be a replayed fix's GPS time (Phase 4 `gts`, up to 6 h
+ * behind arrival), so estimating the offset from telemetry would let a backlog drain convince the view
+ * that hours-old positions are live. Carries no child data — a timestamp and the socket's own session.
+ */
+export interface ServerHello {
+  sessionId: string;
+  serverTs: number;
+}
+
+/** What server.ts publishes on /live — a discriminated union over the envelope kinds. */
 export type LiveEnvelope =
   | { event: 'telemetry'; data: Telemetry }
-  | { event: 'status'; data: DeviceHealth };
+  | { event: 'status'; data: DeviceHealth }
+  | { event: 'hello'; data: ServerHello };
 
 // ----- Coaching domain (Phase 4; ADR-0019) — mirror server/src/types.ts -----
 export type AgeBand = 'U12' | 'U14' | 'U16' | 'U19';
@@ -52,10 +66,17 @@ export interface ZoneThresholds {
   sprintMps: number;
 }
 
-/** GET /sessions/:id/config response body. */
+/**
+ * GET /sessions/:id/config response body (as this client models it).
+ *
+ * `pitchCorners` (Phase 5) is present only when the session has a MEASURED pitch that passed
+ * validation on both sides — server (`sessionConfig.ts validatePitchCorners`) and client
+ * (`pitchFrame.ts parsePitchCorners`). Absent ⇒ the view keeps its built-in `PITCH_CORNERS`.
+ */
 export interface SessionConfig {
   ageBand: AgeBand;
   thresholds: ZoneThresholds;
+  pitchCorners?: LatLon[];
 }
 
 /** Per-player LIVE running-distance accumulator (client-only). Best-effort coaching glance: it is built from

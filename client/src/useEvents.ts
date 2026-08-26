@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import { apiUrl } from './config';
+import { fetchWithDeadline, isTimeoutError, SCAN_DEADLINE_MS } from './fetchDeadline';
+import { sendBeacon } from './beacon';
 import type { EventsResult } from './types';
 
 /**
@@ -21,9 +23,16 @@ export type EventsState =
   | { status: 'empty' }
   | { status: 'ok'; data: EventsResult };
 
+/**
+ * @param reloadNonce Phase 5 (audit §6 "Client": *the "try again" copy is misleading because
+ *   re-pressing Apply is a no-op*). Re-applying the SAME window changed no dependency, so nothing
+ *   re-fetched and the failure looked permanent. Bumping this nonce re-runs the read with identical
+ *   parameters — which is exactly what "try again" has to mean after a transient failure.
+ */
 export function useEvents(
   sessionId: string,
   window: { from: number; to: number } | null,
+  reloadNonce = 0,
 ): EventsState {
   const [state, setState] = useState<EventsState>({ status: 'loading' });
 
@@ -45,12 +54,16 @@ export function useEvents(
 
     void (async () => {
       try {
-        const res = await fetch(apiUrl(`/sessions/${encodeURIComponent(sessionId)}/events?${params.toString()}`), {
-          method: 'GET',
-          credentials: 'same-origin', // send the HttpOnly session cookie (same-origin transport, ADR-0015)
-          headers: { Accept: 'application/json' },
-          signal: controller.signal,
-        });
+        const res = await fetchWithDeadline(
+          apiUrl(`/sessions/${encodeURIComponent(sessionId)}/events?${params.toString()}`),
+          {
+            method: 'GET',
+            credentials: 'same-origin', // send the HttpOnly session cookie (same-origin transport, ADR-0015)
+            headers: { Accept: 'application/json' },
+            signal: controller.signal,
+          },
+          SCAN_DEADLINE_MS, // an events read is a scan, like /history — see fetchDeadline.ts
+        );
         // Fail closed: any non-2xx (401/403/404/429/503/400/5xx) is an explicit error, never a silent blank.
         if (!res.ok) {
           if (!disposed) setState({ status: 'error' });
@@ -65,6 +78,9 @@ export function useEvents(
         }
       } catch (err) {
         if (disposed || (err instanceof DOMException && err.name === 'AbortError')) return;
+        // A DEADLINE is worth reporting: it is the failure mode that used to hang forever with no
+        // trace on either side. Kind only — never the URL or the error text.
+        if (isTimeoutError(err)) sendBeacon('fetch_timeout', sessionId);
         setState({ status: 'error' });
       }
     })();
@@ -73,7 +89,7 @@ export function useEvents(
       disposed = true;
       controller.abort();
     };
-  }, [sessionId, from, to]);
+  }, [sessionId, from, to, reloadNonce]);
 
   return state;
 }

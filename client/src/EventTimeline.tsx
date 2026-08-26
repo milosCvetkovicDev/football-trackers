@@ -23,6 +23,11 @@ interface EventTimelineProps {
   /** The committed review window (same one the aggregate uses), or null to render nothing/idle. */
   window: { from: number; to: number } | null;
   theme: Theme;
+  /** Phase 5: bumped by the review surface's "Try again" so an unchanged window still re-fetches. */
+  reloadNonce?: number;
+  /** Phase 5: the retry action shown on the error panel (before, the copy said "try again" and the
+   *  only offered control — Apply, with an unchanged window — did nothing at all). */
+  onRetry?: () => void;
 }
 
 const EVENT_LABEL: Record<TacticalEventType, string> = {
@@ -37,14 +42,15 @@ const EVENT_COLOR: Record<TacticalEventType, string> = {
   stoppage: '#90a4ae', // grey — low-movement / dead time
 };
 
-export function EventTimeline({ session, window, theme }: EventTimelineProps) {
-  const result = useEvents(session, window);
+export function EventTimeline({ session, window, theme, reloadNonce = 0, onRetry }: EventTimelineProps) {
+  const result = useEvents(session, window, reloadNonce);
 
   if (result.status === 'loading') return <Panel>Detecting tactical events…</Panel>;
   if (result.status === 'error') {
     return (
-      <Panel tone="bad">
-        Couldn&rsquo;t load tactical events for this window. Check the time range and try again.
+      <Panel tone="bad" onRetry={onRetry}>
+        Couldn&rsquo;t load tactical events for this window. The server may be busy, or the window may
+        be too wide.
       </Panel>
     );
   }
@@ -296,9 +302,18 @@ function detailText(e: TacticalEvent): string {
   return '—';
 }
 
-function Panel({ children, tone }: { children: React.ReactNode; tone?: 'bad' }) {
+function Panel({
+  children,
+  tone,
+  onRetry,
+}: {
+  children: React.ReactNode;
+  tone?: 'bad';
+  /** Phase 5: a real retry button on the error panel (see EventTimelineProps.onRetry). */
+  onRetry?: () => void;
+}) {
   return (
-    <p
+    <div
       role={tone === 'bad' ? 'alert' : undefined}
       style={{
         margin: 0,
@@ -308,10 +323,35 @@ function Panel({ children, tone }: { children: React.ReactNode; tone?: 'bad' }) 
         background: '#16181d',
         color: tone === 'bad' ? '#ff8d8d' : '#e8e8e8',
         opacity: tone === 'bad' ? 1 : 0.8,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 12,
+        flexWrap: 'wrap',
       }}
     >
-      {children}
-    </p>
+      <span>{children}</span>
+      {onRetry ? (
+        <button
+          type="button"
+          onClick={onRetry}
+          style={{
+            cursor: 'pointer',
+            fontSize: 13,
+            // 44 px (WCAG 2.5.5) — same rule as every other control since Phase 5.
+            minHeight: 44,
+            minWidth: 44,
+            padding: '0 14px',
+            borderRadius: 8,
+            border: '1px solid #2a2d33',
+            background: '#16181d',
+            color: '#e8e8e8',
+          }}
+        >
+          Try again
+        </button>
+      ) : null}
+    </div>
   );
 }
 

@@ -27,7 +27,7 @@ Server (from `server/`):
 bun install
 bun start          # run; bun --watch for dev (bun run dev)
 bun run typecheck  # bunx tsc --noEmit (Bun does not typecheck at runtime)
-bun run test       # THE GATE: all 25 suites, sequential, ~35 s (test/run-all.ts)
+bun run test       # THE GATE: all 26 suites, sequential, ~47 s (test/run-all.ts)
 bun run test:e2e   # one suite; every suite also has its own test:* script
 bun run test/mosquitto-pub-demo.ts   # the README's literal mosquitto_pub -> WS path
 ```
@@ -46,18 +46,22 @@ bun run dev        # Vite dev on :5173; VITE_PROXY_TARGET is the same-origin pro
 bun run build      # vite production build
 bun run typecheck  # tsc --noEmit
 bun run lint       # eslint .
-bun run test       # unit suites (homography, interpolate, ws/validate, zones)
+bun run test       # unit suites — `bun test src`, so a new src/*.test.ts joins the gate automatically
+bun run guard:bundle  # after `build`: asserts no DEV-only test hook or secret survived into dist/
 bun run e2e        # Playwright, driven by the hardware-free simulator
 ```
-The e2e gate binds **sixteen** ports across four stacks: the shared happy-path one
-(:3000/:9464/:1884/:5173) plus three dedicated stacks spun up inside specs — auth
-(:3201/:9466/:1885/:5273), review (:3202/:9476/:1896/:5274) and the 50-player frame-budget run
-(:3210/:9474/:1894/:5283).
+The e2e gate binds **twenty** ports across five stacks: the shared happy-path one
+(:3000/:9464/:1884/:5173) plus four dedicated stacks spun up inside specs — auth
+(:3201/:9466/:1885/:5273), review (:3202/:9476/:1896/:5274), reliability
+(:3203/:9477/:1897/:5275) and the 50-player frame-budget run (:3210/:9474/:1894/:5283).
 Only the happy-path four are env-overridable, which is enough in practice because :3000 is the
 one that collides. If something else holds it, move the block rather than shutting that down:
 `PW_SERVER_PORT=3300 PW_HEALTH_PORT=9564 PW_BROKER_PORT=1984 PW_VITE_PORT=5373 bun run e2e`
 — see [client/e2e/ports.ts](client/e2e/ports.ts), the single source both the config and the
-specs read (the other twelve are hardcoded in `e2e/fixtures.ts` and the review spec).
+specs read (the other sixteen are hardcoded in `e2e/fixtures.ts` and the review/reliability specs).
+The **reliability** stack is the only one that KILLS AND RESTARTS its server mid-spec (audit C-2), so
+it is anon-capable: auth sessions are in-memory, and a cookie-authed page would come back to a login
+form, turning a reconnect test into a session-loss test.
 Review needs its own **auth-ON** stack because Phase 2 scoped the anonymous principal to the live
 pitch: `/roster`, `/history` and `/events` answer 403 without a real login, so the review specs
 sign in.
@@ -136,13 +140,22 @@ runbook in `docs/architecture/observability.md`; the e2e test asserts `/metrics`
 
 **Live fan-out** (`server/src/server.ts`): Elysia `.ws('/live')`; a client connects to
 `/live?sessionId=<id>` and the `open` handler does `ws.subscribe('session:'+id)` (one room
-per session). Frames sent to clients are JSON envelopes `{event:'telemetry', data:Telemetry}`.
+per session). Frames sent to clients are JSON envelopes: `{event:'telemetry', data:Telemetry}`,
+`{event:'status', data:DeviceHealth}`, and — FIRST on every socket (Phase 5) —
+`{event:'hello', data:{sessionId, serverTs}}`, the server's own clock. The client cannot infer the
+clock from telemetry: since Phase 4 a replayed fix carries its GPS time as `serverTs`, so a page
+loading during a backlog drain would read "the server is hours behind" and then draw stale fixes as
+live dots. An unknown `event` is ignored client-side, so the addition is backward-compatible.
 Fan-out uses Bun's native WS pub/sub directly — **not** socket.io — so the (not-yet-built)
 coach UI uses a plain `WebSocket`, not `socket.io-client`. `GET /health` returns
 `{ok, mqtt, db, version, uptimeSeconds}` — HTTP 200 when `ok` (= `mqtt && db`), 503 otherwise — where `mqtt`
 follows the broker client's connect/close events (true once subscribed, false on close/offline) and `db` is a
-`SELECT 1` probe; the e2e tests poll it as a readiness gate to avoid the QoS0 publish-before-subscribe race.
-`GET /metrics` is the Prometheus scrape target.
+probe that READS the telemetry table and folds in the last insert's outcome (a bare `SELECT 1` stayed green with
+the table dropped); the e2e tests poll it as a readiness gate to avoid the QoS0 publish-before-subscribe race.
+`GET /metrics` is the Prometheus scrape target. One write comes the other way: `POST /sessions/:id/client-beacon`
+(Phase 5) lets the coach view report its OWN failures — a closed four-value enum (`ws_gave_up`, `ws_manual_retry`,
+`render_error`, `fetch_timeout`) counted as `ft_client_events_total{kind}`, with no free text, no player id and
+no session label.
 
 **Persistence** (`server/src/db.ts`): bun:sqlite, WAL mode, one prepared insert per packet
 (no batching needed at ~100 msg/s). This is the "local SQLite" option from the original
@@ -155,6 +168,32 @@ drop-OLDEST when full) and are replayed PACED (~30 msg/s) from an NVS cursor che
 records — a crash mid-flush re-sends at most one window, which the server dedupes via `sq`. Records
 older than 6 h are skipped/purged; `wipe` over serial erases the backlog. The pure logic is
 host-tested in `firmware/test/host/` (clang++, also in firmware-ci).
+
+**Coach-view reliability** (`client/src/`, Phase 5): three cross-file rules.
+(1) **The clock is the server's.** `serverClock.ts` keeps a running MINIMUM of `Date.now() - serverTs` over
+accepted frames (transit delay is always ≥ 0, so the smallest sample is closest to the true offset; a replayed
+Phase-4 backlog fix is simply ignored by a minimum). Every freshness decision — canvas, mirror, player count,
+the review window default — reads `serverNow()`, never `Date.now()`: a match-day LAN has no NTP, and a tablet
+10 s fast used to render an EMPTY PITCH over a healthy feed.
+(2) **A dead feed is recoverable — and a stalled one is detected.** The terminal give-up after
+`MAX_RECONNECT_ATTEMPTS` now carries `conn.retryable` + a "Reconnect now" button and an `online` listener,
+both routed through `reconnectNow()`, which re-runs the socket effect with a fresh attempt budget. Policy
+terminals (unauthorized / forbidden / bad session) are NOT retryable — a button there would invite jabbing
+at a locked door. A **stall watchdog** covers the commonest field failure, which produces no close event at
+all: once a socket has carried data, 15 s of silence on a still-OPEN socket is treated as dead. It does NOT
+wait for `close()` to produce an `onclose` — measured against a stopped server, that event did not arrive
+for 40 s while the view kept saying "connected" — it detaches the socket and takes the normal backoff path
+itself.
+(3) **The pitch comes from the session, not the bundle.** `GET /sessions/:id/config` serves
+`pitch:{corners}` when a session has measured corners (`session-config.ts set-pitch`); `src/config.ts`'s
+`PITCH_CORNERS` is only the fallback. The quad is validated on BOTH sides (server `validatePitchCorners`,
+client `parsePitchCorners` — deliberately duplicated, marked on both) because the client SOLVES a homography
+from those four points and a degenerate one throws mid-match. `pitchFrame.ts` is the one definition of "off
+pitch", shared by the canvas (pins the player to the edge with a diamond) and the mirror (says "off pitch" in
+words) — before, such a player was silently clipped while the HUD kept counting them.
+Also here: scoped error boundaries (root / live canvas / Review, so a Review throw no longer white-screens the
+shell), a deadline on every fetch (`fetchDeadline.ts` — TIMEOUT shows, caller ABORT stays silent), retries that
+actually re-fetch (a reload nonce; re-pressing Apply was a no-op), and 44 px touch targets.
 
 **GPS bring-up** (`main.cpp::gpsBegin`): the NEO-M8N ships at 9600 baud / 1 Hz / NMEA. The
 code talks UBX to raise serial baud to 115200, switches to UBX-only output, sets 10 Hz,
