@@ -1,16 +1,11 @@
 # Client CI — coach live view (client/).
 #
-# ┌─ NO REMOTE YET ────────────────────────────────────────────────────────────────┐
-# │ The repo is under git as of the Phase-1 initial commit, but has NO GitHub remote │
-# │ and so no Actions runner: nothing here has executed on a runner yet. It is       │
-# │ written to run as-is once a remote is added. Until then the same gates run       │
-# │ locally — the commands in each step's `run:` are the real ones, not a sketch:    │
-# │   cd client && bun run typecheck && bun run lint && bun run test && bun run build │
-# │   cd client && bun run e2e        (needs :3000/:5173 free — see e2e/ports.ts)    │
-# └────────────────────────────────────────────────────────────────────────────────┘
+# The same gates run locally, and the commands in each step's `run:` are the real ones:
+#   cd client && bun run typecheck && bun run lint && bun run test && bun run build && bun run guard:bundle
+#   cd client && bun run e2e        (needs :3000/:5173 free — see e2e/ports.ts)
 #
 # Gate order (fail fast, cheapest first): install -> typecheck -> lint -> unit test
-# -> build -> e2e (Playwright, driven by the hardware-free simulator). The e2e job
+# -> build -> bundle guard -> e2e (Playwright, driven by the hardware-free simulator). The e2e job
 # needs mosquitto on the runner (the simulator spawns it, exactly like server/test/e2e.ts).
 #
 # Actions are SHA-pinned per the repo CI convention (tag in a trailing comment).
@@ -73,6 +68,13 @@ jobs:
 
       - name: Build
         run: bun run build
+
+      - name: Bundle guard (no dev-only test hooks or secrets in the shipped assets)
+        # Phase 5: ReviewView carries an `import.meta.env.DEV`-guarded crash switch so the e2e gate can
+        # prove the Review error boundary catches a REAL throw. Vite eliminates that branch from a
+        # production build — this step turns "should be eliminated" into a checked fact, and re-checks
+        # the standing no-bundled-token / no-names invariants on the built output.
+        run: bun run guard:bundle
 
   # E2E + frame-budget gate: needs a browser + mosquitto (the simulator spawns the
   # broker + the real server, hardware-free — see server/test/simulate.ts).

@@ -151,6 +151,8 @@ in any label or HELP line" guard that holds for the rest of the catalogue holds 
 | `ft_events_requests_total` | counter | result | `GET /sessions/:id/events` (tactical event detection, [ADR-0020](../decisions/0020-tactical-event-detection.md)) by outcome: `ok` / `rate_limited` (429) / `busy` (503) / `unauthorized` / `forbidden` / `bad_session` / `bad_params` / `forbidden_origin` / `internal`. Team-aggregate surface — **no session/player/name label** |
 | `ft_events_read_seconds` | histogram | — | Wall time of a paged tactical-events read — the **[ADR-0020](../decisions/0020-tactical-event-detection.md) off-the-live-loop SLO**. Shares the live event loop with `/history`, so the **inflight cap is the *shared* `scanLoad` slot** (`OFFLOOP_MAX_INFLIGHT`, default 3, history + events combined): `busy` (503) on either surface means the COMBINED concurrent-scan cap was hit |
 | `ft_events_rows_scanned_total` | counter | — | Telemetry rows scanned by tactical-events reads — the **bulk-export volume signal** (same role as `ft_history_rows_scanned_total`; cross-check the `events read` audit log) |
+| `ft_client_events_total` | counter | kind | **The only metric sourced from the browser** (Phase 5, audit §6 "Client": *no client observability*). `kind` ∈ `ws_gave_up` \| `ws_manual_retry` \| `render_error` \| `fetch_timeout` — a **closed vocabulary validated at the route**, so cardinality is fixed at four by construction and an unrecognised value is refused (400) rather than admitted as a new series. Deliberately **no session or player label**: which sessions have a struggling tablet is not a question `/metrics` should answer to whoever can scrape it. All four are seeded present-at-0 at boot so `increase()` can fire on the first occurrence |
+| `ft_client_beacon_requests_total` | counter | result | `POST /sessions/:id/client-beacon` by outcome: `ok` / `bad_kind` / `rate_limited` (429) / `unauthorized` / `forbidden` / `bad_session` / `forbidden_origin` / `too_large` / `bad_json` / `unsupported_media_type`. Same session gate as `/roster` + `/config`, but **strict** Origin (a POST always carries one) and a 256-byte body cap |
 
 > **SLO / alerting note.** `ft_history_read_seconds` is the observable side of the ADR-0017 guarantee that a
 > review read never stalls the shared event loop. The hard gate is the `test/history.ts` SLO case: over a
@@ -292,7 +294,23 @@ groups:
       - alert: AuthSessionGrowth        # tokens minting faster than they expire/log out, nearing the cap
         expr: ft_auth_sessions_active > 0.8 * 1000   # 0.8 * AUTH_MAX_SESSIONS
         for: 15m
+      # --- the coach's VIEW (Phase 5, audit C-1/C-2 + §6). Everything above measures the server; these
+      # are the only signals that say whether anyone can actually SEE the pitch. A dark tablet on a
+      # touchline is invisible from here without them. ---
+      - alert: CoachViewDark            # a tablet exhausted its reconnect budget — that coach sees nothing
+        expr: increase(ft_client_events_total{kind="ws_gave_up"}[10m]) > 0
+      - alert: CoachViewCrashing        # a render threw into an error boundary (kind only; never the message)
+        expr: increase(ft_client_events_total{kind="render_error"}[30m]) > 0
+      - alert: CoachViewReadsTimingOut  # review/roster reads hitting FETCH_DEADLINE_MS — server slow or link bad
+        expr: increase(ft_client_events_total{kind="fetch_timeout"}[15m]) > 2
 ```
+
+> **Why these four kinds and nothing else.** The beacon runs on a device displaying children's live
+> positions, so it carries a fixed enum and a session id — no player id, no coordinates, no free text,
+> no stack trace (an error message routinely interpolates whatever was being rendered). `ws_manual_retry`
+> is the quiet one: it means the automatic recovery path failed a coach badly enough that they pressed a
+> button, so a rise in it without a matching `ws_gave_up` says the backoff is too slow, not that the
+> network is broken.
 
 ---
 

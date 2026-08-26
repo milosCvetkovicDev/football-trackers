@@ -26,15 +26,19 @@ export function apiUrl(path: string): string {
 export const DEFAULT_SESSION = import.meta.env.VITE_DEFAULT_SESSION ?? 'test';
 
 /**
- * The pitch's four corners in GPS, in on-screen order:
+ * FALLBACK pitch corners, in on-screen order:
  *   0 = top-left, 1 = top-right, 2 = bottom-right, 3 = bottom-left.
  * Edges 0->1 and 3->2 are the two touchlines (long sides).
  *
- * TODO: replace with your pitch's measured corners (stand at each corner with a
- * device and read lat/lon). These placeholders are a ~105x68 m rectangle.
- * 2026-06-18: recentred on the bench-test location (device read ~44.81250, 20.46120
- * in Belgrade) so the live device's dot lands on the pitch and movement is visible.
- * For a real match, re-measure the actual pitch corners.
+ * PHASE 5 (audit §6 "Client"): the REAL corners come from the server, per session —
+ * `GET /sessions/:id/config` returns `pitch:{corners}` when someone has measured them
+ * (`bun run session-config.ts set-pitch <session> <TL> <TR> <BR> <BL>` in server/).
+ * This constant is only what the view falls back to when a session has no configured
+ * pitch: before Phase 5 it was the ONLY source, which meant every real pitch mapped to
+ * the wrong box until someone edited this file and rebuilt the bundle.
+ *
+ * The values below are a ~105x68 m rectangle over the bench-test location in Belgrade
+ * (2026-06-18) — a deliberate placeholder, not anyone's pitch.
  */
 export const PITCH_CORNERS: LatLon[] = [
   { lat: 44.812806, lon: 20.460535 }, // TL
@@ -58,6 +62,32 @@ export const MAX_PLAUSIBLE_SPEED_MPS = 8;
 export const INTERP_MAX_GAP_MS = 200;
 /** Hard cap on tracked players — a bound against a buggy/hostile feed flooding the Map with ids. */
 export const MAX_TRACKED_PLAYERS = 64;
+
+/**
+ * How many consecutive failed network reconnects before the live socket settles into a terminal,
+ * visibly-stopped state (Phase 5, audit C-2). Eight capped-backoff attempts is ~37 s expected and
+ * 75 s worst case — long enough to ride out a relay blip, and the point at which continuing to retry
+ * silently is less honest than saying so and offering the coach a button.
+ *
+ * Overridable ONLY so the e2e gate can reach the terminal state in seconds instead of a minute; a
+ * bad value falls back to the default LOUDLY (the same rule the server's env.ts follows) rather than
+ * becoming NaN, which would make `attempt > MAX_RETRIES` false forever — a silent infinite loop, the
+ * exact bug the terminal state exists to remove.
+ */
+export const MAX_RECONNECT_ATTEMPTS = readAttempts();
+
+function readAttempts(): number {
+  const raw = import.meta.env.VITE_MAX_RECONNECT_ATTEMPTS;
+  if (raw === undefined || raw === '') return 8;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1 || n > 50) {
+    console.warn(
+      `VITE_MAX_RECONNECT_ATTEMPTS="${raw}" is not an integer in 1..50 — using the default (8).`,
+    );
+    return 8;
+  }
+  return n;
+}
 
 // --- Device-health thresholds (Phase 3) — shared by the canvas cue + the accessible mirror so they
 // classify a tracker's health identically. Status frames arrive ~every 5 s (see firmware/simulate). ---

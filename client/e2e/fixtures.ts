@@ -82,6 +82,19 @@ export interface AuthStack extends Stack {
 }
 
 /**
+ * An auth stack whose SERVER can be killed and brought back while the browser stays put — the only
+ * honest way to drive the Phase-5 reconnect gate (audit C-2), which is about what the coach's view
+ * does when the server goes away mid-match and comes back. The broker, the simulator and Vite keep
+ * running throughout, so the only thing that changes is the thing under test.
+ */
+export interface RestartableAuthStack extends AuthStack {
+  /** Kill the server and wait until it stops answering /health. */
+  stopServer: () => Promise<void>;
+  /** Start it again on the same ports/DB and wait until it is healthy + subscribed. */
+  startServer: () => Promise<void>;
+}
+
+/**
  * Start an ANONYMOUS simulator standalone stack (server + broker + N-player fleet) plus a dedicated
  * Vite, on dedicated ports. Used by the 50-player frame-budget gate so it doesn't collide with the
  * 12-player happy-path stack started in playwright.config.ts.
@@ -181,12 +194,46 @@ export async function withAnonStack(players: number, opts?: {
  * Requires `mosquitto` + `bun` on PATH (same dependency as server/test/auth-e2e.ts). Throws if the
  * stack doesn't come up; the caller should `test.skip` on that so the gate is honest.
  */
-export async function withAuthStack(opts?: {
+export async function withAuthStack(opts?: AuthStackOpts): Promise<AuthStack> {
+  const { baseURL, stop, creds } = await startStack(opts);
+  return { baseURL, stop, creds };
+}
+
+/**
+ * The Phase-5 reliability stack (audit C-1/C-2): the server can be killed and restarted ON ITS OWN
+ * while the browser, broker, simulator and Vite stay put — see RestartableAuthStack.
+ *
+ * ANONYMOUS-CAPABLE ON PURPOSE. Auth sessions live in memory (a known Phase-6 item), so killing the
+ * server logs every coach out: a cookie-authed page would come back to a LOGIN FORM and the spec
+ * would be measuring session loss rather than reconnection. With `ALLOW_ANONYMOUS_LIVE` the live
+ * pitch survives the restart, so the reconnect assertions are about the socket and nothing else. A
+ * coach account is still provisioned, because the Review error-boundary test needs a real login
+ * (Phase 2 scoped anon to the live pitch) — exactly the posture `simulate.ts --standalone` runs.
+ *
+ * `maxReconnectAttempts` shrinks the client's retry budget so the terminal "gave up" state is reached
+ * in seconds: the field default of 8 capped-backoff attempts is ~37 s expected, 75 s worst case — the
+ * right default on a touchline and an unusable one in a test.
+ */
+export async function withRestartableStack(
+  opts?: AuthStackOpts & { maxReconnectAttempts?: number },
+): Promise<RestartableAuthStack> {
+  return startStack({ maxReconnectAttempts: 2, anonymous: true, ...opts });
+}
+
+export interface AuthStackOpts {
   serverPort?: number;
   healthPort?: number;
   brokerPort?: number;
   vitePort?: number;
-}): Promise<AuthStack> {
+}
+
+interface StartOpts extends AuthStackOpts {
+  maxReconnectAttempts?: number;
+  /** Also allow the anonymous live pitch (ANON_SESSIONS = SESSION), alongside the coach account. */
+  anonymous?: boolean;
+}
+
+async function startStack(opts?: StartOpts): Promise<RestartableAuthStack> {
   // Dedicated ports, distinct from the happy-path (:3000/:9464/:1884/:5173) and the load stack
   // (:3210/:9474/:1894/:5283), so all stacks can coexist without colliding.
   const serverPort = opts?.serverPort ?? 3201;
@@ -227,7 +274,23 @@ export async function withAuthStack(opts?: {
       },
     }) + '\n',
   );
-  writeFileSync(sessionConfigFile, JSON.stringify({ sessions: { [SESSION]: { ageBand: 'U14' } } }) + '\n');
+  // Phase 5: publish the pitch the simulator's fleet actually moves on, so this stack's coach view
+  // draws players ON the pitch rather than as off-pitch edge markers. MUST match CORNERS in
+  // server/test/simulate.ts — the simulator generates positions inside this rectangle, and a stack
+  // that disagreed with it would silently render every player outside the box (which is exactly the
+  // drift a checker lens found between simulate.ts and the client's built-in fallback).
+  const SIM_CORNERS = [
+    { lat: 44.812806, lon: 20.460535 },
+    { lat: 44.812806, lon: 20.461865 },
+    { lat: 44.812194, lon: 20.461865 },
+    { lat: 44.812194, lon: 20.460535 },
+  ];
+  writeFileSync(
+    sessionConfigFile,
+    JSON.stringify({
+      sessions: { [SESSION]: { ageBand: 'U14', pitch: { corners: SIM_CORNERS } } },
+    }) + '\n',
+  );
 
   // Anonymous broker is fine here — the AUTH being tested is the server's cookie /live gate, not the
   // broker ACL (that's covered by server/test/auth-e2e.ts + the sim's --secure mode).
@@ -244,26 +307,38 @@ export async function withAuthStack(opts?: {
   // 2. The real server with AUTH ON: accounts file loaded, NON-Secure cookie (we're on
   //    http://localhost), strict Origin pinned to this Vite origin, and NO ALLOW_ANONYMOUS_LIVE —
   //    so a tokenless browser is bounced to the login gate, not silently let through.
-  const server = spawn('bun', ['run', 'src/server.ts'], {
-    cwd: SERVER_DIR,
-    stdio: 'ignore',
-    env: {
-      ...process.env,
-      PORT: String(serverPort),
-      METRICS_PORT: String(healthPort),
-      MQTT_URL: `mqtt://127.0.0.1:${brokerPort}`,
-      DB_PATH: dbPath,
-      LOG_LEVEL: 'warn',
-      AUTH_ACCOUNTS_FILE: accountsFile,
-      AUTH_ROSTER_FILE: rosterFile, // names — a real login is now the only way to see them
-      SESSION_CONFIG_FILE: sessionConfigFile, // age band → real youth zone thresholds, not the U14 fallback
-      AUTH_COOKIE_SECURE: 'false', // localhost dev/e2e: a Secure cookie wouldn't be stored over http://
-      ALLOWED_ORIGINS: baseURL, // allow this Vite origin so the proxied upgrade/POST is admitted
-      // NB: NO ALLOW_ANONYMOUS_LIVE — login is required (the whole point of this stack).
-      ALLOW_ANONYMOUS_LIVE: '',
-    },
-  });
-  procs.push(server);
+  // Spawned through a function so the SERVER ALONE can be killed and brought back (audit C-2) without
+  // disturbing the broker, the simulator or Vite. `serverProc` always points at the live one.
+  let serverProc: ChildProcess | null = null;
+  const spawnServer = (): ChildProcess => {
+    const p = spawn('bun', ['run', 'src/server.ts'], {
+      cwd: SERVER_DIR,
+      stdio: 'ignore',
+      env: {
+        ...process.env,
+        PORT: String(serverPort),
+        METRICS_PORT: String(healthPort),
+        MQTT_URL: `mqtt://127.0.0.1:${brokerPort}`,
+        DB_PATH: dbPath,
+        LOG_LEVEL: 'warn',
+        AUTH_ACCOUNTS_FILE: accountsFile,
+        AUTH_ROSTER_FILE: rosterFile, // names — a real login is now the only way to see them
+        SESSION_CONFIG_FILE: sessionConfigFile, // age band → real youth zone thresholds, not the U14 fallback
+        AUTH_COOKIE_SECURE: 'false', // localhost dev/e2e: a Secure cookie wouldn't be stored over http://
+        ALLOWED_ORIGINS: baseURL, // allow this Vite origin so the proxied upgrade/POST is admitted
+        // NB: NO ALLOW_ANONYMOUS_LIVE — login is required (the whole point of this stack)... unless a
+        // caller explicitly asked for the anon-capable posture (withRestartableStack; see its comment).
+        ALLOW_ANONYMOUS_LIVE: opts?.anonymous ? 'true' : '',
+        ...(opts?.anonymous
+          ? { ANON_SESSIONS: creds.session, PUBLIC_HOST: '127.0.0.1' } // anon ⇒ loopback-only bind (§4.1)
+          : {}),
+      },
+    });
+    serverProc = p;
+    procs.push(p);
+    return p;
+  };
+  spawnServer();
 
   // 3. Attach-mode simulator: stream the coach's session into the broker so a successful login lands
   //    on a LIVE feed (not an empty "waiting for players"). It only publishes MQTT — it needs no
@@ -280,7 +355,16 @@ export async function withAuthStack(opts?: {
   const vite = spawn('bun', ['run', 'dev', '--', '--port', String(vitePort), '--strictPort'], {
     cwd: CLIENT_DIR,
     stdio: 'ignore',
-    env: { ...process.env, VITE_PROXY_TARGET: proxyTarget, VITE_DEFAULT_SESSION: creds.session },
+    env: {
+      ...process.env,
+      VITE_PROXY_TARGET: proxyTarget,
+      VITE_DEFAULT_SESSION: creds.session,
+      // Only set when a spec asked for it: the field default (8) takes 37-75 s to reach the terminal
+      // "gave up" state, which is correct on a touchline and useless in a test.
+      ...(opts?.maxReconnectAttempts === undefined
+        ? {}
+        : { VITE_MAX_RECONNECT_ATTEMPTS: String(opts.maxReconnectAttempts) }),
+    },
   });
   procs.push(vite);
 
@@ -299,12 +383,43 @@ export async function withAuthStack(opts?: {
     }
   };
 
+  // Kill the server alone and wait until it really stops answering — returning while the socket is
+  // still accepting would let the spec's "the server is down" assertions race the shutdown.
+  const stopServer = async (): Promise<void> => {
+    if (serverProc) {
+      try {
+        serverProc.kill('SIGKILL'); // no graceful shutdown yet (audit Phase 6) — SIGTERM can linger
+      } catch {
+        /* already gone */
+      }
+      serverProc = null;
+    }
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      try {
+        await fetch(`http://127.0.0.1:${healthPort}/health`);
+      } catch {
+        return; // connection refused == down
+      }
+      await sleep(100);
+    }
+    throw new Error('server did not stop answering /health within 15s');
+  };
+
+  const startServer = async (): Promise<void> => {
+    if (serverProc) return; // already up
+    spawnServer();
+    if (!(await waitForHealthy(healthPort, 30_000))) {
+      throw new Error('server did not come back healthy within 30s');
+    }
+  };
+
   const ready = (await waitForHealthy(healthPort, 30_000)) && (await waitForHttp(baseURL, 30_000));
   if (!ready) {
     stop();
     throw new Error('auth stack did not become ready (is mosquitto installed?)');
   }
-  return { baseURL, stop, creds };
+  return { baseURL, stop, creds, stopServer, startServer };
 }
 
 /**

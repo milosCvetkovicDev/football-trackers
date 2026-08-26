@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import { apiUrl } from './config';
+import { fetchWithDeadline, isTimeoutError, SCAN_DEADLINE_MS } from './fetchDeadline';
+import { sendBeacon } from './beacon';
 import type { AgeBand } from './types';
 
 /**
@@ -150,10 +152,15 @@ function isEmptyResponse(mode: 'aggregate' | 'raw', body: AggregateResult | RawR
  *
  * @param sessionId  the match session to read. Falsy → idle `'empty'` (no request).
  * @param query      window + mode (+ player/cursor for raw). A null/undefined query → idle `'empty'`.
+ * @param reloadNonce Phase 5 (audit §6 "Client": *the "try again" copy is misleading because
+ *   re-pressing Apply is a no-op*). Re-applying the SAME window changed no dependency below, so the
+ *   read never re-ran and a transient failure looked permanent. Bumping this nonce repeats the read
+ *   with identical parameters — which is what "try again" has to mean.
  */
 export function useHistory(
   sessionId: string,
   query: HistoryQuery | null,
+  reloadNonce = 0,
 ): HistoryResult {
   const [result, setResult] = useState<HistoryResult>({ status: 'loading' });
 
@@ -196,7 +203,9 @@ export function useHistory(
 
     void (async () => {
       try {
-        const res = await fetch(
+        // Deadline (Phase 5): a history read is the slowest thing this client asks for, and the one a
+        // half-open socket strands most visibly — "Loading match summary…" with no end and no error.
+        const res = await fetchWithDeadline(
           apiUrl(`/sessions/${encodeURIComponent(sessionId)}/history?${params.toString()}`),
           {
             method: 'GET',
@@ -204,6 +213,11 @@ export function useHistory(
             headers: { Accept: 'application/json' },
             signal: controller.signal,
           },
+          // The SCAN deadline, not the small-read one: /history pages over the raw fix table and the
+          // server caps its cost, never its time. Aborting a legitimate long scan would show a failure
+          // the coach cannot fix by retrying — and would leave the abandoned scan holding its shared
+          // off-loop slot until it finished anyway.
+          SCAN_DEADLINE_MS,
         );
         // Fail closed: ANY non-2xx (401/403/404/429/503/400/5xx) is an explicit error, never a silent
         // empty pitch — the coach must be told the read failed (§0.2). Error bodies are opaque codes we
@@ -223,6 +237,7 @@ export function useHistory(
         // An abort (param change / unmount) is expected — don't flip to error, the next effect run owns
         // the state. Any OTHER failure (network/parse) fails closed to an explicit error.
         if (disposed || (err instanceof DOMException && err.name === 'AbortError')) return;
+        if (isTimeoutError(err)) sendBeacon('fetch_timeout', sessionId); // kind only — never the URL/text
         setResult({ status: 'error' });
       }
     })();
@@ -234,7 +249,7 @@ export function useHistory(
     // Primitive deps ONLY (the `query` object identity is intentionally excluded) so a caller that rebuilds
     // an equal-valued query each render doesn't trigger an endless re-fetch loop. The effect body reads only
     // these primitives (the redundant `!query` guard was dropped — undefined from/to/mode already cover it).
-  }, [sessionId, mode, from, to, player, cursorTs, cursorRowid]);
+  }, [sessionId, mode, from, to, player, cursorTs, cursorRowid, reloadNonce]);
 
   return result;
 }

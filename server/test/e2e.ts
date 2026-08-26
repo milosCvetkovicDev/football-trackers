@@ -193,10 +193,16 @@ try {
   };
   pub.publish(TOPIC_01, JSON.stringify(good), { qos: 0 });
 
-  for (let i = 0; i < 50 && received.length < 1; i++) await sleep(100);
-  assert(received.length === 1, `expected 1 WS message, got ${received.length}`);
+  // NB every socket opens with a Phase-5 `hello` envelope (the server's clock — audit C-1), so select
+  // the telemetry frame by EVENT rather than by position. Asserting on `received[0]` would pin the
+  // frame ORDER, which is not part of the contract; the envelope kind is.
+  for (let i = 0; i < 50 && !received.some((m) => m.event === 'telemetry'); i++) await sleep(100);
+  const telemetryFrames = received.filter((m) => m.event === 'telemetry');
+  assert(telemetryFrames.length === 1, `expected 1 telemetry envelope, got ${telemetryFrames.length} of ${received.length} frames`);
 
-  const msg = received[0];
+  // Count TELEMETRY frames, not all frames: the socket also carries the Phase-5 `hello` clock envelope.
+  const telemetryCount = () => received.filter((m) => m.event === 'telemetry').length;
+  const msg = telemetryFrames[0];
   assert(msg.event === 'telemetry', `envelope event was "${msg.event}"`);
   const d = msg.data;
   assert(d.sessionId === SESSION, `sessionId enriched wrong: ${d.sessionId}`);
@@ -213,22 +219,22 @@ try {
   // --- 7. id_mismatch: body pl "02" on player/01 topic -> dropped, not fanned out ----
   pub.publish(TOPIC_01, JSON.stringify({ ...good, pl: '02' }), { qos: 0 });
   await sleep(700);
-  assert(received.length === 1, `id_mismatch packet should be dropped; got ${received.length} messages`);
+  assert(telemetryCount() === 1, `id_mismatch packet should be dropped; got ${telemetryCount()} telemetry frames`);
 
   // --- 8. fix<2 -> dropped (no fan-out, no row) -------------------------------------
   pub.publish(TOPIC_01, JSON.stringify({ ...good, fix: 1 }), { qos: 0 });
   await sleep(700);
-  assert(received.length === 1, `fix<2 packet should be dropped; got ${received.length} messages`);
+  assert(telemetryCount() === 1, `fix<2 packet should be dropped; got ${telemetryCount()} telemetry frames`);
 
   // --- 9. ACL anti-spoof: player "01" creds cannot publish to player "02"'s topic ----
   pub.publish(TOPIC_02, JSON.stringify({ ...good, pl: '02' }), { qos: 0 }); // broker denies
   await sleep(700);
-  assert(received.length === 1, `ACL should block player-01 publishing to player-02; got ${received.length}`);
+  assert(telemetryCount() === 1, `ACL should block player-01 publishing to player-02; got ${telemetryCount()} telemetry frames`);
 
   // --- 9b. out-of-range coordinates -> dropped (no fan-out, no row) ------------------
   pub.publish(TOPIC_01, JSON.stringify({ ...good, lat: 999 }), { qos: 0 });
   await sleep(700);
-  assert(received.length === 1, `out-of-range packet should be dropped; got ${received.length} messages`);
+  assert(telemetryCount() === 1, `out-of-range packet should be dropped; got ${telemetryCount()} telemetry frames`);
 
   // --- 10. persistence: exactly one row (only the good packet) ----------------------
   await sleep(200);

@@ -139,6 +139,24 @@ and `localhost` can resolve to `::1` first. Two consequences worth knowing befor
   ```
   (both files are gitignored; the server picks them up on its reload timer).
 
+### 5a. Point the view at the REAL pitch (Phase 5)
+
+Until you do this, dots are mapped onto a placeholder rectangle over a bench in Belgrade — which is fine on a
+desk and useless outdoors, because every position lands in the wrong box. Walk the pitch, stand at each corner,
+read `lat,lon` off any GPS app (or the device's own serial output), then:
+
+```sh
+cd server && SESSION_CONFIG_FILE=./session-config.json bun run session-config.ts set-pitch test \
+  <TL lat,lon> <TR lat,lon> <BR lat,lon> <BL lat,lon>
+```
+
+Corner order is **on-screen**: top-left, top-right, bottom-right, bottom-left — going *around* the pitch, not
+diagonally. The CLI validates the quad before writing (coincident/collinear corners, a self-crossing order, or
+sides outside 10–250 m are refused with the reason and the file left untouched), the server reloads it within
+`SESSION_CONFIG_RELOAD_SECONDS`, and the coach view picks it up on its next config fetch. `list` shows which
+sessions have one; `clear-pitch` reverts to the built-in fallback. The footer under the pitch says which of the
+two you are currently looking at.
+
 ## 6. Verify end to end
 - **Connected, but "waiting for players" (indoors):** correct and expected. The device is connected and sending
   health (`ft_device_wifi_rssi_dbm`, etc.), but **indoors there is no GPS fix**, so every position packet is

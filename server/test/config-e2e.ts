@@ -14,6 +14,10 @@
  *     thresholds:{ jogMps:2, runMps:4, hsrMps:5.28, sprintMps:6.39 } } (the §1 table — no invented values).
  *   - an UNCONFIGURED session the coach is also assigned to defaults to U14
  *     ({ ageBand:'U14', hsrMps:4.86, sprintMps:5.83 }) — so zones always resolve.
+ *   - PHASE 5 (audit §6 "Client"): the same endpoint now carries the PITCH — `pitch:{corners:[4]}` for a
+ *     session that has one, the key ABSENT for one that doesn't (client keeps its built-in corners), and
+ *     absent again for a configured-but-DEGENERATE quad, which is refused server-side rather than handed
+ *     to a homography solve that would throw and white-screen the coach view.
  *   - NO name/PII in the body or in /metrics; ft_config_requests_total is present (by {result} only).
  *
  * Hardware-free: anonymous mosquitto + a provisioned coach account gate the endpoint. Names used here are
@@ -46,14 +50,30 @@ const BAD_ORIGIN = 'http://evil.example';
 // path covers both the configured + default-band branches; coach is NOT assigned OTHER_SESSION (the 403 case).
 const COACH = 'coach-config';
 const COACH_PW = 'coach-config-pw';
-const SESSION_CONFIGURED = 'sessCfg'; // configured U16 in SESSION_CONFIG_FILE
+const SESSION_CONFIGURED = 'sessCfg'; // configured U16 + a real pitch in SESSION_CONFIG_FILE
 const SESSION_UNCONFIGURED = 'sessDefault'; // assigned to the coach but NOT in the config file → U14 default
+const SESSION_BAD_PITCH = 'sessBadPitch'; // configured band + an UNUSABLE pitch → band served, pitch dropped
 const OTHER_SESSION = 'sessOther'; // the coach is NOT assigned this one → 403
 const COOKIE_NAME = 'ft_session'; // AUTH_COOKIE_SECURE=false ⇒ no __Host- prefix
 
 // The §1 youth threshold table values this test pins (verbatim — no invented/rounded numbers).
 const U16 = { jogMps: 2, runMps: 4, hsrMps: 5.28, sprintMps: 6.39 };
 const U14 = { jogMps: 2, runMps: 4, hsrMps: 4.86, sprintMps: 5.83 };
+
+// Phase 5 (audit §6 "Client"): the pitch's four GPS corners move OUT of the client bundle and into this
+// endpoint, so a coach can point the view at the pitch they are actually standing on. A synthetic
+// ~105 x 68 m rectangle in on-screen corner order (TL, TR, BR, BL), built from metre offsets.
+const BASE = { lat: 44.812806, lon: 20.460535 };
+const M_PER_DEG_LAT = 111_320;
+const M_PER_DEG_LON = M_PER_DEG_LAT * Math.cos((BASE.lat * Math.PI) / 180);
+const pt = (east: number, north: number) => ({
+  lat: BASE.lat + north / M_PER_DEG_LAT,
+  lon: BASE.lon + east / M_PER_DEG_LON,
+});
+const PITCH = [pt(0, 0), pt(105, 0), pt(105, -68), pt(0, -68)];
+// Three collinear corners: the client's 8x8 homography solve would throw 'degenerate homography' on
+// this and white-screen the coach view, so the server must refuse to serve it at all.
+const BAD_PITCH = [pt(0, 0), pt(50, 0), pt(105, 0), pt(0, -68)];
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 function assert(cond: unknown, msg: string): asserts cond {
@@ -76,7 +96,7 @@ const cfgUrl = (id: string) => `http://127.0.0.1:${PORT}/sessions/${encodeURICom
 try {
   // --- 1. provision the coach account assigned to BOTH the configured + unconfigured sessions -----------
   const add = Bun.spawn(
-    ['bun', 'run', 'auth-user.ts', 'add', COACH, '--role', 'coach', '--sessions', `${SESSION_CONFIGURED},${SESSION_UNCONFIGURED}`],
+    ['bun', 'run', 'auth-user.ts', 'add', COACH, '--role', 'coach', '--sessions', `${SESSION_CONFIGURED},${SESSION_UNCONFIGURED},${SESSION_BAD_PITCH}`],
     {
       cwd: `${import.meta.dir}/..`,
       env: { ...process.env, AUTH_ACCOUNTS_FILE: ACCOUNTS_FILE },
@@ -92,7 +112,16 @@ try {
   // through to the U14 default). Shape mirrors sessionConfig.ts: { sessions: { "<id>": { ageBand } } }. ----
   await Bun.write(
     CONFIG_FILE,
-    JSON.stringify({ sessions: { [SESSION_CONFIGURED]: { ageBand: 'U16' } } }, null, 2) + '\n',
+    JSON.stringify(
+      {
+        sessions: {
+          [SESSION_CONFIGURED]: { ageBand: 'U16', pitch: { corners: PITCH } },
+          [SESSION_BAD_PITCH]: { ageBand: 'U12', pitch: { corners: BAD_PITCH } },
+        },
+      },
+      null,
+      2,
+    ) + '\n',
   );
 
   // --- 3. anonymous broker (the auth under test is the SERVER /config gate, not broker ACLs) ------------
@@ -197,9 +226,33 @@ try {
   for (const [k, v] of Object.entries(U16)) {
     assert(cfgBody.thresholds![k] === v, `U16 thresholds.${k} should be ${v}, got ${cfgBody.thresholds![k]}`);
   }
-  // The body must carry ONLY {sessionId, ageBand, thresholds} — no stray fields.
-  assert(JSON.stringify(Object.keys(cfgBody).sort()) === JSON.stringify(['ageBand', 'sessionId', 'thresholds']),
-    `config body must have EXACTLY {sessionId, ageBand, thresholds}, got keys ${Object.keys(cfgBody).join(',')}`);
+  // The body must carry ONLY {sessionId, ageBand, thresholds} (+ `pitch` when one is configured) — no
+  // stray fields. This session HAS a pitch, so all four keys are expected here.
+  assert(JSON.stringify(Object.keys(cfgBody).sort()) === JSON.stringify(['ageBand', 'pitch', 'sessionId', 'thresholds']),
+    `configured-pitch config body must have EXACTLY {sessionId, ageBand, thresholds, pitch}, got keys ${Object.keys(cfgBody).join(',')}`);
+
+  // (b1a) PHASE 5: the four pitch corners are served, in order, unmodified — this is what replaces the
+  // compile-time PITCH_CORNERS the audit found pointing at a bench in Belgrade.
+  const pitch = (cfgBody as unknown as { pitch?: { corners?: Array<{ lat: number; lon: number }> } }).pitch;
+  assert(pitch !== undefined, 'configured session must carry a pitch');
+  assert(JSON.stringify(Object.keys(pitch!).sort()) === JSON.stringify(['corners']),
+    `pitch must carry EXACTLY {corners}, got ${Object.keys(pitch!).join(',')}`);
+  assert(pitch!.corners?.length === 4, `pitch.corners must have 4 entries, got ${pitch!.corners?.length}`);
+  for (let i = 0; i < 4; i++) {
+    assert(JSON.stringify(Object.keys(pitch!.corners![i]).sort()) === JSON.stringify(['lat', 'lon']),
+      `corner ${i} must carry EXACTLY {lat, lon}, got ${Object.keys(pitch!.corners![i]).join(',')}`);
+    assert(pitch!.corners![i].lat === PITCH[i].lat && pitch!.corners![i].lon === PITCH[i].lon,
+      `corner ${i} must round-trip unmodified and IN ORDER (TL,TR,BR,BL)`);
+  }
+
+  // (b1b) PHASE 5: an UNUSABLE pitch is refused at the server, not passed to a client that would throw
+  // inside its homography solve. The band still resolves — a bad pitch must not cost the session its zones.
+  const badPitchRes = await fetch(cfgUrl(SESSION_BAD_PITCH), { headers: { origin: ORIGIN, cookie } });
+  assert(badPitchRes.status === 200, `bad-pitch session should still be 200, got ${badPitchRes.status}`);
+  const badPitchBody = (await badPitchRes.json()) as Record<string, unknown>;
+  assert(badPitchBody.ageBand === 'U12', `bad-pitch session must keep its band, got ${badPitchBody.ageBand}`);
+  assert(!('pitch' in badPitchBody),
+    `a degenerate pitch must be dropped server-side, got ${JSON.stringify(badPitchBody.pitch)}`);
 
   // (b2) REGRESSION GUARD: a same-origin browser GET via fetch() sends NO Origin header — authed + NO Origin
   // + own session → 200 (requiring an Origin would 403 the real coach UI).
@@ -219,6 +272,12 @@ try {
   for (const [k, v] of Object.entries(U14)) {
     assert(defBody.thresholds![k] === v, `U14 default thresholds.${k} should be ${v}, got ${defBody.thresholds![k]}`);
   }
+  // An unconfigured session carries NO pitch — `pitch` is ABSENT rather than null, which is what tells
+  // the client to keep its built-in corners (a null would have to be special-cased at every reader).
+  assert(!('pitch' in defBody),
+    `an unconfigured session must omit pitch entirely, got ${JSON.stringify((defBody as Record<string, unknown>).pitch)}`);
+  assert(JSON.stringify(Object.keys(defBody).sort()) === JSON.stringify(['ageBand', 'sessionId', 'thresholds']),
+    `unconfigured config body must have EXACTLY {sessionId, ageBand, thresholds}, got keys ${Object.keys(defBody).join(',')}`);
 
   // ====================================================================================================
   // (d) /metrics — ft_config_requests_total present, by {result} only (no session/player/name label)
@@ -257,7 +316,7 @@ try {
     assert(!metricsText.includes(bad), `/metrics must not contain "${bad}"`);
   }
 
-  console.log('\n✅ CONFIG E2E PASSED — §0.4 authz order (no-cookie→401 even on malformed id, bad-origin→403, wrong-session→403), authorised 200 with EXACTLY {sessionId,ageBand,thresholds}; configured session=U16, unconfigured defaults to U14; ft_config_requests_total {result}-only; no name/PII in body or /metrics');
+  console.log('\n✅ CONFIG E2E PASSED — §0.4 authz order (no-cookie→401 even on malformed id, bad-origin→403, wrong-session→403), authorised 200 with EXACTLY {sessionId,ageBand,thresholds(,pitch)}; configured session=U16 + 4 pitch corners in order, unconfigured defaults to U14 with NO pitch, degenerate pitch refused server-side (band kept); ft_config_requests_total {result}-only; no name/PII in body or /metrics');
   for (const f of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`, ACCOUNTS_FILE, CONFIG_FILE, CONF_FILE]) {
     if (existsSync(f)) rmSync(f);
   }

@@ -234,8 +234,11 @@ try {
   pub.publish(TOPIC_A, JSON.stringify(good), { qos: 0 });
   const aOut = await a.outcome;
   assert(!aOut.closed, `authorized WS to ${SESSION_A} should stay open, but closed ${aOut.code} '${aOut.reason}'`);
-  assert(aOut.messages.length >= 1, `authorized WS should receive >=1 telemetry envelope, got ${aOut.messages.length}`);
-  const env = aOut.messages[0];
+  // Select by EVENT, not position: every socket now opens with a Phase-5 `hello` envelope carrying the
+  // server's clock (audit C-1), which is not telemetry and must not be mistaken for it.
+  const telemetry = aOut.messages.filter((m: { event?: string }) => m.event === 'telemetry');
+  assert(telemetry.length >= 1, `authorized WS should receive >=1 telemetry envelope, got ${JSON.stringify(aOut.messages.map((m: { event?: string }) => m.event))}`);
+  const env = telemetry[0];
   assert(env.event === 'telemetry', `envelope event was "${env.event}"`);
   assert(env.data.sessionId === SESSION_A && env.data.playerId === '01', 'fanned-out telemetry enriched wrong');
 

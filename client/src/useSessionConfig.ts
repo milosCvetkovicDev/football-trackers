@@ -1,40 +1,57 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { apiUrl } from './config';
+import { fetchWithDeadline } from './fetchDeadline';
+import { parsePitchCorners } from './pitchFrame';
 import type { AgeBand, SessionConfig, ZoneThresholds } from './types';
 
 /**
- * Phase 4 (ADR-0019): resolve a session's age band + speed-zone thresholds from the server config store.
+ * Phase 4 (ADR-0019) + Phase 5: resolve a session's setup from the server — the age band that selects
+ * youth speed-zone thresholds, and (since Phase 5) the four measured pitch corners.
  *
- * Modelled EXACTLY on `useRoster` — fetch GET /sessions/:id/config (`credentials:'same-origin'` so the
- * HttpOnly session cookie rides along), an AbortController + `disposed` flag on cleanup, and a synchronous
- * reset-to-null at the START of the effect so a new session never renders with the previous session's band
- * while the request is in flight. Like the roster, the config is an ENHANCEMENT for the live render, never a
- * gate: `null` until the first successful load, and the caller falls back to U14 `DEFAULT_THRESHOLDS`
- * client-side while null so zones still render (graceful degradation). It is NEVER persisted (no
- * localStorage/sessionStorage/IndexedDB/Cache) — only component memory.
+ * Modelled on `useRoster` — fetch GET /sessions/:id/config (`credentials:'same-origin'` so the HttpOnly
+ * session cookie rides along), an AbortController + `disposed` flag on cleanup, and a synchronous reset at
+ * the START of the effect so a new session never renders with the previous session's band while the request
+ * is in flight. Like the roster, this is an ENHANCEMENT for the live render, never a gate: the caller falls
+ * back to U14 `DEFAULT_THRESHOLDS` and the built-in `PITCH_CORNERS` while unresolved, so the pitch always
+ * renders. It is NEVER persisted (no localStorage/sessionStorage/IndexedDB/Cache) — only component memory.
  *
- * Transient-failure retention (§3.2 / pre-mortem provenance gap): keep the last successfully-fetched config
- * for THIS session in a ref, and on a later non-abort fetch error return that last-good config rather than
- * snapping back to null. A configured session that hits a network blip therefore keeps its REAL band live —
- * otherwise the live zones would silently degrade to U14 while the review path still uses the real band, and
- * the two would disagree. On a session CHANGE the ref is reset FIRST (mirroring the roster stale guard) so a
- * stale config can never bleed across sessions.
+ * WHY THIS RETRIES (Phase 5 checker finding). The original version fetched exactly once per session and
+ * folded every failure into "stay null", which the caller cannot distinguish from "this session has no
+ * measured pitch". One blip at page load — a 429, a 5xx, a restart with no graceful shutdown, a hit deadline
+ * — therefore stranded the coach for the WHOLE MATCH on U14 defaults and the built-in placeholder rectangle,
+ * with the footer positively asserting that no pitch was configured. Two changes fix that:
+ *   - a bounded retry with backoff, so a transient failure recovers on its own;
+ *   - an explicit `status`, so the UI can say "couldn't load this session's setup" instead of stating a
+ *     falsehood about the pitch.
+ * (The previous "last-good retention" branch was removed: with exactly one fetch per session, `lastGood` was
+ * provably null at every read site — a mechanism the doc described at length and that could never fire.)
  *
- * @param sessionId  the match session whose config to fetch. Falsy → null, no fetch (idle).
- * @returns          the SessionConfig once loaded, the last-good config on a transient failure, else null.
+ * @param sessionId  the match session whose config to fetch. Falsy → idle, no fetch.
  */
-export function useSessionConfig(sessionId: string): SessionConfig | null {
-  const [config, setConfig] = useState<SessionConfig | null>(null);
-  // Last successfully-fetched config for THIS session — survives a transient (non-abort) failure so a
-  // configured session keeps its real band on a blip. Reset on session change BEFORE any fetch (below).
-  const lastGood = useRef<SessionConfig | null>(null);
+
+/** Retry schedule for a transient failure. Short enough to recover before kick-off, bounded so a genuinely
+ *  misconfigured server doesn't become a request loop against a children's-location endpoint. */
+const RETRY_DELAYS_MS = [1_000, 3_000, 8_000];
+
+export type SessionConfigStatus = 'idle' | 'loading' | 'ok' | 'error';
+
+export interface SessionConfigState {
+  /** The resolved config, or null while loading / after giving up. */
+  config: SessionConfig | null;
+  /**
+   * 'ok' means the server ANSWERED — so an absent `pitchCorners` genuinely means "no pitch measured for
+   * this session". 'error' means we could not ask, and the caller must not claim anything about the pitch.
+   */
+  status: SessionConfigStatus;
+}
+
+export function useSessionConfig(sessionId: string): SessionConfigState {
+  const [state, setState] = useState<SessionConfigState>({ config: null, status: 'idle' });
 
   useEffect(() => {
-    // Reset synchronously at the START of the effect so the new session never renders with the old session's
-    // band while the fetch below is in flight, and so a transient failure on the NEW session can't fall back
-    // to the OLD session's last-good config (the cross-session belt — mirrors the useRoster stale guard).
-    lastGood.current = null;
-    setConfig(null);
+    // Reset synchronously at the START of the effect so the new session never renders with the old
+    // session's band while the fetch below is in flight (mirrors the useRoster stale guard).
+    setState({ config: null, status: sessionId ? 'loading' : 'idle' });
 
     // Falsy sessionId (e.g. admin hasn't chosen one yet) → no config, no request.
     if (!sessionId) return;
@@ -43,60 +60,91 @@ export function useSessionConfig(sessionId: string): SessionConfig | null {
     // session-A response can't configure a session-B view after we've switched.
     const controller = new AbortController();
     let disposed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
 
-    void (async () => {
-      try {
-        const res = await fetch(apiUrl(`/sessions/${encodeURIComponent(sessionId)}/config`), {
-          method: 'GET',
-          credentials: 'same-origin', // send the HttpOnly session cookie (same-origin transport, ADR-0015)
-          headers: { Accept: 'application/json' },
-          signal: controller.signal,
-        });
-        if (!res.ok) {
-          // 401/403/404/429/5xx → keep the last-good band if we have one (transient-failure retention),
-          // else stay null so the caller falls back to U14 DEFAULT_THRESHOLDS.
-          if (!disposed && lastGood.current) setConfig(lastGood.current);
-          return;
-        }
-        const body = (await res.json()) as {
-          sessionId?: string;
-          ageBand?: AgeBand;
-          thresholds?: ZoneThresholds;
-        };
-        if (disposed) return; // a newer session won the race — drop this stale result
-        // Build defensively: only a well-shaped {ageBand, thresholds:{4 numbers}} is accepted; anything else
-        // is treated as a failure (retain last-good / stay null) rather than rendering a malformed config.
-        const t = body?.thresholds;
-        if (
-          body &&
-          typeof body.ageBand === 'string' &&
-          t &&
-          typeof t.jogMps === 'number' &&
-          typeof t.runMps === 'number' &&
-          typeof t.hsrMps === 'number' &&
-          typeof t.sprintMps === 'number'
-        ) {
-          const next: SessionConfig = {
-            ageBand: body.ageBand,
-            thresholds: { jogMps: t.jogMps, runMps: t.runMps, hsrMps: t.hsrMps, sprintMps: t.sprintMps },
-          };
-          lastGood.current = next;
-          setConfig(next);
-        } else if (lastGood.current) {
-          setConfig(lastGood.current);
-        }
-      } catch {
-        // Abort (session switch) or network/parse failure: keep the last-good band if we have one so a
-        // configured session survives a blip; otherwise stay null (caller uses U14 defaults). Never throw.
-        if (!disposed && lastGood.current) setConfig(lastGood.current);
+    /** One attempt. Returns true when the config resolved; false for a retryable failure. */
+    const attempt = async (): Promise<boolean> => {
+      // Deadline (Phase 5): a half-open socket would otherwise leave the band unresolved forever, and
+      // with it the pitch corners — the view would silently run on U14 defaults and the built-in
+      // outline with nothing on screen to say why.
+      const res = await fetchWithDeadline(apiUrl(`/sessions/${encodeURIComponent(sessionId)}/config`), {
+        method: 'GET',
+        credentials: 'same-origin', // send the HttpOnly session cookie (same-origin transport, ADR-0015)
+        headers: { Accept: 'application/json' },
+        signal: controller.signal,
+      });
+      // 401/403 are ANSWERS, not blips: this principal will not be allowed to read this session's config
+      // however many times we ask, so retrying is pure noise against an access-controlled endpoint.
+      if (res.status === 401 || res.status === 403) {
+        if (!disposed) setState({ config: null, status: 'error' });
+        return true; // "settled" — stop retrying
       }
-    })();
+      if (!res.ok) return false; // 404/429/5xx → retryable
+
+      const body = (await res.json()) as {
+        sessionId?: string;
+        ageBand?: AgeBand;
+        thresholds?: ZoneThresholds;
+        pitch?: { corners?: unknown };
+      };
+      if (disposed) return true; // a newer session won the race — drop this stale result
+      // Build defensively: only a well-shaped {ageBand, thresholds:{4 numbers}} is accepted; anything else
+      // is treated as a failure rather than rendering a malformed config.
+      const t = body?.thresholds;
+      if (
+        !body ||
+        typeof body.ageBand !== 'string' ||
+        !t ||
+        typeof t.jogMps !== 'number' ||
+        typeof t.runMps !== 'number' ||
+        typeof t.hsrMps !== 'number' ||
+        typeof t.sprintMps !== 'number'
+      ) {
+        return false; // a malformed body is as good as no answer — retry, then report error
+      }
+      // Phase 5: the pitch is OPTIONAL and independently validated. The server already refused a
+      // degenerate quad, but nothing off the wire is trusted here either — an unusable one is dropped
+      // (the caller keeps the built-in corners) rather than reaching a homography solve that throws
+      // mid-match.
+      const corners = body.pitch ? parsePitchCorners(body.pitch.corners) : null;
+      setState({
+        config: {
+          ageBand: body.ageBand,
+          thresholds: { jogMps: t.jogMps, runMps: t.runMps, hsrMps: t.hsrMps, sprintMps: t.sprintMps },
+          ...(corners ? { pitchCorners: corners } : {}),
+        },
+        status: 'ok',
+      });
+      return true;
+    };
+
+    const run = async (tries = 0): Promise<void> => {
+      let settled = false;
+      try {
+        settled = await attempt();
+      } catch (err) {
+        // An abort (session switch / unmount) is expected and owns nothing: the next effect run takes
+        // over. Anything else — network, deadline, parse — is a retryable failure.
+        if (disposed || (err instanceof DOMException && err.name === 'AbortError')) return;
+        settled = false;
+      }
+      if (disposed || settled) return;
+      if (tries >= RETRY_DELAYS_MS.length) {
+        // Out of attempts: say so, rather than letting the UI assert the session has no pitch.
+        setState({ config: null, status: 'error' });
+        return;
+      }
+      retryTimer = setTimeout(() => void run(tries + 1), RETRY_DELAYS_MS[tries]);
+    };
+
+    void run();
 
     return () => {
       disposed = true;
+      if (retryTimer) clearTimeout(retryTimer);
       controller.abort();
     };
   }, [sessionId]);
 
-  return config;
+  return state;
 }

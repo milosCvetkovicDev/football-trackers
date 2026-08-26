@@ -133,6 +133,26 @@ try {
   });
   await sleep(300); // let the server-side open() subscribe to the room before we publish
 
+  // --- 5a. PHASE 5 (audit C-1): the socket's FIRST frame is the server's clock -------------------------
+  // A match-day LAN has no NTP, so the client must be told the server's time by something that cannot
+  // be a device event time. Telemetry can't do it: since Phase 4 a replayed backlog fix carries its GPS
+  // time as `serverTs` (up to 6 h behind arrival), so a client estimating the offset from telemetry
+  // would read a backlog drain as "the server is hours behind" and then draw stale fixes as live dots.
+  // This envelope is the fix, and it must arrive on EVERY socket, before any data.
+  const hello = received.find((m) => m && m.event === 'hello');
+  assert(hello !== undefined, `expected a { event:'hello' } envelope on connect, got ${JSON.stringify(received)}`);
+  assert(received[0].event === 'hello', `hello must be the FIRST frame, got ${received[0]?.event}`);
+  const helloKeys = Object.keys(hello.data).sort();
+  assert(JSON.stringify(helloKeys) === JSON.stringify(['serverTs', 'sessionId']),
+    `hello must carry EXACTLY {sessionId, serverTs}, got ${JSON.stringify(helloKeys)}`);
+  assert(hello.data.sessionId === SESSION, `hello sessionId should be "${SESSION}", got ${hello.data.sessionId}`);
+  // A CLOCK reading, not an event time: within a few seconds of this test's own clock.
+  assert(Math.abs(hello.data.serverTs - Date.now()) < 10_000,
+    `hello.serverTs must be the server's current clock, got ${hello.data.serverTs} vs ${Date.now()}`);
+  // ...and nothing about a child rides on it.
+  assert(!('name' in hello.data) && !('displayName' in hello.data) && !('lat' in hello.data),
+    `hello must never carry child data, got ${JSON.stringify(helloKeys)}`);
+
   // --- 6. publish ONE full firmware-shape DeviceStatus on the status topic -----------------------------
   // The full shape (types.ts DeviceStatus): id, pl, ts, up, heap, rssi, batt, pct, fix, sats, pub, stash, backlog.
   const beforePublish = Date.now();

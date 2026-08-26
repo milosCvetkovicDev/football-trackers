@@ -38,6 +38,28 @@ cut-off. The high-intensity (HSR) and sprint cut-offs must be **age-banded**, an
   authz posture anyway for uniformity (it is NOT name/location data, so no `no-store`/rate-limit is required —
   see the Phase-4 contract).
 
+## Amendment — the PITCH lives here too (audit Phase 5, 2026-08-26)
+
+The 2026-08-03 audit (§6 "Client") found `PITCH_CORNERS` compiled into the client bundle — and the committed
+value pointing at a bench in Belgrade, so **every real pitch mapped to the wrong box** and fixing it meant
+editing source and rebuilding. The corners are per-session configuration in exactly the sense this ADR already
+established for the age band, so they join the same store rather than getting a second one:
+
+- `session-config.json` entries gain an optional `pitch: { corners: [TL, TR, BR, BL] }`, set with
+  `bun run session-config.ts set-pitch <session> <TL> <TR> <BR> <BL>` (each corner `"lat,lon"`), cleared with
+  `clear-pitch`, and shown by `list`. Setting the BAND merges rather than replaces, so a routine band
+  correction can't silently discard four coordinates someone walked the pitch to collect.
+- `GET /sessions/:id/config` returns `pitch:{corners}` when one is configured and **omits the key entirely**
+  otherwise — absent means "keep your built-in corners", which needs no special case at any reader.
+- **The geometry is validated on BOTH sides** (`validatePitchCorners` server-side, `parsePitchCorners`
+  client-side — deliberately duplicated, marked as such in both files). The client SOLVES a homography from
+  these four points: coincident or collinear corners throw inside that solve, and a self-crossing order solves
+  fine but folds the pitch over itself and maps players to mirrored nonsense. Rejecting a bad quad costs the
+  session its pitch (fall back to the built-in corners); it must never cost the coach their view mid-match, and
+  an unusable pitch never costs the session its **band**.
+- Same posture as the band: a pitch corner is a **place, not a person** — no child's position, so no `no-store`
+  and no rate-limit beyond the existing session gate.
+
 ## Alternatives considered
 - **Client-picked band + query param (echoed for provenance)** — rejected by the owner: simplest, but two
   coaches could pick different bands for the same session; no server-stored provenance.

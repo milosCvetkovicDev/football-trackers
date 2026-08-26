@@ -10,11 +10,13 @@ import { ReviewView } from './ReviewView';
 import { ErrorBoundary } from './ErrorBoundary';
 import { useReducedMotion } from './hooks/useReducedMotion';
 import { useWakeLock } from './hooks/useWakeLock';
-import { DEFAULT_SESSION, DROP_MS } from './config';
+import { DEFAULT_SESSION, DROP_MS, PITCH_CORNERS } from './config';
 import { DEFAULT_THRESHOLDS } from './zones';
-import { describeConnection } from './contracts';
+import { describeConnection, shouldOfferReconnect } from './contracts';
+import { serverNow } from './serverClock';
 import type { Principal } from './contracts';
 import type { ZoneThresholds } from './types';
+import type { LatLon } from './geo';
 
 type Theme = 'normal' | 'outdoor';
 
@@ -143,8 +145,16 @@ function AuthedShell({
   // (graceful degradation). The same thresholds drive the live colour (canvas + mirror) AND the review
   // panel header, so live and review classify a speed identically. Called unconditionally here, alongside
   // useRoster, so hook order is stable across the live/review toggle below.
-  const sessionConfig = useSessionConfig(session);
+  const { config: sessionConfig, status: configStatus } = useSessionConfig(session);
   const thresholds: ZoneThresholds = sessionConfig?.thresholds ?? DEFAULT_THRESHOLDS;
+  // Phase 5 (audit §6 "Client"): the pitch's four GPS corners come from the SAME session config. Until
+  // it resolves — or when this session has no measured pitch — we fall back to the built-in corners, so
+  // the view always renders something. Before Phase 5 the built-in corners were the only option, and
+  // the committed value pointed at a bench in Belgrade, so every real pitch mapped to the wrong box.
+  const corners: LatLon[] = sessionConfig?.pitchCorners ?? PITCH_CORNERS;
+  // A pitch change must rebuild the render geometry, and must also clear any boundary the previous
+  // (bad) geometry tripped — hence this key, which is part of both the canvas key and the boundaries'.
+  const pitchKey = corners.map((c) => `${c.lat},${c.lon}`).join(';');
 
   // Re-arm machinery for a transient 'unauthorized' WS close (see MAX_REARM). connEpoch is part of the
   // <LiveView> key, so bumping it remounts the socket; rearms is the per-session-selection budget.
@@ -201,20 +211,20 @@ function AuthedShell({
           type="button"
           onClick={() => setTheme((t) => (t === 'outdoor' ? 'normal' : 'outdoor'))}
           aria-pressed={outdoor}
-          style={toggleStyle(outdoor)}
+          style={controlStyle(outdoor)}
         >
           {outdoor ? 'Standard view' : 'Outdoor mode'}
         </button>
 
         {showSignOut ? (
-          <button type="button" onClick={() => void logout()} style={toggleStyle(false)}>
+          <button type="button" onClick={() => void logout()} style={controlStyle(false)}>
             Sign out
           </button>
         ) : (
           // Anonymous principal: the live pitch already works without a login, so this is an OFFER, not
           // a gate. It is the only route to the surfaces that now need a named account — the label says
           // which ones, so nobody has to discover it by finding the Review toggle missing.
-          <button type="button" onClick={onRequestLogin} style={toggleStyle(false)}>
+          <button type="button" onClick={onRequestLogin} style={controlStyle(false)}>
             Sign in for names &amp; review
           </button>
         )}
@@ -259,7 +269,7 @@ function AuthedShell({
             )}
           </label>
           {principal.wildcard ? (
-            <button type="submit" style={toggleStyle(outdoor)}>
+            <button type="submit" style={controlStyle(outdoor)}>
               View
             </button>
           ) : null}
@@ -274,7 +284,7 @@ function AuthedShell({
                 type="button"
                 onClick={() => setMode('live')}
                 aria-pressed={mode === 'live'}
-                style={toggleStyle(mode === 'live')}
+                style={controlStyle(mode === 'live')}
               >
                 Live
               </button>
@@ -282,7 +292,7 @@ function AuthedShell({
                 type="button"
                 onClick={() => setMode('review')}
                 aria-pressed={mode === 'review'}
-                style={toggleStyle(mode === 'review')}
+                style={controlStyle(mode === 'review')}
               >
                 Review
               </button>
@@ -296,16 +306,30 @@ function AuthedShell({
               reducedMotion={reducedMotion}
               roster={roster}
               thresholds={thresholds}
+              corners={corners}
+              pitchKey={pitchKey}
               onUnauthorized={onUnauthorized}
             />
           ) : (
-            <ReviewView
-              session={session}
-              roster={roster}
-              thresholds={thresholds}
-              theme={theme}
-              reducedMotion={reducedMotion}
-            />
+            // Review gets its OWN boundary (Phase 5, audit §6): a throw in here used to reach the root
+            // and replace the entire page, leaving reload as the only exit. Scoped, the shell survives
+            // and "Back to live" is one press away — the live pitch is the thing a coach actually needs.
+            <ErrorBoundary
+              title="Match review couldn't be shown"
+              resetLabel="Back to live"
+              onReset={() => setMode('live')}
+              sessionId={session}
+              resetKey={`${session}:${pitchKey}`}
+            >
+              <ReviewView
+                session={session}
+                roster={roster}
+                thresholds={thresholds}
+                corners={corners}
+                theme={theme}
+                reducedMotion={reducedMotion}
+              />
+            </ErrorBoundary>
           )}
         </>
       ) : (
@@ -314,8 +338,17 @@ function AuthedShell({
 
       <p style={{ opacity: 0.5, fontSize: 12, maxWidth: 640, textAlign: 'center' }}>
         Positions update at the device rate; dots freeze to a hollow &ldquo;last known&rdquo; ring
-        when a fix is &gt;2&nbsp;s old and drop after 10&nbsp;s. Edit <code>src/config.ts</code> with
-        your pitch&apos;s four GPS corners.
+        when a fix is &gt;2&nbsp;s old and drop after 10&nbsp;s.{' '}
+        {/* Three states, not two (Phase 5 checker): a FAILED config read must not be reported as
+            "this session has no measured pitch" — that is a positive claim we cannot make while the
+            coach is looking at children drawn on a placeholder rectangle. */}
+        {configStatus === 'error'
+          ? 'Couldn’t load this session’s setup — showing the default pitch outline and U14 speed zones.'
+          : sessionConfig?.pitchCorners
+            ? 'The pitch outline is this session’s measured corners.'
+            : configStatus === 'ok'
+              ? 'No measured pitch for this session yet — showing the default outline (set it with session-config.ts set-pitch).'
+              : 'Loading this session’s pitch and speed zones…'}
       </p>
     </div>
   );
@@ -329,6 +362,10 @@ interface LiveViewProps {
   roster: Map<string, string>;
   /** Session speed-zone thresholds (Phase 4) — the fetched config or U14 defaults; drive zone colour. */
   thresholds: ZoneThresholds;
+  /** The pitch's four GPS corners (Phase 5) — this session's measured ones, else the built-in fallback. */
+  corners: LatLon[];
+  /** Identity of `corners`, used to re-key the canvas + boundary when the pitch changes. */
+  pitchKey: string;
   /** Called when the WS upgrade is closed 'unauthorized' — App re-checks /auth/me (→ <Login>). */
   onUnauthorized: () => void;
 }
@@ -338,8 +375,17 @@ interface LiveViewProps {
  * unconditional within it. Holds the visible connection banner, the canvas + accessible mirror, and the
  * 1 Hz active-player count. The wake-lock lives here because it is driven by the live connection phase.
  */
-function LiveView({ session, theme, reducedMotion, roster, thresholds, onUnauthorized }: LiveViewProps) {
-  const { store, health, dist, conn } = useLiveTelemetry(session, onUnauthorized);
+function LiveView({
+  session,
+  theme,
+  reducedMotion,
+  roster,
+  thresholds,
+  corners,
+  pitchKey,
+  onUnauthorized,
+}: LiveViewProps) {
+  const { store, health, dist, conn, reconnectNow } = useLiveTelemetry(session, onUnauthorized);
 
   // Keep the pitch-side tablet awake while the feed is live or recovering; release it once the
   // connection is terminally dead — no point burning the screen on a state a coach must go fix.
@@ -354,7 +400,10 @@ function LiveView({ session, theme, reducedMotion, roster, thresholds, onUnautho
   const [active, setActive] = useState(0);
   useEffect(() => {
     const tick = () => {
-      const now = Date.now();
+      // serverNow(), not Date.now(): `serverTs` is stamped by the SERVER, so counting against this
+      // tablet's clock would report 0 players over a healthy feed whenever the tablet runs fast
+      // (audit C-1). The correction is inert until the first frame arrives.
+      const now = serverNow();
       let n = 0;
       for (const t of store.current.values()) if (now - t.serverTs <= DROP_MS) n++;
       setActive(n);
@@ -388,10 +437,23 @@ function LiveView({ session, theme, reducedMotion, roster, thresholds, onUnautho
           style={{ width: 10, height: 10, borderRadius: '50%', background: toneColor }}
         />
         <span>{label}</span>
+        {/* Phase 5 (audit C-2): the way OUT of a dead feed. Offered whenever the connection is not
+            live AND retrying could plausibly help — i.e. a network drop or the terminal give-up, but
+            never an authz refusal, where a button would only invite jabbing at a locked door. */}
+        {shouldOfferReconnect(conn) ? (
+          <button type="button" onClick={reconnectNow} style={controlStyle(false)}>
+            Reconnect now
+          </button>
+        ) : null}
       </div>
 
-      <ErrorBoundary>
+      <ErrorBoundary
+        title="The live pitch couldn't be drawn"
+        sessionId={session}
+        resetKey={`${session}:${pitchKey}`}
+      >
         <PitchCanvas
+          key={pitchKey}
           store={store}
           health={health}
           dist={dist}
@@ -400,6 +462,7 @@ function LiveView({ session, theme, reducedMotion, roster, thresholds, onUnautho
           reducedMotion={reducedMotion}
           roster={roster}
           thresholds={thresholds}
+          corners={corners}
         />
         <A11yMirror
           store={store}
@@ -408,6 +471,7 @@ function LiveView({ session, theme, reducedMotion, roster, thresholds, onUnautho
           conn={conn}
           roster={roster}
           thresholds={thresholds}
+          corners={corners}
         />
       </ErrorBoundary>
     </>
@@ -430,11 +494,22 @@ function shellStyle(theme: Theme): React.CSSProperties {
   };
 }
 
-function toggleStyle(active: boolean): React.CSSProperties {
+/**
+ * Every interactive control in the shell (Phase 5; audit §6 "Client": touch targets ~24-25 px, WCAG
+ * 2.5.5 wants 44). These are pressed on a tablet held in one hand, at the side of a pitch, often in
+ * rain or with gloves on — a 24 px target there is not a style preference, it is a missed tap while
+ * a coach is trying to look at children. `minHeight`/`minWidth` rather than a fixed size so a long
+ * label still grows, and the e2e gate measures the rendered boxes.
+ */
+const TOUCH_TARGET_PX = 44;
+
+function controlStyle(active: boolean): React.CSSProperties {
   return {
     cursor: 'pointer',
-    fontSize: 12,
-    padding: '4px 10px',
+    fontSize: 13,
+    minHeight: TOUCH_TARGET_PX,
+    minWidth: TOUCH_TARGET_PX,
+    padding: '0 14px',
     borderRadius: 8,
     border: '1px solid #2a2d33',
     background: active ? '#ffdf2b' : '#16181d',
@@ -445,7 +520,9 @@ function toggleStyle(active: boolean): React.CSSProperties {
 function pickerInputStyle(theme: Theme): React.CSSProperties {
   return {
     fontSize: 13,
-    padding: '4px 8px',
+    minHeight: TOUCH_TARGET_PX,
+    minWidth: TOUCH_TARGET_PX,
+    padding: '0 10px',
     borderRadius: 8,
     border: '1px solid #2a2d33',
     background: theme === 'outdoor' ? '#111' : '#0e0f12',

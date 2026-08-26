@@ -687,6 +687,70 @@ Review error boundaries · fetch deadlines · pitch corners via session config �
 
 **Accept:** skew unit test within 100 ms · e2e: kill server → "gave up" → click retry → feed returns · induced Review throw shows the boundary, not a blank page.
 
+> **✅ DONE 2026-08-26 — all three acceptance criteria met, by execution, plus ten defects the checker
+> pass found in this phase's own first cut.**
+>
+> ACCEPTANCE. **Skew within 100 ms** — `client/src/serverClock.test.ts` drives a 45 s-ahead tablet through
+> 15 samples of realistic transit jitter and lands within 3 ms; the negative-skew (dead-tracker-looks-live)
+> direction is covered too. In the browser: `reliability.spec.ts` runs the whole app with `Date.now()`
+> shifted +30 s and requires the pitch to populate AND the "Last fix (s)" cell to read fresh — with the
+> correction disabled, that test fails at the first assertion (verified). **Kill server → "gave up" → retry
+> → feed returns** — the same spec kills a REAL server process, waits for the give-up text, presses the
+> button, restarts the server and requires the feed back. **Induced Review throw** — a DEV-only crash switch
+> (dead-code-eliminated from production, and `client-ci`'s new `guard:bundle` step fails the build if the
+> token survives — proven by injecting it) makes Review throw for real; the boundary renders, the shell
+> survives, and "Back to live" returns to a working canvas.
+>
+> ALSO SHIPPED: the pitch's four corners moved out of the bundle into per-session config
+> ([ADR-0019 amendment](../decisions/0019-age-banded-zones-session-config.md)), validated on both sides —
+> a 426-quad differential run (both hemispheres, 78°N, the antimeridian, 400 random quads) found zero
+> disagreements between the server and client validators; off-pitch players pinned to the canvas edge with
+> a distinct marker and the word "off pitch" in the accessible mirror, instead of being clipped into
+> invisibility while the HUD counted them; deadlines on every client read; retries that actually re-fetch;
+> 44 px touch targets; and a four-value client beacon
+> ([ADR-0024](../decisions/0024-client-reliability-signals.md)) so a dark tablet is visible from `/metrics`.
+>
+> The six-lens checker pass (browser probes, a stopped server, host-run repros) confirmed **10 defects** in
+> the first cut — one refuted — every one fixed and re-verified:
+> - **The clock estimator was fed by telemetry**, whose `serverTs` since Phase 4 may be a replayed fix's GPS
+>   time. A page loading while a tracker drained a backlog would have inferred an offset of HOURS and then
+>   rendered stale positions as live dots — ADR-0018's honesty rule failing in its dangerous direction. Fixed
+>   with a new `{event:'hello'}` envelope (the server's clock, first frame on every socket) plus `.../status`
+>   as the only sources; telemetry is now excluded by design, and a test pins the consequence it prevents.
+> - **A silent stall left the view saying "live" forever** — the commonest field failure of all (walk behind
+>   the clubhouse; the AP drops the flow) produces no close event, so the socket stayed OPEN, the phase
+>   stayed 'live', and BOTH new recovery paths were explicit no-ops there. A watchdog now treats 15 s of
+>   silence on a socket that had been carrying data as death. The first version of that watchdog *called
+>   `close()` and waited for `onclose`* — measured against a SIGSTOPped server, that event did not arrive
+>   for 40 s while the banner still read "connected". It now detaches the socket and drives the reconnect
+>   itself; a SIGSTOP e2e case pins it.
+> - **The fetch deadline bounded only the response HEADERS.** `fetch()` resolves before the body streams, so
+>   every `await res.json()` was unbounded — the exact indefinite hang the module's own docstring claimed to
+>   fix, and the likelier shape for a multi-packet `/history` page. The body is now read inside the deadline.
+> - **8 s was the wrong deadline for a scan**, justified by a comment claiming a server-side scan-time cap
+>   that does not exist: a legitimate long review read was aborted and shown as a failure that every retry
+>   reproduced, while the abandoned scan kept its shared off-loop slot. Scans now get 30 s; small reads keep 8.
+> - **The simulator's pitch was 7.1 km from the client's fallback**, so every hardware-free run rendered the
+>   whole fleet off-pitch — invisible before this phase, an edge full of markers after it. The simulator now
+>   publishes its own corners through the session config (so every run also exercises that path), and a new
+>   live-spec assertion fails if any tracked player renders off-pitch.
+> - **One transient `/config` failure stranded the coach for the whole match** on U14 defaults and the
+>   placeholder pitch, with the footer *positively asserting* no pitch was measured. The hook now retries with
+>   backoff and reports an explicit `error` status the footer distinguishes from "none configured". (Its
+>   documented "last-good retention" was dead code — with one fetch per session it could never fire; removed.)
+> - Smaller, each reproduced: the beacon's rate-limit map had no sweep and is IP-keyed for the anonymous
+>   principal (unlike `/roster`, which requires a login) — now swept like the ingest buckets; an `online`-
+>   triggered reconnect was counted as `ws_manual_retry`, which would have made a healthy Wi-Fi flap read as
+>   a UX failure in the one metric ADR-0024 defines as "a coach had to intervene"; the reconnect button was
+>   offered during the FIRST connect (`shouldOfferReconnect`, now one rule with its own unit gate); the
+>   accessible mirror rebuilt its homography on every 1 Hz render; the bundle guard advertised a child-name
+>   check it did not perform (now performed); and the timer-leak test could not fail — deleting
+>   `clearTimeout` left it green — now it watches the timer itself.
+>
+> The one REFUTED claim: that Review's default window is computed from an inert estimator. The verifier
+> showed the feeder does exist — and the `hello` frame makes the estimate available from the moment the
+> socket opens, before Review can be reached.
+
 ### Phase 6 — Operability
 Graceful shutdown + exec-form PID 1 · compose healthcheck on `/health` · log rotation · migrations via
 `user_version` · `VACUUM INTO` backup with erasure-aware rotation · `deploy/production/compose.yml`

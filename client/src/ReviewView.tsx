@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { applyHomography, computeHomography, type Pt } from './homography';
-import { makeProjector } from './geo';
-import { PITCH_CORNERS } from './config';
+import { makeProjector, type LatLon } from './geo';
+import { serverNow } from './serverClock';
 import { ZONE_LABEL, ZONE_COLOR, type Zone } from './zones';
 import type { ZoneThresholds } from './types';
 import {
@@ -18,8 +18,9 @@ import { EventTimeline } from './EventTimeline';
 /**
  * Phase 3 (ADR-0017): the review/replay shell — "one renderer, two modes". A coach picks a recorded
  * window, sees per-player aggregates + an occupancy heatmap, then optionally scrubs one player's raw
- * trace. It shares the live view's pitch geometry (the homography from PITCH_CORNERS via the imported
- * helpers — NOT duplicated maths, NOT a second PitchCanvas) so review dots land where live dots did.
+ * trace. It shares the live view's pitch geometry (the SAME `corners` prop the live canvas draws with —
+ * this session's measured pitch since Phase 5, else the built-in fallback — via the imported helpers,
+ * NOT duplicated maths and NOT a second PitchCanvas) so review dots land where live dots did.
  *
  * Security posture (§0.1 / §0.2):
  *   - Names are render-only. `roster` (playerId → displayName) is joined at draw time via
@@ -41,6 +42,9 @@ interface ReviewViewProps {
   roster: Map<string, string>;
   /** Session speed-zone thresholds (Phase 4) — fetched config or U14 defaults; shown as panel provenance. */
   thresholds: ZoneThresholds;
+  /** The pitch's four GPS corners (Phase 5) — the same ones the live canvas uses, so review dots land
+   *  in the same box live dots did. */
+  corners: LatLon[];
   theme: Theme;
   reducedMotion: boolean;
 }
@@ -96,21 +100,40 @@ const DEFAULT_WINDOW_MS = 90 * 60 * 1_000;
  */
 const RAW_MAX_FIXES = 200_000;
 
-export function ReviewView({ session, roster, thresholds, theme, reducedMotion }: ReviewViewProps) {
+export function ReviewView({ session, roster, thresholds, corners, theme, reducedMotion }: ReviewViewProps) {
+  // DEV-ONLY crash switch (Phase 5). It exists so the e2e gate can prove that a REAL throw in here is
+  // caught by Review's own boundary and leaves the shell standing — a mocked failure would prove
+  // nothing about the boundary that actually ships. `import.meta.env.DEV` is statically replaced at
+  // build time, so this whole branch is dead-code-eliminated from a production bundle; `bun run
+  // guard:bundle` (a client-ci step) fails the build if the token survives into dist/.
+  // (`globalThis.location`, not `window.location`: this component binds a local `window` — the review
+  // time window — a few lines below, which shadows the global for the whole function scope.)
+  if (import.meta.env.DEV && new URLSearchParams(globalThis.location.search).has('__crash_review')) {
+    throw new Error('induced review crash (e2e)');
+  }
+
   // --- Window picker: default to "now − 90 min … now", editable via two datetime-local inputs. ---
-  const [from, setFrom] = useState(() => Date.now() - DEFAULT_WINDOW_MS);
-  const [to, setTo] = useState(() => Date.now());
+  // serverNow(), not Date.now(): the window is compared against SERVER-stamped rows, so a tablet whose
+  // clock is minutes off would default to a window that misses the fixes just recorded (audit C-1).
+  const [from, setFrom] = useState(() => serverNow() - DEFAULT_WINDOW_MS);
+  const [to, setTo] = useState(() => serverNow());
   // The committed window the queries actually use — only updated on "Apply" so dragging a field doesn't
   // fire a fetch per keystroke (and an invalid intermediate from>to never reaches the server).
   const [window, setWindow] = useState<{ from: number; to: number }>(() => ({ from, to }));
   const windowValid = to > from;
+
+  // Phase 5 (audit §6 "Client"): a retry that actually retries. Re-pressing "Apply" with the same
+  // window changed no dependency, so nothing re-fetched — the copy said "try again" while the button
+  // did nothing. Bumping this nonce re-runs the reads with identical parameters.
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const retry = () => setReloadNonce((n) => n + 1);
 
   // --- Aggregate query: re-fetched whenever the committed window changes. ---
   const aggQuery = useMemo(
     () => ({ from: window.from, to: window.to, mode: 'aggregate' as const }),
     [window],
   );
-  const aggResult = useHistory(session, aggQuery);
+  const aggResult = useHistory(session, aggQuery, reloadNonce);
 
   // --- Replay selection: a playerId (or null = no replay) + the scrubber's virtual-now. ---
   const [replayPlayer, setReplayPlayer] = useState<string | null>(null);
@@ -151,26 +174,30 @@ export function ReviewView({ session, roster, thresholds, theme, reducedMotion }
         nameOf={nameOf}
         palette={palette}
         thresholds={thresholds}
+        corners={corners}
         replayPlayer={replayPlayer}
         onPickReplay={setReplayPlayer}
+        onRetry={retry}
       />
 
       {/* Tactical events (ADR-0020): movement-derived phases over the committed window. Team-aggregate (no
           identity); honestly labelled heuristics, never ground truth. Shares the window the aggregate uses. */}
-      <EventTimeline session={session} window={window} theme={theme} />
+      <EventTimeline session={session} window={window} theme={theme} reloadNonce={reloadNonce} onRetry={retry} />
 
       {/* On-demand raw replay: only mounted once a player is chosen, so we don't fetch raw pages until
           the coach asks for them (children's raw location is the most sensitive read — §0.7). */}
       {replayPlayer ? (
         <ReplaySection
-          key={`${session}:${window.from}:${window.to}:${replayPlayer}`}
+          key={`${session}:${window.from}:${window.to}:${replayPlayer}:${reloadNonce}`}
           session={session}
           window={window}
           playerId={replayPlayer}
           name={nameOf(replayPlayer)}
           palette={palette}
+          corners={corners}
           reducedMotion={reducedMotion}
           onClose={() => setReplayPlayer(null)}
+          onRetry={retry}
         />
       ) : null}
     </section>
@@ -247,24 +274,30 @@ function AggregateSection({
   nameOf,
   palette,
   thresholds,
+  corners,
   replayPlayer,
   onPickReplay,
+  onRetry,
 }: {
   result: ReturnType<typeof useHistory>;
   nameOf: (playerId: string) => string;
   palette: ReviewPalette;
   thresholds: ZoneThresholds;
+  corners: LatLon[];
   replayPlayer: string | null;
   onPickReplay: (playerId: string) => void;
+  onRetry: () => void;
 }) {
   // Fail-closed narration: each non-ok status is explicit text, never a blank pitch (§0.2).
   if (result.status === 'loading') {
     return <Panel>Loading match summary…</Panel>;
   }
   if (result.status === 'error') {
+    // The button is the "try again" — before Phase 5 this panel told the coach to retry via Apply,
+    // which with an unchanged window did nothing at all.
     return (
-      <Panel tone="bad">
-        Couldn&rsquo;t load the match summary. Check the time window and try again.
+      <Panel tone="bad" onRetry={onRetry}>
+        Couldn&rsquo;t load the match summary. The server may be busy, or the window may be too wide.
       </Panel>
     );
   }
@@ -300,7 +333,7 @@ function AggregateSection({
           alignItems: 'flex-start',
         }}
       >
-        <Heatmap heatmap={data.heatmap} palette={palette} />
+        <Heatmap heatmap={data.heatmap} palette={palette} corners={corners} />
         <div style={{ flex: '1 1 320px', minWidth: 280 }}>
           <AggregateTable
             data={data}
@@ -463,7 +496,15 @@ function effortText(effort: AggregatePlayer['effort']): string {
 // Heatmap — occupancy grid drawn on the SAME pitch geometry as PitchCanvas (reused homography helpers)
 // ---------------------------------------------------------------------------------------------------
 
-function Heatmap({ heatmap, palette }: { heatmap: HeatmapData; palette: ReviewPalette }) {
+function Heatmap({
+  heatmap,
+  palette,
+  corners,
+}: {
+  heatmap: HeatmapData;
+  palette: ReviewPalette;
+  corners: LatLon[];
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -486,8 +527,8 @@ function Heatmap({ heatmap, palette }: { heatmap: HeatmapData; palette: ReviewPa
     // Geometry — identical construction to PitchCanvas: project the four corners once, then solve the
     // homography for the responsive dst rectangle on each resize. We reuse computeHomography/applyHomography
     // and makeProjector verbatim so review pixels and live pixels agree exactly (ADR-0017 "one renderer").
-    const project = makeProjector(PITCH_CORNERS[0]);
-    const srcM = PITCH_CORNERS.map(project);
+    const project = makeProjector(corners[0]);
+    const srcM = corners.map(project);
     let cssW = 0;
     let cssH = 0;
     let dst: Pt[] = [];
@@ -534,7 +575,10 @@ function Heatmap({ heatmap, palette }: { heatmap: HeatmapData; palette: ReviewPa
     });
     ro.observe(container);
     return () => ro.disconnect();
-  }, []);
+    // `corners` is a real dependency (Phase 5): the pitch geometry is baked into the homography built
+    // above, so a session config that resolves AFTER this mounted must rebuild it — otherwise review
+    // dots would keep landing in the fallback box while the live view had already moved to the real one.
+  }, [corners]);
 
   // Repaint on a heatmap/palette change without rebuilding geometry.
   useEffect(() => {
@@ -631,16 +675,20 @@ function ReplaySection({
   playerId,
   name,
   palette,
+  corners,
   reducedMotion,
   onClose,
+  onRetry,
 }: {
   session: string;
   window: { from: number; to: number };
   playerId: string;
   name: string;
   palette: ReviewPalette;
+  corners: LatLon[];
   reducedMotion: boolean;
   onClose: () => void;
+  onRetry: () => void;
 }) {
   // Accumulate raw pages into one in-memory trace (capped). `cursor` advances the keyset paging; null
   // once we've requested the first page with no cursor and again means "done" via nextCursor === null.
@@ -709,7 +757,9 @@ function ReplaySection({
       </div>
 
       {errored ? (
-        <Panel tone="bad">Couldn&rsquo;t load this player&rsquo;s replay. Try again.</Panel>
+        <Panel tone="bad" onRetry={onRetry}>
+          Couldn&rsquo;t load this player&rsquo;s replay.
+        </Panel>
       ) : emptyDone ? (
         <Panel>No recorded positions for this player in the window.</Panel>
       ) : loading ? (
@@ -717,6 +767,7 @@ function ReplaySection({
       ) : (
         <>
           <ReplayCanvas
+            corners={corners}
             fixes={fixes}
             virtualNow={virtualNow}
             palette={palette}
@@ -781,12 +832,14 @@ function Scrubber({
  * live canvas (and the heatmap) so the replayed dot lands where the live dot did.
  */
 function ReplayCanvas({
+  corners,
   fixes,
   virtualNow,
   palette,
   reducedMotion,
   label,
 }: {
+  corners: LatLon[];
   fixes: RawFix[];
   virtualNow: number;
   palette: ReviewPalette;
@@ -816,8 +869,8 @@ function ReplayCanvas({
     const ctx = canvas.getContext('2d')!;
 
     // Same geometry construction as PitchCanvas / Heatmap (reused helpers, not duplicated maths).
-    const project = makeProjector(PITCH_CORNERS[0]);
-    const srcM = PITCH_CORNERS.map(project);
+    const project = makeProjector(corners[0]);
+    const srcM = corners.map(project);
     let cssW = 0;
     let cssH = 0;
     let dst: Pt[] = [];
@@ -904,7 +957,10 @@ function ReplayCanvas({
     });
     ro.observe(container);
     return () => ro.disconnect();
-  }, []);
+    // `corners` is a real dependency (Phase 5): the pitch geometry is baked into the homography built
+    // above, so a session config that resolves AFTER this mounted must rebuild it — otherwise review
+    // dots would keep landing in the fallback box while the live view had already moved to the real one.
+  }, [corners]);
 
   // Redraw imperatively on any input change (scrubber, new pages, theme) — no rAF treadmill.
   useEffect(() => {
@@ -967,9 +1023,18 @@ function drawPitchLines(ctx: CanvasRenderingContext2D, dst: Pt[], pal: ReviewPal
 // Small shared UI bits (dark-palette panels, controls) — match App.tsx's control styling feel
 // ---------------------------------------------------------------------------------------------------
 
-function Panel({ children, tone }: { children: React.ReactNode; tone?: 'bad' }) {
+function Panel({
+  children,
+  tone,
+  onRetry,
+}: {
+  children: React.ReactNode;
+  tone?: 'bad';
+  /** Phase 5: when given, the panel carries a real retry — a button that re-runs the failed read. */
+  onRetry?: () => void;
+}) {
   return (
-    <p
+    <div
       // role=alert only for the error tone so a screen reader announces a failed read (fail closed = loud).
       role={tone === 'bad' ? 'alert' : undefined}
       style={{
@@ -980,10 +1045,20 @@ function Panel({ children, tone }: { children: React.ReactNode; tone?: 'bad' }) 
         background: '#16181d',
         color: tone === 'bad' ? '#ff8d8d' : '#e8e8e8',
         opacity: tone === 'bad' ? 1 : 0.8,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: 12,
+        flexWrap: 'wrap',
       }}
     >
-      {children}
-    </p>
+      <span>{children}</span>
+      {onRetry ? (
+        <button type="button" onClick={onRetry} style={buttonStyle(false, false)}>
+          Try again
+        </button>
+      ) : null}
+    </div>
   );
 }
 
@@ -997,7 +1072,8 @@ const fieldLabelStyle: React.CSSProperties = {
 function inputStyle(theme: Theme): React.CSSProperties {
   return {
     fontSize: 13,
-    padding: '4px 8px',
+    minHeight: TOUCH_TARGET_PX,
+    padding: '0 10px',
     borderRadius: 8,
     border: '1px solid #2a2d33',
     background: theme === 'outdoor' ? '#111' : '#0e0f12',
@@ -1006,11 +1082,17 @@ function inputStyle(theme: Theme): React.CSSProperties {
   };
 }
 
+// 44 px minimum (WCAG 2.5.5; audit §6 "Client": targets were ~24-25 px). Every control here is
+// pressed on a tablet at the side of a pitch — see the same constant in App.tsx.
+const TOUCH_TARGET_PX = 44;
+
 function buttonStyle(active: boolean, disabled: boolean): React.CSSProperties {
   return {
     cursor: disabled ? 'not-allowed' : 'pointer',
-    fontSize: 12,
-    padding: '4px 10px',
+    fontSize: 13,
+    minHeight: TOUCH_TARGET_PX,
+    minWidth: TOUCH_TARGET_PX,
+    padding: '0 14px',
     borderRadius: 8,
     border: '1px solid #2a2d33',
     background: active ? '#ffdf2b' : '#16181d',

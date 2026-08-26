@@ -42,6 +42,18 @@ const fixture = (json: string): string => {
 let passed = 0;
 const ok = (msg: string) => { passed++; console.log(`  ok: ${msg}`); };
 
+// A synthetic ~105 x 68 m pitch, expressed in metre offsets from one base point so the geometry
+// assertions below read in metres rather than in opaque decimal degrees. Corner order is the
+// on-screen one the client draws with: TL, TR, BR, BL (north is UP, so "bottom" corners are south).
+const BASE = { lat: 44.812806, lon: 20.460535 };
+const M_PER_DEG_LAT = 111_320;
+const M_PER_DEG_LON = M_PER_DEG_LAT * Math.cos((BASE.lat * Math.PI) / 180);
+const pt = (east: number, north: number) => ({
+  lat: BASE.lat + north / M_PER_DEG_LAT,
+  lon: BASE.lon + east / M_PER_DEG_LON,
+});
+const PITCH = [pt(0, 0), pt(105, 0), pt(105, -68), pt(0, -68)];
+
 try {
   // --- 1. valid file: 2 sessions, each a recognised band -> exact shape -------------------------------
   {
@@ -50,8 +62,9 @@ try {
     }));
     const m = await loadSessionConfig(f);
     assert(m.size === 2, `valid file should load 2 sessions, got ${m.size}`);
-    assert(m.get('s1') === 'U12', `s1 band must round-trip as U12, got ${m.get('s1')}`);
-    assert(m.get('s2') === 'U19', `s2 band must round-trip as U19, got ${m.get('s2')}`);
+    assert(m.get('s1')?.ageBand === 'U12', `s1 band must round-trip as U12, got ${m.get('s1')?.ageBand}`);
+    assert(m.get('s2')?.ageBand === 'U19', `s2 band must round-trip as U19, got ${m.get('s2')?.ageBand}`);
+    assert(m.get('s1')?.pitchCorners === undefined, 'a band-only entry carries no pitch');
     ok('valid 2-session file -> exact sessions/bands');
   }
 
@@ -107,7 +120,7 @@ try {
     }));
     const m = await loadSessionConfig(f);
     assert(m.size === 1, `only the 1 valid entry should survive, got ${m.size}`);
-    assert(m.get('s4') === 'U16', 'the valid s4/U16 entry must survive the drops');
+    assert(m.get('s4')?.ageBand === 'U16', 'the valid s4/U16 entry must survive the drops');
     assert(!m.has('s1') && !m.has('s2') && !m.has('s3'), 'invalid-band entries must be dropped');
     ok('invalid ageBand entries dropped; valid survives (per-entry fail closed)');
   }
@@ -118,12 +131,53 @@ try {
     BANDS.forEach((b, i) => { sessions[`s${i}`] = { ageBand: b }; });
     const m = await loadSessionConfig(fixture(JSON.stringify({ sessions })));
     assert(m.size === BANDS.length, `all ${BANDS.length} valid bands should load, got ${m.size}`);
-    BANDS.forEach((b, i) => assert(m.get(`s${i}`) === b, `s${i} must round-trip as ${b}`));
+    BANDS.forEach((b, i) => assert(m.get(`s${i}`)?.ageBand === b, `s${i} must round-trip as ${b}`));
     ok(`all 4 valid bands accepted (${BANDS.join(', ')})`);
   }
 
+  // --- 8. PHASE 5 (audit §6 "Client"): the pitch corners now live in this file --------------------------
+  // They used to be a compile-time constant in the bundle — and the committed value pointed at a bench in
+  // Belgrade, so EVERY real pitch mapped to the wrong box. A valid four-corner entry must load intact.
+  {
+    const f = fixture(JSON.stringify({
+      sessions: { s1: { ageBand: 'U12', pitch: { corners: PITCH } } },
+    }));
+    const m = await loadSessionConfig(f);
+    assert(m.size === 1, `configured pitch session should load, got ${m.size}`);
+    const e = m.get('s1');
+    assert(e?.ageBand === 'U12', 'band still loads alongside a pitch');
+    assert(e?.pitchCorners?.length === 4, `pitch must carry 4 corners, got ${e?.pitchCorners?.length}`);
+    assert(e!.pitchCorners![2].lat === PITCH[2].lat, 'corner order must be preserved (TL,TR,BR,BL)');
+    ok('a valid pitch loads alongside the band, corner order preserved');
+  }
+
+  // --- 9. an unusable pitch drops the PITCH ONLY — the band survives -----------------------------------
+  // Fail-closed here means "fall back to the built-in corners", not "lose the session's age band": a
+  // degenerate quad would otherwise throw inside the client's homography solve and white-screen the view.
+  {
+    const cases: Array<[string, unknown]> = [
+      ['not an object', { corners: 'nope' }],
+      ['three corners', { corners: PITCH.slice(0, 3) }],
+      ['five corners', { corners: [...PITCH, PITCH[0]] }],
+      ['non-finite lat', { corners: [{ lat: 'x', lon: 20.5 }, ...PITCH.slice(1)] }],
+      ['out-of-range lat', { corners: [{ lat: 91, lon: 20.5 }, ...PITCH.slice(1)] }],
+      ['coincident corners', { corners: [PITCH[0], PITCH[0], PITCH[2], PITCH[3]] }],
+      ['collinear corners', { corners: [pt(0, 0), pt(50, 0), pt(105, 0), pt(0, -68)] }],
+      ['bow-tie order', { corners: [pt(0, 0), pt(105, -68), pt(105, 0), pt(0, -68)] }],
+      ['implausibly small', { corners: [pt(0, 0), pt(4, 0), pt(4, -4), pt(0, -4)] }],
+      ['implausibly large', { corners: [pt(0, 0), pt(400, 0), pt(400, -68), pt(0, -68)] }],
+    ];
+    for (const [why, pitch] of cases) {
+      const m = await loadSessionConfig(fixture(JSON.stringify({ sessions: { s1: { ageBand: 'U16', pitch } } })));
+      assert(m.get('s1')?.ageBand === 'U16', `${why}: the band must survive a bad pitch`);
+      assert(m.get('s1')?.pitchCorners === undefined, `${why}: an unusable pitch must be dropped`);
+    }
+    ok(`${cases.length} unusable pitch shapes dropped, band preserved (fail closed to built-in corners)`);
+  }
+
   console.log(`\n✅ SESSION-CONFIG-LOADER UNIT PASSED — ${passed} cases: fail-closed on missing/oversized/`
-    + `malformed/no-sessions, per-entry drop for an invalid ageBand, and all four valid bands accepted`);
+    + `malformed/no-sessions, per-entry drop for an invalid ageBand, all four valid bands accepted, and`
+    + ` an unusable pitch dropped without losing the band`);
   rmSync(dir, { recursive: true, force: true });
   process.exit(0);
 } catch (err) {

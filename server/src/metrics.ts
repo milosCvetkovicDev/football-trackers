@@ -355,7 +355,25 @@ export const metrics = {
   configRequests: registry.register(
     new Counter(
       'ft_config_requests_total',
-      'GET /sessions/:id/config requests by result (ok|unauthorized|forbidden|bad_session|forbidden_origin) — Phase 4 age band',
+      'GET /sessions/:id/config requests by result (ok|unauthorized|forbidden|bad_session|forbidden_origin) — Phase 4 age band + Phase 5 pitch corners',
+    ),
+  ),
+  // --- client beacon (Phase 5; audit §6 "Client": no client observability) ---
+  // THE ONLY METRIC SOURCED FROM THE BROWSER. `kind` is a CLOSED four-value vocabulary validated at the
+  // route (server.ts BEACON_KINDS) — cardinality is fixed at four by construction, and an unrecognised
+  // value is refused with a 400 rather than admitted as a new series (audit S-5). NEVER a session or
+  // player label: which sessions have a struggling tablet is not a question /metrics should answer to
+  // whoever can scrape it, and it would reintroduce the enumeration oracle the other routes avoid.
+  clientEvents: registry.register(
+    new Counter(
+      'ft_client_events_total',
+      'Coach-view failures reported by the browser, by kind (ws_gave_up|ws_manual_retry|render_error|fetch_timeout) — alert on ws_gave_up during a session',
+    ),
+  ),
+  beaconRequests: registry.register(
+    new Counter(
+      'ft_client_beacon_requests_total',
+      'POST /sessions/:id/client-beacon requests by result (ok|unauthorized|forbidden|bad_session|forbidden_origin|bad_kind|rate_limited|too_large|bad_json|unsupported_media_type)',
     ),
   ),
   // --- tactical event detection (Track A; ADR-0020 / event-detection-contract) ---

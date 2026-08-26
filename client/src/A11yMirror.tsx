@@ -6,6 +6,9 @@ import { describeConnection, playerFreshness, deviceHealthLevel } from './contra
 import { DROP_MS } from './config';
 import { speedZone, ZONE_LABEL, ZONE_COLOR, type Zone } from './zones';
 import { useReducedMotion } from './hooks/useReducedMotion';
+import { makePitchFrame, type PitchFrame } from './pitchFrame';
+import { serverNow } from './serverClock';
+import type { LatLon } from './geo';
 
 interface Props {
   store: RefObject<Map<string, Telemetry>>;
@@ -18,6 +21,9 @@ interface Props {
   roster: Map<string, string>;
   /** Session speed-zone thresholds (Phase 4) — fetched config or U14 defaults; classify the Zone column. */
   thresholds: ZoneThresholds;
+  /** The pitch's four GPS corners (Phase 5) — the SAME ones the canvas draws with, so "off pitch"
+   *  here and the edge-pinned marker there are one decision, not two that can drift apart. */
+  corners: LatLon[];
 }
 
 /** A lightweight, render-friendly row — decoupled from the full Telemetry the ref holds. */
@@ -36,6 +42,9 @@ interface PlayerRow {
   distM: number | null;
   /** Phase-4 distance per active minute (null when there's no distance / not enough span yet). */
   distPerMin: number | null;
+  /** Phase-5: outside the pitch rectangle (beyond the GNSS-noise margin) — the canvas pins these to
+   *  its edge instead of clipping them away, and this column says so in words. */
+  offPitch: boolean;
 }
 
 /** How often we sample the ref into React state — the table is glanceable, not a 10 Hz feed. */
@@ -80,17 +89,30 @@ function gpsText(h: DeviceHealth | null): string {
  * It reads the same ref the rAF loop draws from, but on a 1 Hz timer (NOT per frame) so it
  * never adds React churn to the render hot path.
  */
-export function A11yMirror({ store, health, dist, conn, roster, thresholds }: Props) {
+export function A11yMirror({ store, health, dist, conn, roster, thresholds, corners }: Props) {
   const reducedMotion = useReducedMotion();
   const [rows, setRows] = useState<PlayerRow[]>([]);
   // Mirror thresholds into a ref (exactly like PitchCanvas) so the 1 Hz sampler reads the latest band
   // without re-running its effect — keeping the effect deps the stable refs only, as before.
   const thresholdsRef = useRef(thresholds);
   thresholdsRef.current = thresholds;
+  // The pitch frame is rebuilt ONLY when the corners change (it solves a homography), and mirrored into
+  // a ref so the 1 Hz sampler reads the current one without re-running its effect. Built lazily rather
+  // than as `useRef(makePitchFrame(corners))`: a useRef argument is evaluated on EVERY render even
+  // though only the first is kept, and this component re-renders once a second.
+  const frameRef = useRef<PitchFrame | null>(null);
+  const cornersKey = corners.map((c) => `${c.lat},${c.lon}`).join(';');
+  const lastCornersKey = useRef('');
+  if (frameRef.current === null || lastCornersKey.current !== cornersKey) {
+    lastCornersKey.current = cornersKey;
+    frameRef.current = makePitchFrame(corners);
+  }
 
   useEffect(() => {
     const sample = () => {
-      const now = Date.now();
+      // serverNow(), not Date.now() — the same clock correction the canvas uses (audit C-1), so the
+      // table and the pitch can never disagree about whether a player is fresh.
+      const now = serverNow();
       const thr = thresholdsRef.current;
       const next: PlayerRow[] = [];
       for (const t of store.current.values()) {
@@ -121,6 +143,7 @@ export function A11yMirror({ store, health, dist, conn, roster, thresholds }: Pr
           zone: speedZone(t.spd, thr),
           distM,
           distPerMin,
+          offPitch: frameRef.current!.isOffPitch(t.lat, t.lon),
         });
       }
       // Stable order so the table doesn't reshuffle on the screen reader between samples.
@@ -265,6 +288,9 @@ export function A11yMirror({ store, health, dist, conn, roster, thresholds }: Pr
                         {FRESHNESS_GLYPH[r.freshness]}
                       </span>
                       {r.freshness}
+                      {/* Phase 5: the canvas pins an off-pitch player to its edge with a distinct
+                          diamond; here the same fact is a WORD, so it is never shape-only. */}
+                      {r.offPitch ? ' · off pitch' : ''}
                     </td>
                     <td style={{ ...td, textAlign: 'right' }}>{r.spd.toFixed(1)}</td>
                     <td style={{ ...td, textAlign: 'right' }}>{(r.ageMs / 1000).toFixed(1)}</td>

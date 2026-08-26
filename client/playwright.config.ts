@@ -93,6 +93,14 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'], deviceScaleFactor: 2 },
     },
     {
+      // Phase 5 (audit C-1/C-2 + §6): clock skew, reconnect recovery, the Review error boundary and
+      // touch targets. Spins its OWN restartable stack via fixtures.ts (withRestartableStack) —
+      // it KILLS AND RESTARTS a server, which no shared stack could survive.
+      name: 'reliability',
+      testMatch: /reliability\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'], deviceScaleFactor: 2 },
+    },
+    {
       name: 'frame-budget',
       testMatch: /frame-budget\.spec\.ts/,
       use: { ...devices['Desktop Chrome'], deviceScaleFactor: 2 },

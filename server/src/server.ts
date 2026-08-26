@@ -46,7 +46,7 @@ import {
   type Principal,
 } from './auth';
 import { initRoster, rosterFor, rosterSessionIds } from './roster';
-import { initSessionConfig, ageBandFor, thresholdsFor, configuredSessionIds } from './sessionConfig';
+import { initSessionConfig, ageBandFor, thresholdsFor, configuredSessionIds, pitchCornersFor } from './sessionConfig';
 import {
   validateHistoryParams,
   readHistory,
@@ -132,14 +132,21 @@ function clientIp(request: Request, server: { requestIP?: (r: Request) => { addr
   return sockIp ?? 'unknown';
 }
 
-/** Content-type + size guards BEFORE JSON.parse — the login body is untrusted and unauthenticated. */
+/**
+ * Content-type + size guards BEFORE JSON.parse — the login body is untrusted and unauthenticated.
+ *
+ * @param maxBytes per-endpoint cap. The default suits the /auth bodies; the client beacon passes a much
+ *   tighter one, because its whole legitimate body is ~30 bytes and there is no reason to READ more of
+ *   an unrecognised payload than the endpoint can possibly use.
+ */
 async function readJsonBody(
   request: Request,
+  maxBytes: number = MAX_BODY_BYTES,
 ): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; status: number; error: string }> {
   const ct = (request.headers.get('content-type') ?? '').toLowerCase();
   if (!ct.includes('application/json')) return { ok: false, status: 415, error: 'unsupported_media_type' };
   const len = Number(request.headers.get('content-length') ?? '0');
-  if (Number.isFinite(len) && len > MAX_BODY_BYTES) return { ok: false, status: 413, error: 'too_large' };
+  if (Number.isFinite(len) && len > maxBytes) return { ok: false, status: 413, error: 'too_large' };
   let txt: string;
   try {
     txt = await request.text();
@@ -148,7 +155,7 @@ async function readJsonBody(
   }
   // Authoritative size check on BYTE length (Content-Length can be absent/forged, and txt.length counts
   // UTF-16 code units — a multibyte body could slip past a code-unit cap).
-  if (Buffer.byteLength(txt, 'utf8') > MAX_BODY_BYTES) return { ok: false, status: 413, error: 'too_large' };
+  if (Buffer.byteLength(txt, 'utf8') > maxBytes) return { ok: false, status: 413, error: 'too_large' };
   try {
     const parsed = JSON.parse(txt);
     if (!parsed || typeof parsed !== 'object') return { ok: false, status: 400, error: 'bad_json' };
@@ -205,6 +212,47 @@ function rosterRateOk(key: string): boolean {
     rosterBuckets.set(key, b);
   }
   b.tokens = Math.min(ROSTER_RATE_BURST, b.tokens + ((now - b.last) / 60_000) * ROSTER_RATE_PER_MIN);
+  b.last = now;
+  if (b.tokens < 1) return false;
+  b.tokens -= 1;
+  return true;
+}
+
+// Client beacon (Phase 5): the closed vocabulary the POST body's `kind` must belong to. MUST match
+// BEACON_KINDS in client/src/beacon.ts — a value outside this list is refused with a 400 and never
+// reaches the exposition, so the metric's cardinality is fixed at four by construction (audit S-5).
+const BEACON_KINDS: readonly string[] = ['ws_gave_up', 'ws_manual_retry', 'render_error', 'fetch_timeout'];
+/** The legitimate body is `{"kind":"ws_manual_retry"}` — ~30 bytes. Read no more than this. */
+const BEACON_MAX_BODY_BYTES = 256;
+
+// Per-principal token bucket for the beacon. Defaults are a MATCH-scale budget: the client throttles
+// each kind to one report per 30 s, so a legitimate tablet spends a handful per hour and only a broken
+// or hostile one ever reaches this limit.
+//
+// UNLIKE rosterBuckets this map IS SWEPT (checker finding). The roster's map is bounded by the account
+// count because /roster requires a named login; the beacon deliberately allows the ANONYMOUS principal
+// (a coach on the isolated-LAN bypass must be able to report that the live pitch broke), and the anon
+// key is the client IP — so every distinct source IP would otherwise add a permanent entry. Sweeping
+// buckets that have been idle long enough to have FULLY refilled is equivalent to recreating them, and
+// bounds the map to the clients actually reporting. Same rule and shape as ingest.ts's sweep.
+const BEACON_RATE_BURST = envNumber('BEACON_RATE_BURST', 20, { min: 1 });
+const BEACON_RATE_PER_MIN = envNumber('BEACON_RATE_PER_MIN', 10, { min: 1 });
+const beaconBuckets = new Map<string, { tokens: number; last: number }>();
+// Never sweep a bucket before it would have refilled completely, or an operator who lowered the cap
+// would be handing back a full burst on every sweep.
+const BEACON_BUCKET_IDLE_MS = Math.max(60_000, Math.ceil((BEACON_RATE_BURST / BEACON_RATE_PER_MIN) * 60_000));
+setInterval(() => {
+  const cutoff = Date.now() - BEACON_BUCKET_IDLE_MS;
+  for (const [k, b] of beaconBuckets) if (b.last < cutoff) beaconBuckets.delete(k);
+}, BEACON_BUCKET_IDLE_MS).unref?.();
+function beaconRateOk(key: string): boolean {
+  const now = Date.now();
+  let b = beaconBuckets.get(key);
+  if (!b) {
+    b = { tokens: BEACON_RATE_BURST, last: now };
+    beaconBuckets.set(key, b);
+  }
+  b.tokens = Math.min(BEACON_RATE_BURST, b.tokens + ((now - b.last) / 60_000) * BEACON_RATE_PER_MIN);
   b.last = now;
   if (b.tokens < 1) return false;
   b.tokens -= 1;
@@ -330,7 +378,69 @@ export function createApp() {
         }
         const ageBand = ageBandFor(params.id); // configured band or the U14 default (zones always resolve)
         metrics.configRequests.inc({ result: 'ok' });
-        return { sessionId: params.id, ageBand, thresholds: thresholdsFor(ageBand) };
+        // Phase 5 (audit §6 "Client"): the pitch's four GPS corners ride along when this session has a
+        // measured one — that is what replaces the compile-time PITCH_CORNERS in the client bundle. The
+        // key is OMITTED (not null) when there is none, so the client simply keeps its built-in corners.
+        // A corner is a PLACE, not a person: no name, no child position, so no `no-store` is needed here.
+        const corners = pitchCornersFor(params.id);
+        return corners
+          ? { sessionId: params.id, ageBand, thresholds: thresholdsFor(ageBand), pitch: { corners } }
+          : { sessionId: params.id, ageBand, thresholds: thresholdsFor(ageBand) };
+      })
+      // --- client beacon (Phase 5, audit §6 "Client": no client observability). The ONE write the coach
+      // view makes. Everything else this server measures stops at its own process boundary: a tablet that
+      // exhausts its reconnect budget, a review view that crashes into its error boundary, or a read that
+      // hits its deadline are all invisible here — /metrics stays green while the touchline sees nothing.
+      //
+      // MINIMISED BY CONSTRUCTION: the body is EXACTLY {kind} from a closed four-value vocabulary, so
+      // there is no free text to carry a child's name and no unbounded metric label (audit S-5). Session
+      // scope comes from the URL, so this reuses the SAME sessionGetGate as /roster and /config rather
+      // than inventing a second authz path. allowAnonymous: the anon principal owns the live pitch, so it
+      // must be able to report that the live pitch broke. STRICT Origin: this is a POST, and browsers
+      // always send Origin on POST, so an absent one means a non-browser caller.
+      .post('/sessions/:id/client-beacon', async ({ request, set, params, server }) => {
+        const origin = request.headers.get('origin') ?? undefined;
+        if (!originOkStrict(origin)) {
+          metrics.beaconRequests.inc({ result: 'forbidden_origin' });
+          set.status = 403;
+          return { error: 'forbidden_origin' };
+        }
+        const g = sessionGetGate(request, params.id, true);
+        if (!g.ok) {
+          metrics.beaconRequests.inc({ result: g.result });
+          set.status = g.status;
+          return g.status === 401 ? { authenticated: false } : { error: g.result };
+        }
+        // Per-principal bucket (anon keys by IP, like /roster) so one wedged tablet in a reconnect loop
+        // cannot flood the server it is already failing to reach.
+        const key = g.principal.username ?? clientIp(request, server);
+        if (!beaconRateOk(key)) {
+          metrics.beaconRequests.inc({ result: 'rate_limited' });
+          set.status = 429;
+          return { error: 'rate_limited' };
+        }
+        const parsed = await readJsonBody(request, BEACON_MAX_BODY_BYTES);
+        if (!parsed.ok) {
+          metrics.beaconRequests.inc({ result: parsed.error });
+          set.status = parsed.status;
+          return { error: parsed.error };
+        }
+        // Closed vocabulary AND no extra keys: an unknown kind, a non-string kind, or anything smuggled
+        // alongside is a 400. The rejected value is NEVER echoed back or logged — it is attacker-supplied
+        // text on a system whose one hard invariant is that no child's name is ever written down.
+        const keys = Object.keys(parsed.body);
+        const kind = parsed.body.kind;
+        if (keys.length !== 1 || keys[0] !== 'kind' || typeof kind !== 'string' || !BEACON_KINDS.includes(kind)) {
+          metrics.beaconRequests.inc({ result: 'bad_kind' });
+          set.status = 400;
+          return { error: 'bad_kind' };
+        }
+        metrics.clientEvents.inc({ kind });
+        metrics.beaconRequests.inc({ result: 'ok' });
+        // Audited by KIND + principal only — no session label on the metric, no body echo in the log.
+        log.info('client beacon', { kind, username: g.principal.username, session: params.id });
+        set.status = 204;
+        return null;
       })
       // --- history: review/replay source (ADR-0017). Off-the-live-loop paged read; per-principal rate limit +
       // concurrent-scan inflight cap (DoS bounds on a raw children's-location export); audit log; no-store.
@@ -498,6 +608,26 @@ export function createApp() {
           admitted.set(ws.data as object, admit);
           metrics.wsClients.inc({ session: capLabel('session', sessionId) });
           log.info('ws open', { session: sessionId, username: principal.username });
+
+          // Phase 5 (audit C-1): hand the client the SERVER's clock, once, immediately on connect.
+          //
+          // A match-day LAN has no NTP, so the coach's tablet and this server agree only by luck, and
+          // every freshness decision in the client compares its own `Date.now()` against a timestamp
+          // stamped here. The client estimates the offset from what it receives — and telemetry is NOT
+          // a safe source for that: since Phase 4 a replayed backlog fix carries its GPS time
+          // (`Math.min(gts, arrival)`, up to 6 h behind), so a page that loads while a tracker is
+          // draining a backlog would infer an offset of HOURS and then render stale fixes as live dots
+          // — the exact dishonesty ADR-0018 forbids. This frame, and the `.../status` envelope (also
+          // arrival-stamped, never backlogged), are the only clock sources the client trusts.
+          //
+          // Carries no child data at all: a clock reading and the session the socket is already on.
+          // An older client ignores an unknown `event` (parseLiveFrame returns null), so this is a
+          // backward-compatible addition to the wire.
+          try {
+            ws.send(JSON.stringify({ event: 'hello', data: { sessionId, serverTs: Date.now() } }));
+          } catch {
+            /* a socket that died between admit and here closes on its own; nothing to recover */
+          }
         },
         close(ws) {
           // Decrement/unregister ONLY for sockets we actually admitted (they have an Admit record), so the
@@ -592,6 +722,11 @@ for (const sid of ANON_SESSIONS) seedLabel('session', sid);
 for (const sid of rosterSessionIds()) seedLabel('session', sid);
 for (const sid of configuredSessionIds()) seedLabel('session', sid);
 for (const sid of accountSessionIds()) seedLabel('session', sid);
+
+// Present-at-0 for the client-beacon kinds (Phase 5), like the retention counter: a series that only
+// appears the first time it happens has no baseline, so `increase(...[15m]) > 0` cannot fire on the
+// very occurrence that matters most — a coach's view going dark mid-match.
+for (const kind of BEACON_KINDS) metrics.clientEvents.inc({ kind }, 0);
 
 // Bound the raw-fix store in time (children's location must not linger). See ADR-0010.
 startRetention();
