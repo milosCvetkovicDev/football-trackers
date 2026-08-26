@@ -9,7 +9,7 @@ import {
   PDOP_MAX,
 } from './config';
 import { parseLiveFrame } from './ws/validate';
-import { noteServerTime } from './serverClock';
+import { noteServerTime, clockSampleFrom } from './serverClock';
 import { sendBeacon } from './beacon';
 
 // Earth mean radius (m) for the haversine below. Matches metric-definitions §2.1; over a ~105x68 m pitch
@@ -324,11 +324,9 @@ export function useLiveTelemetry(
         // offset of HOURS — and then draw hours-old positions as live dots, the precise dishonesty
         // ADR-0018 forbids. `hello` (the server's clock, sent once on connect) and `status` (stamped
         // at arrival, never backlogged) cannot carry an event time, so only those two feed it.
-        if (frame.kind === 'hello') {
-          noteServerTime(frame.data.serverTs);
-          return; // no store, no liveness — a hello is not data from a tracker
-        }
-        if (frame.kind === 'status') noteServerTime(frame.data.serverTs);
+        const sample = clockSampleFrom(frame); // null for telemetry — the rule lives in serverClock.ts
+        if (sample !== null) noteServerTime(sample);
+        if (frame.kind === 'hello') return; // no store, no liveness — a hello is not data from a tracker
 
         // DATA LIVENESS (audit C-2, checker): the socket being OPEN is not the same as the feed
         // flowing. Record every real frame so the watchdog below can tell a stalled transport from a

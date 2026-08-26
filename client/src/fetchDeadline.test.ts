@@ -194,3 +194,40 @@ test('the buffered response still exposes status, headers and a readable body', 
   expect(res.headers.get('cache-control')).toBe('no-store'); // no-store must survive (§0.2)
   expect(((await res.json()) as { players: number[] }).players).toEqual([1, 2, 3]);
 });
+
+test('a caller abort DURING the body still reports as an abort, not a timeout', () => {
+  // The listener that forwards the caller's signal must survive until the BODY settles, not just until
+  // the headers do — otherwise a session switch mid-download is uncancellable and the request runs on,
+  // holding the connection (and, for a scan, the server's shared off-loop slot).
+  const outer = new AbortController();
+  globalThis.fetch = (async (_url: string, init: RequestInit) => {
+    const signal = init.signal as AbortSignal;
+    return new Response(
+      new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"partial":'));
+          signal.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+        },
+      }),
+      { status: 200 },
+    );
+  }) as unknown as typeof fetch;
+
+  const p = fetchWithDeadline('/sessions/x/history', { signal: outer.signal }, 10_000);
+  // Give the headers a turn to resolve, then cancel the way a session switch does.
+  return new Promise<void>((resolve) => {
+    setTimeout(async () => {
+      outer.abort();
+      let caught: unknown;
+      try {
+        await p;
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught).toBeDefined();
+      expect(isTimeoutError(caught)).toBe(false); // an abort must stay SILENT in the UI
+      expect((caught as Error).name).toBe('AbortError');
+      resolve();
+    }, 20);
+  });
+});

@@ -21,6 +21,7 @@ import {
   serverSkewMs,
   serverClockSamples,
   resetServerClock,
+  clockSampleFrom,
   SKEW_WINDOW_MS,
 } from './serverClock';
 
@@ -148,4 +149,14 @@ test('one honest arrival-stamped sample in the window is enough to hold the esti
   noteServerTime(base, base + 12); // the honest one
   for (let i = 0; i < 50; i++) noteServerTime(base - 20 * 60_000 + i, base + 20 + i);
   expect(serverSkewMs()).toBe(12);
+});
+
+test('clockSampleFrom REFUSES telemetry and accepts the two arrival-stamped kinds', () => {
+  // This is the rule the two tests above exist to justify, in the form the hook actually calls. It is a
+  // function rather than an `if` at the call site so that removing it fails HERE — a checker lens
+  // showed that with the rule inlined, reverting it to "feed every frame" passed the entire gate.
+  const ts = 1_700_000_000_000;
+  expect(clockSampleFrom({ kind: 'telemetry', data: { serverTs: ts } })).toBeNull();
+  expect(clockSampleFrom({ kind: 'status', data: { serverTs: ts } })).toBe(ts);
+  expect(clockSampleFrom({ kind: 'hello', data: { serverTs: ts } })).toBe(ts);
 });

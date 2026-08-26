@@ -233,6 +233,69 @@ test.describe('§6 — a Review crash must not white-screen the coach view', () 
   });
 });
 
+test.describe('§6 — the pitch config is untrusted, and its failure must not be a false claim', () => {
+  test('a player OUTSIDE the pitch is drawn and named, not silently clipped', async ({ page }) => {
+    test.skip(!stack, 'reliability stack not started');
+    // Since the simulator publishes its own corners, the happy path no longer exercises the off-pitch
+    // branch at all — a checker completeness note. Strip the pitch out of the config response and the
+    // client falls back to its built-in corners, 7 km away, so every simulated player IS off-pitch.
+    // That is both the off-pitch render path AND the "server serves a pitch the client won't use" path.
+    await page.route('**/sessions/*/config', async (route) => {
+      const res = await route.fetch();
+      const body = (await res.json()) as Record<string, unknown>;
+      delete body.pitch;
+      await route.fulfill({ response: res, json: body });
+    });
+    await page.goto(stack!.baseURL);
+    await waitLive(page);
+
+    // The players are still TRACKED (the HUD counts them)...
+    await expect
+      .poll(async () => playerRows(page).count(), { timeout: 30_000, intervals: [500] })
+      .toBeGreaterThanOrEqual(1);
+    // ...and every one of them SAYS it is off the pitch, in words. Before Phase 5 they were clipped
+    // into invisibility while the HUD kept counting them — "11 players" over a pitch showing none.
+    await expect
+      .poll(
+        async () => {
+          const texts = await playerRows(page).first().locator('td').allInnerTexts();
+          return texts[1] ?? '';
+        },
+        { timeout: 30_000, intervals: [1_000] },
+      )
+      .toMatch(/off pitch/i);
+    // The footer must also stop claiming the outline is measured.
+    await expect(page.getByText(/No measured pitch for this session yet/i)).toBeVisible();
+  });
+
+  test('a FAILED config read says so — it never claims the pitch is unmeasured', async ({ page }) => {
+    test.skip(!stack, 'reliability stack not started');
+    // One blip used to strand the coach on the placeholder pitch and U14 zones for the whole match,
+    // with the footer asserting — as fact — that no pitch was configured. Fail every read until the
+    // retry budget is spent, then require the honest wording.
+    //
+    // A FLAG, not a call count: React 19 StrictMode double-invokes the effect in dev, so the number of
+    // requests is not something a test should encode.
+    let failing = true;
+    await page.route('**/sessions/*/config', async (route) => {
+      if (failing) return route.abort('failed');
+      return route.fallback();
+    });
+    await page.goto(stack!.baseURL);
+    await waitLive(page);
+
+    await expect(page.getByText(/Couldn’t load this session’s setup/i)).toBeVisible({ timeout: 40_000 });
+    // The wording that would be a lie: we cannot claim the pitch is unmeasured when we never asked.
+    await expect(page.getByText(/No measured pitch for this session yet/i)).toHaveCount(0);
+
+    // ...and once the network is back, the browser's `online` event triggers a fresh read that lands
+    // the real corners — so the coach is not stranded for the rest of the match.
+    failing = false;
+    await page.evaluate(() => window.dispatchEvent(new Event('online')));
+    await expect(page.getByText(/this session’s measured corners/i)).toBeVisible({ timeout: 30_000 });
+  });
+});
+
 test.describe('§6 — touch targets are usable with gloves on a wet tablet', () => {
   test('every control on the live view is at least 44x44 CSS px (WCAG 2.5.5)', async ({ page }) => {
     test.skip(!stack, 'reliability stack not started');

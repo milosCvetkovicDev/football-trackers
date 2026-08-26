@@ -91,6 +91,23 @@ export function serverClockSamples(): number {
   return samples;
 }
 
+/**
+ * THE SOURCE RULE, as a function — so it is testable and so reverting it fails a test rather than a
+ * code review. Returns the timestamp a live frame may contribute to the estimate, or null when the
+ * frame must not feed it at all.
+ *
+ * Telemetry returns null: since Phase 4 its `serverTs` is `Math.min(gts, arrival)`, an EVENT time that
+ * can sit up to 6 h behind arrival. A page loading during a backlog drain would otherwise see only old
+ * timestamps, infer an offset of hours, and paint the replayed outage as live dots — measured, before
+ * the fix, as 30/30 twenty-minute-old fixes classified `fresh` on a real stack.
+ */
+export function clockSampleFrom(frame: {
+  kind: 'telemetry' | 'status' | 'hello';
+  data: { serverTs: number };
+}): number | null {
+  return frame.kind === 'telemetry' ? null : frame.data.serverTs;
+}
+
 /** Drop the estimate entirely (tests; and any future "different server" case). */
 export function resetServerClock(): void {
   curMin = Number.POSITIVE_INFINITY;

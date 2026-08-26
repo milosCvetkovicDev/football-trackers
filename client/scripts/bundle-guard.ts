@@ -27,7 +27,7 @@ import { join } from 'node:path';
 const DIST = new URL('../dist', import.meta.url).pathname;
 
 /** Substrings that must NEVER appear in a shipped asset, each with the reason it is banned. */
-const FORBIDDEN: Array<[token: string, why: string]> = [
+export const FORBIDDEN: Array<[token: string, why: string]> = [
   ['__crash_review', 'the DEV-only Review crash switch (e2e hook) must be eliminated from production'],
   ['induced review crash', 'the DEV-only crash message must not ship'],
   ['VITE_LIVE_TOKEN', 'the retired bundled bearer token must never come back (ADR-0015)'],
@@ -37,11 +37,6 @@ const FORBIDDEN: Array<[token: string, why: string]> = [
   ['Player 0', 'a roster-shaped name literal reached the bundle — names must come from /roster at runtime'],
   ['Player 1', 'a roster-shaped name literal reached the bundle — names must come from /roster at runtime'],
 ];
-
-if (!existsSync(DIST)) {
-  console.error(`❌ no dist/ at ${DIST} — run \`bun run build\` first`);
-  process.exit(1);
-}
 
 function walk(dir: string): string[] {
   const out: string[] = [];
@@ -53,30 +48,45 @@ function walk(dir: string): string[] {
   return out;
 }
 
-// Text-ish assets only; a font or image cannot meaningfully contain these tokens and reading them as
-// UTF-8 would just produce noise.
-const files = walk(DIST).filter((f) => /\.(js|mjs|cjs|css|html|json|map)$/.test(f));
-if (files.length === 0) {
-  console.error('❌ dist/ contains no JS/CSS/HTML assets — did the build actually run?');
-  process.exit(1);
-}
-
-const violations: string[] = [];
-for (const file of files) {
-  const text = readFileSync(file, 'utf8');
-  for (const [token, why] of FORBIDDEN) {
-    if (text.includes(token)) {
-      violations.push(`  ${file.replace(DIST, 'dist')}: contains "${token}" — ${why}`);
+/**
+ * Scan one built directory. Exported (and pure) so `bundle-guard.test.ts` can run it over a synthetic
+ * dist and prove it actually FAILS for each forbidden token — a guard nothing can fail is the same
+ * vacuity trap the audit's Q-1 finding is about, and this is the one gate that inspects the artefact
+ * we ship.
+ */
+export function scanDist(dir: string): { files: string[]; violations: string[] } {
+  // Text-ish assets only; a font or image cannot meaningfully contain these tokens and reading them as
+  // UTF-8 would just produce noise.
+  const files = walk(dir).filter((f) => /\.(js|mjs|cjs|css|html|json|map)$/.test(f));
+  const violations: string[] = [];
+  for (const file of files) {
+    const text = readFileSync(file, 'utf8');
+    for (const [token, why] of FORBIDDEN) {
+      if (text.includes(token)) {
+        violations.push(`  ${file.replace(dir, 'dist')}: contains "${token}" — ${why}`);
+      }
     }
   }
+  return { files, violations };
 }
 
-if (violations.length) {
-  console.error(`\n❌ BUNDLE GUARD FAILED — ${violations.length} violation(s):\n${violations.join('\n')}\n`);
-  process.exit(1);
+// Running as a script (not imported by the test) → scan the real dist/ and set the exit code.
+if (import.meta.main) {
+  if (!existsSync(DIST)) {
+    console.error(`❌ no dist/ at ${DIST} — run \`bun run build\` first`);
+    process.exit(1);
+  }
+  const { files, violations } = scanDist(DIST);
+  if (files.length === 0) {
+    console.error('❌ dist/ contains no JS/CSS/HTML assets — did the build actually run?');
+    process.exit(1);
+  }
+  if (violations.length) {
+    console.error(`\n❌ BUNDLE GUARD FAILED — ${violations.length} violation(s):\n${violations.join('\n')}\n`);
+    process.exit(1);
+  }
+  console.log(
+    `✅ bundle guard passed — ${files.length} asset(s) checked, none contain any of: ` +
+      FORBIDDEN.map(([t]) => `"${t}"`).join(', '),
+  );
 }
-
-console.log(
-  `✅ bundle guard passed — ${files.length} asset(s) checked, none contain any of: ` +
-    FORBIDDEN.map(([t]) => `"${t}"`).join(', '),
-);

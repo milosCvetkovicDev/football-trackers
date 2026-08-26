@@ -370,6 +370,12 @@ export const metrics = {
       'Coach-view failures reported by the browser, by kind (ws_gave_up|ws_manual_retry|render_error|fetch_timeout) — alert on ws_gave_up during a session',
     ),
   ),
+  beaconBuckets: registry.register(
+    new Gauge(
+      'ft_client_beacon_buckets',
+      'Retained per-principal beacon rate-limit buckets. A MEMORY signal: the beacon is the one limiter that admits the anonymous principal, whose key is the client IP — so an unswept map would grow one entry per distinct source address forever. It must plateau at roughly the number of clients reporting; a monotonic climb means the sweep stopped',
+    ),
+  ),
   beaconRequests: registry.register(
     new Counter(
       'ft_client_beacon_requests_total',

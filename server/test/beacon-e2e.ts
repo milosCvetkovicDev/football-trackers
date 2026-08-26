@@ -112,8 +112,13 @@ try {
       ALLOWED_ORIGINS: ORIGIN,
       AUTH_ACCOUNTS_RELOAD_SECONDS: '3600',
       AUTH_SESSION_TTL_SECONDS: '3600',
+      // A burst of 20 with a 10/s refill: the §(d) flood still outruns it (it issues 30 back to back in
+      // milliseconds), while burst/perMin keeps the sweep's "fully refilled" floor at 2 s — which is what
+      // lets §(g) prove the sweep RUNS without a 60 s test. The floor is deliberately not bypassable:
+      // sweeping a half-refilled bucket would hand back a full burst.
       BEACON_RATE_BURST: '20',
-      BEACON_RATE_PER_MIN: '1', // ~1 token/60 s of refill: the burst is what this test spends
+      BEACON_RATE_PER_MIN: '600',
+      BEACON_BUCKET_IDLE_MS: '2000',
       LOG_LEVEL: 'info',
       MQTT_USERNAME: undefined as unknown as string,
       MQTT_PASSWORD: undefined as unknown as string,
@@ -257,6 +262,34 @@ try {
   }
 
   // ====================================================================================================
+  // (g) THE RATE-LIMIT MAP IS SWEPT — a memory bound, not just a request bound
+  // ====================================================================================================
+  // This is the ONE limiter that admits the anonymous principal, so its key is the CLIENT IP rather than
+  // a bounded username set: without a sweep every distinct source address would add a permanent entry
+  // (the checker's finding). The gauge is the observable — it must return to ~0 once the buckets go idle.
+  const bucketsNow = async (): Promise<number> => {
+    const text = await (await fetch(`http://127.0.0.1:${METRICS_PORT}/metrics`)).text();
+    const m = text.match(/ft_client_beacon_buckets\s+(\d+)/);
+    return m ? Number(m[1]) : -1;
+  };
+  // The gauge samples on a 5 s timer while the sweep runs every 2 s, so keep touching the bucket until
+  // a tick observes it — otherwise the sweep can legitimately remove it before the gauge ever looks.
+  let peak = 0;
+  for (let i = 0; i < 12 && peak < 1; i++) {
+    await (await beacon(SESSION, { kind: 'ws_manual_retry' }, { cookie })).text(); // 204 or 429; both touch it
+    await sleep(1_000);
+    peak = await bucketsNow();
+  }
+  assert(peak >= 1, `expected at least one retained beacon bucket while active, got ${peak}`);
+  // Now go quiet for longer than BEACON_BUCKET_IDLE_MS and let both the sweep and the gauge tick.
+  let after = peak;
+  for (let i = 0; i < 15 && after > 0; i++) {
+    await sleep(1_000);
+    after = await bucketsNow();
+  }
+  assert(after === 0, `idle beacon buckets must be swept, still ${after} retained`);
+
+  // ====================================================================================================
   // (f) NAME/PII GUARD (§0.1) — nothing the client sent can echo into the log or the exposition
   // ====================================================================================================
   for (const bad of ['Alex M.', 'displayName', 'exfiltrate']) {
@@ -266,7 +299,8 @@ try {
 
   console.log('\n✅ BEACON E2E PASSED — POST /sessions/:id/client-beacon reuses the session gate (401 even on a '
     + 'malformed id, strict Origin incl. Origin-less→403, wrong-session→403), 204 with no body on success, a '
-    + 'closed four-value vocabulary (unknown/typed/oversized/non-JSON refused), rate-limited, and '
+    + 'closed four-value vocabulary (unknown/typed/oversized/non-JSON refused), rate-limited with a SWEPT '
+    + 'bucket map (ft_client_beacon_buckets returns to 0), and '
     + 'ft_client_events_total is labelled by KIND only — no session, no player, no echoed input');
   for (const f of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`, ACCOUNTS_FILE, CONF_FILE]) {
     if (existsSync(f)) rmSync(f);

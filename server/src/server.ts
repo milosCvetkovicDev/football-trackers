@@ -24,7 +24,7 @@ import { Elysia, t } from 'elysia';
 import { wsRoom, type Telemetry } from './types';
 import { startIngest } from './ingest';
 import { metrics, registry, updateRuntimeMetrics, capLabel, seedLabel } from './metrics';
-import { envInt, envNumber, envString, envBool, logResolvedConfig } from './env';
+import { envInt, envNumber, envString, envBool, envTimerMs, logResolvedConfig } from './env';
 import { dbProbe } from './db';
 import { startRetention, refreshRetentionGauges } from './retention';
 import { log } from './log';
@@ -239,12 +239,18 @@ const BEACON_RATE_BURST = envNumber('BEACON_RATE_BURST', 20, { min: 1 });
 const BEACON_RATE_PER_MIN = envNumber('BEACON_RATE_PER_MIN', 10, { min: 1 });
 const beaconBuckets = new Map<string, { tokens: number; last: number }>();
 // Never sweep a bucket before it would have refilled completely, or an operator who lowered the cap
-// would be handing back a full burst on every sweep.
-const BEACON_BUCKET_IDLE_MS = Math.max(60_000, Math.ceil((BEACON_RATE_BURST / BEACON_RATE_PER_MIN) * 60_000));
+// would be handing back a full burst on every sweep. Overridable the same way ingest.ts's sweep is —
+// which is also what lets the e2e prove the sweep actually runs without a 60 s test.
+const BEACON_BUCKET_IDLE_MS = Math.max(
+  envTimerMs('BEACON_BUCKET_IDLE_MS', 60_000, { min: 1_000 }),
+  Math.ceil((BEACON_RATE_BURST / BEACON_RATE_PER_MIN) * 60_000),
+);
 setInterval(() => {
   const cutoff = Date.now() - BEACON_BUCKET_IDLE_MS;
   for (const [k, b] of beaconBuckets) if (b.last < cutoff) beaconBuckets.delete(k);
 }, BEACON_BUCKET_IDLE_MS).unref?.();
+
+setInterval(() => metrics.beaconBuckets.set({}, beaconBuckets.size), 5_000).unref?.();
 function beaconRateOk(key: string): boolean {
   const now = Date.now();
   let b = beaconBuckets.get(key);

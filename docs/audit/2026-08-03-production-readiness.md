@@ -750,6 +750,23 @@ Review error boundaries · fetch deadlines · pitch corners via session config �
 > The one REFUTED claim: that Review's default window is computed from an inert estimator. The verifier
 > showed the feeder does exist — and the `hello` frame makes the estimate available from the moment the
 > socket opens, before Review can be reached.
+>
+> The checker's completeness pass then drove a second round, because most of those fixes had shipped
+> WITHOUT a test that fails without them: the clock-source rule is now a function (`clockSampleFrom`)
+> with its own unit gate, so re-feeding telemetry fails a test rather than a code review; a browser test
+> strips the pitch out of the config response to exercise the off-pitch render path (which the simulator
+> fix had just stopped exercising) and another fails the config read outright to pin the honest footer;
+> the beacon's bucket sweep is proven by a new `ft_client_beacon_buckets` gauge returning to 0; the
+> bundle guard has a self-test that requires every forbidden token to be detected; and a mid-body caller
+> abort is pinned as an abort, not a timeout. The session config also re-reads on `online`, so a session
+> that exhausts its retry budget is not stranded for the rest of the match.
+>
+> **Deliberately deferred to Phase 6 (operability), not fixed here:** an abandoned `/history` or
+> `/events` request keeps scanning and keeps one of `OFFLOOP_MAX_INFLIGHT` slots until it finishes —
+> the server never observes the client's disconnect (`request.signal` is unused), and there is no
+> wall-clock scan budget at all. Phase 5 reduces how often that happens (scans get a 30 s deadline
+> rather than the 8 s that was aborting legitimate reads), but the mechanism is server-side
+> cancellation plumbing and belongs with the rest of the operability work.
 
 ### Phase 6 — Operability
 Graceful shutdown + exec-form PID 1 · compose healthcheck on `/health` · log rotation · migrations via

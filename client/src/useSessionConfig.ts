@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { apiUrl } from './config';
 import { fetchWithDeadline } from './fetchDeadline';
 import { parsePitchCorners } from './pitchFrame';
@@ -47,6 +47,21 @@ export interface SessionConfigState {
 
 export function useSessionConfig(sessionId: string): SessionConfigState {
   const [state, setState] = useState<SessionConfigState>({ config: null, status: 'idle' });
+  // Bumping this re-runs the whole fetch+retry sequence. The bounded retry above eventually gives up
+  // (~12 s), and without this the session would stay stranded on default zones and the placeholder
+  // pitch for the rest of the match — the very failure the retry was added to remove, just later. The
+  // browser regaining an interface is the one signal that reliably means "ask again now".
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const statusRef = useRef(state.status);
+  statusRef.current = state.status;
+
+  useEffect(() => {
+    const onOnline = () => {
+      if (statusRef.current === 'error') setReloadNonce((n) => n + 1);
+    };
+    window.addEventListener('online', onOnline);
+    return () => window.removeEventListener('online', onOnline);
+  }, []);
 
   useEffect(() => {
     // Reset synchronously at the START of the effect so the new session never renders with the old
@@ -144,7 +159,8 @@ export function useSessionConfig(sessionId: string): SessionConfigState {
       if (retryTimer) clearTimeout(retryTimer);
       controller.abort();
     };
-  }, [sessionId]);
+    // reloadNonce is a dep so an `online` event re-runs the whole sequence from scratch.
+  }, [sessionId, reloadNonce]);
 
   return state;
 }
