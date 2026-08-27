@@ -36,7 +36,13 @@
     "test:session-config-cli": "bun run test/session-config-cli.ts",
     "test:config-e2e": "bun run test/config-e2e.ts",
     "test:erasure-audit": "bun run test/erasure-audit.ts",
-    "test:boundary": "bun run test/boundary.ts"
+    "test:boundary": "bun run test/boundary.ts",
+    "test:beacon": "bun run test/beacon-e2e.ts",
+    "test:migrate": "bun run test/migrate.ts",
+    "test:backup": "bun run test/backup.ts",
+    "test:scan-cancel": "bun run test/scan-cancel.ts",
+    "test:shutdown": "bun run test/shutdown-e2e.ts",
+    "backup": "bun run backup-db.ts"
   },
   "dependencies": {
     "elysia": "^1.4.28",

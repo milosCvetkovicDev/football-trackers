@@ -51,10 +51,11 @@ function readRosterSessions(): Record<string, RosterEntry[]> {
 async function runCli(
   script: string,
   args: string[],
+  extraEnv: Record<string, string> = {},
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn(['bun', 'run', script, ...args], {
     cwd: `${import.meta.dir}/..`,
-    env: { ...process.env, AUTH_ROSTER_FILE: ROSTER_FILE, DB_PATH },
+    env: { ...process.env, AUTH_ROSTER_FILE: ROSTER_FILE, DB_PATH, ...extraEnv },
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
@@ -124,6 +125,41 @@ try {
   sessions = readRosterSessions();
   assert((sessions[SESSION] ?? []).length === 1 && sessions[SESSION][0].playerId === OTHER_PLAYER,
     `a no-op second purge must not corrupt the file (only ${OTHER_PLAYER} left), got ${JSON.stringify(sessions[SESSION])}`);
+
+  // --- 4. PHASE 6: the receipt must NAME the backup directory it searched, and whether it EXISTED -------
+  // `backups: []` alone cannot distinguish "this box takes no backups" from "BACKUP_DIR is the host path
+  // and the container's copies were never opened". A checker pass ran the purge with a typo'd BACKUP_DIR:
+  // exit 0, a clean receipt, and every real backup still holding 1,800 of the child's rows. That receipt
+  // is the compliance record — it must not be able to say "erased" over copies it never looked at. Same
+  // signal, same reason, as `rosterFound` (audit §4.5 e).
+  {
+    const typo = '/tmp/ft-erasure-e2e-backups-typo';
+    if (existsSync(typo)) rmSync(typo, { recursive: true, force: true });
+    const r = await runCli('purge-player.ts', [OTHER_PLAYER, SESSION], { BACKUP_DIR: typo });
+    assert(r.code === 0, `purge with an empty backup dir should still exit 0, got ${r.code}`);
+    const receipt = JSON.parse(r.stdout) as { backupDir?: string; backupsFound?: boolean; backups?: unknown[] };
+    assert(typeof receipt.backupDir === 'string' && receipt.backupDir.includes('typo'),
+      `the receipt must NAME the directory it searched, got ${JSON.stringify(receipt.backupDir)}`);
+    assert(receipt.backupsFound === false,
+      `backupsFound must be false when the directory does not exist, got ${JSON.stringify(receipt.backupsFound)}`);
+    assert(/no backup directory/.test(r.stderr),
+      `a missing backup directory must produce an operator-visible note, got: ${r.stderr.slice(0, 300)}`);
+  }
+
+  // ...and when the directory DOES exist, it says so and erases from it.
+  {
+    const real = '/tmp/ft-erasure-e2e-backups';
+    rmSync(real, { recursive: true, force: true });
+    const { createBackup } = await import('../src/backup');
+    createBackup(DB_PATH, real, Date.now());
+    const r = await runCli('purge-player.ts', ['99', SESSION], { BACKUP_DIR: real });
+    const receipt = JSON.parse(r.stdout) as { backupsFound?: boolean; backups?: { path: string; ok: boolean }[] };
+    assert(receipt.backupsFound === true, 'backupsFound must be true when the directory exists');
+    assert((receipt.backups ?? []).length === 1, `the one backup must be processed, got ${(receipt.backups ?? []).length}`);
+    assert((receipt.backups ?? []).every((b) => b.ok), 'the backup must report ok');
+    assert(!/no backup directory/.test(r.stderr), 'no missing-directory note when it exists');
+    rmSync(real, { recursive: true, force: true });
+  }
 
   console.log('\n✅ ERASURE E2E PASSED — roster set → purge-player erases BOTH stores (rosterEntriesErased:1, DB rows 0), '
     + 'the other player survives, the name is gone from roster.json, and a no-op second run exits 0 with '

@@ -104,7 +104,8 @@ The registry itself refuses non-finite values as a last line of defence (a strin
 | `ft_mqtt_connected` | gauge | Broker link (1/0) |
 | `ft_mqtt_reconnects_total` | counter | Reconnect attempts |
 | `ft_ws_clients` | gauge (per session) | Connected coach tablets |
-| `ft_ws_messages_sent_total` | counter (per session) | **Telemetry** envelopes pushed (meaning unchanged) |
+| `ft_ws_messages_sent_total` | counter (per session) | **Telemetry** envelopes actually DELIVERED. Phase 6 changed what this means: `server.publish()`'s return was previously discarded, so it counted attempts — a coach tablet stalling behind a slow link lost frames while this climbed at full rate. It now only increments on a real send |
+| `ft_ws_dropped_total` | counter (per session, per reason) | Envelopes `publish()` did NOT deliver — `dropped` (no subscriber / closed socket), `backpressure` (socket buffer full), `error` (publish threw). Watch the ratio against the counter above **during a match**: a rising `backpressure` share is a tablet losing frames, and it was previously invisible |
 | `ft_ws_status_envelopes_sent_total` | counter (per session) | **Device-health** envelopes pushed — the Phase 3 second `/live` envelope (`{event:'status'}`) fanned out from the `.../status` topic ([ADR-0016](../decisions/0016-player-name-roster.md) phase). The `{session}` label is safe here: a WS room already requires auth to join, so it leaks nothing a coach with that room can't see (unlike the `/roster` + `/history` request counters below, which carry **no** session label) |
 | `ft_ws_rejected_total` | counter (per reason) | Rejected `/live` upgrades — `auth` / `origin` / `no_session` / `not_authorized_for_session` (principal not assigned to the requested session, [ADR-0015](../decisions/0015-frontend-auth-transport.md)) |
 
@@ -201,6 +202,18 @@ guarantee *observable* — see [ADR-0010](../decisions/0010-location-data-retent
 
 ### Process / build
 `ft_process_uptime_seconds`, `ft_process_resident_memory_bytes`, `ft_build_info{version,runtime}`.
+
+### Lifecycle, schema & cancellation (Phase 6 — [ADR-0025](../decisions/0025-operability-lifecycle.md))
+| Metric | Type | Meaning |
+|---|---|---|
+| `ft_process_fatal_total{kind}` | counter | `uncaught_exception` (followed by a graceful exit 1 and a restart) or `unhandled_rejection` (the process KEEPS SERVING — so this counter is the only evidence it happened). Alert on **any** increase of either |
+| `ft_db_schema_version` | gauge | `PRAGMA user_version` after migrations. A box that quietly failed to migrate is otherwise indistinguishable from one that did |
+| `ft_scan_aborted_total{surface,reason}` | counter | Off-loop scans stopped early. `client_gone` = the coach navigated away or their fetch deadline fired (normal, and before Phase 6 it kept its shared slot to the end); `budget` = past `SCAN_BUDGET_MS`; `shutdown` = the server is going away. A sustained `budget` rate means the review windows being asked for are too big for the store |
+| `ft_auth_sessions_restored_total{outcome}` | counter | `restored` / `expired` / `orphaned` / `capped` / `unreadable` at boot. **0 restored after a planned restart means every coach was logged out mid-match** — expected after a crash, a bug after a `docker stop`. `capped` = the handover held more than the CURRENT per-user/global caps allow, which is what applying a tightened policy looks like; `unreadable` includes a handover that could not be CONSUMED (restoring it would replay signed-out sessions, so nothing is restored) |
+| `ft_backups` | gauge | Verified copies on disk in `BACKUP_DIR` |
+| `ft_backup_oldest_age_seconds` | gauge | **The compliance SLI for copies**, mirroring `ft_oldest_raw_fix_age_seconds` for the live store. Rotation only runs when a backup is taken or `--rotate-only` is invoked, so a nightly cron that has been failing for a month leaves month-old copies of children's location with nothing else reporting them. Alert when this exceeds `RETENTION_DAYS` |
+| `ft_backup_bytes` | gauge | Total bytes held by backups |
+| `ft_shutdown_seconds{outcome}` | gauge | How long the last teardown took: `clean`, or `deadline` if a step wedged and the hard deadline force-exited. Only visible to a scrape that races the exit; its real consumer is `test/shutdown-e2e.ts` |
 
 ---
 
@@ -421,13 +434,60 @@ const b=fs.readFileSync(p);let i=b.indexOf(id);while(i!==-1){n++;i=b.indexOf(id,
 ```
 (the gate's `server/test/erasure-audit.ts` does the same scan with long, distinctive ids).
 
-Two residuals the CLI **cannot** reach from its separate process — clear them by hand:
+**Backups are erased too, since Phase 6.** This section used to say a copy taken before the wipe was a
+residual the CLI could not reach — which stopped being acceptable the moment backups became a supported
+feature ([ADR-0025](../decisions/0025-operability-lifecycle.md)). Every `telemetry-*.db` in `BACKUP_DIR` now
+gets the *same* erasure statements ([`src/erase.ts`](../../server/src/erase.ts), one definition for the live
+store and every copy) plus its own `VACUUM`, and the receipt carries a per-file entry that **proves** it by
+re-counting:
+
+```json
+"backups": [{ "path": "/data/backups/telemetry-2026-08-27T02-15-00Z.db", "erased": 1843, "remaining": 0, "ok": true }],
+"backupsErased": 1843
+```
+
+`remaining` must be `0` on every entry. A file that could not be opened or written is reported `ok:false`
+with the reason and makes the whole run **exit 4** — fix that file (permissions, or delete it) and re-run.
+
+One residual the CLI **still cannot** reach, and one it never could:
 1. **In-memory Prometheus series.** The running server holds per-player gauges
    (`ft_player_last_seen_timestamp_seconds{player=…}`, fix/sats/pdop, device-health) that linger until
    **restart**. They are pseudonymous and exposed only on the loopback `/metrics` port, but for a full
-   wipe **restart the server** after the purge.
-2. **Backups.** Any file-level copy of `telemetry.db` taken before the wipe still holds the data — purge
-   or rotate backups per your retention policy.
+   wipe **restart the server** after the purge (which, since Phase 6, is a graceful ~0.2 s `docker stop`
+   that keeps the coaches logged in).
+2. **Copies it cannot see** — one you made by hand somewhere else, an SD-card image, a filesystem
+   snapshot. Those remain the operator's responsibility; the tool only knows about `BACKUP_DIR`.
+
+---
+
+## Runbook — backups (Phase 6)
+
+```
+docker compose exec -T server bun run backup-db.ts               # one verified copy + rotation
+docker compose exec -T server bun run backup-db.ts --list        # what is on disk, and what is past retention
+docker compose exec -T server bun run backup-db.ts --rotate-only # expire old copies WITHOUT taking a new one
+```
+
+`VACUUM INTO`, not `cp`: in WAL mode a file copy is a torn snapshot that opens perfectly and is quietly
+short. The copy is verified row-for-row **before it counts as a backup** and deleted if it is short — an
+unverified backup is a belief, and the failure being guarded against produces a file that looks fine.
+Written 0600 into a 0700 directory; the JSON receipt on stdout is the record.
+
+**Rotation is bounded twice** and the second bound is the compliance one: `BACKUP_KEEP` (default 7) *and*
+`RETENTION_DAYS` (default 30). A backup is a complete copy of children's location, so it inherits the live
+store's window — `BACKUP_KEEP=7` on a monthly schedule would otherwise hold seven months of it. Rotation
+only ever deletes files matching the name pattern the tool writes; an operator's own copy in the same
+directory is left alone (and is therefore *also* outside what the erasure CLI knows about — see above).
+
+Rotation runs **whether or not the backup succeeded** — a night when the store was unreachable used to
+expire nothing, and since rotation ran nowhere else the copies simply accumulated for as long as the cron
+kept failing. `--rotate-only` is the same job without the store, and `ft_backup_oldest_age_seconds`
+answers the question without running anything at all.
+
+Run it **between sessions**: `VACUUM INTO` reads the whole store and writes a full copy, which on a Pi with
+one SD card is I/O contention with the live 10 Hz ingest. The crontab line is in
+[deploy/production/README.md](../../deploy/production/README.md). Restoring is a file copy — a backup *is* a
+store: stop the stack, put the file at `DB_PATH`, remove any stale `-wal`/`-shm`, start.
 
 Names also expire on their own: the retention sweep drops a roster session once none of its fixes remain
 and its provisioning stamp (`sessionMeta.<id>.updatedAt`, written by `roster-user.ts set`) is older than

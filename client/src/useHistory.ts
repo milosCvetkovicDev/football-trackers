@@ -213,10 +213,11 @@ export function useHistory(
             headers: { Accept: 'application/json' },
             signal: controller.signal,
           },
-          // The SCAN deadline, not the small-read one: /history pages over the raw fix table and the
-          // server caps its cost, never its time. Aborting a legitimate long scan would show a failure
-          // the coach cannot fix by retrying — and would leave the abandoned scan holding its shared
-          // off-loop slot until it finished anyway.
+          // The SCAN deadline, not the small-read one: /history pages over the raw fix table. It is set
+          // LONGER than the server's own SCAN_BUDGET_MS so the server gives up first and answers an
+          // honest, retryable 503 — aborting a legitimate long scan here would instead show the coach a
+          // failure that every retry reproduces. (Since Phase 6 an abandoned read does release its
+          // shared off-loop slot, but being the one to give up first is still the better answer.)
           SCAN_DEADLINE_MS,
         );
         // Fail closed: ANY non-2xx (401/403/404/429/503/400/5xx) is an explicit error, never a silent

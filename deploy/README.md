@@ -25,3 +25,15 @@ cd client && VITE_PROXY_TARGET=http://127.0.0.1:3007 bun run dev
 `127.0.0.1:3007`, not `localhost:3007`: the server's published port is pinned to the IPv4 loopback
 (the live view needs no login on this stack, so it must not be LAN-reachable), and `localhost` can
 resolve to `::1` first.
+
+## There is a production stack now
+
+[`production/`](production/README.md) — the audit's I-1 finding was "no production artifact", and this
+directory held only the note above. It now holds a real one: a built non-root image
+([`../server/Dockerfile`](../server/Dockerfile)) with no roster, accounts or store in any layer, **no
+anonymous access**, nothing published on `0.0.0.0`, resource limits, capped logs, and a `/health`
+healthcheck. `server/test/deploy-posture.ts` fails the build if either stack drifts from that.
+
+The one piece deliberately still missing is TLS termination — a field box has no public DNS, so it needs
+an internal-CA decision rather than a guessed Caddyfile. `production/README.md` says so, and says what to
+do until it is made.

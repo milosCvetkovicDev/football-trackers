@@ -1,7 +1,7 @@
 # Server CI — the Bun + Elysia ingest / fan-out / persistence service (server/).
 #
 # Gate order (fail fast, cheapest first): install -> typecheck -> full suite. `bun run test` is
-# server/test/run-all.ts, which runs all 25 suites sequentially and REFUSES TO START if any file in
+# server/test/run-all.ts, which runs all 30 suites sequentially and REFUSES TO START if any file in
 # test/ is undeclared — so a suite added without being wired in turns this red instead of silently
 # shrinking the gate.
 #
@@ -68,7 +68,44 @@ jobs:
         # Bun executes .ts without typechecking, so nothing else in the pipeline would catch a type error.
         run: bun run typecheck
 
-      - name: Full suite (25 suites, sequential)
+      - name: Full suite (30 suites, sequential)
         # `bun run test` — the package script (run-all.ts), NOT bare `bun test`, which would try to
         # execute the e2e harnesses as if they were bun:test files.
         run: bun run test
+
+  # The production image (audit I-1 / Phase 6). test/deploy-posture.ts greps the Dockerfile for the
+  # properties that matter (non-root, --frozen-lockfile, exec-form CMD, no `COPY . .`), but a grep cannot
+  # tell you the thing still BUILDS — and this is the artifact a field box would actually run. Separate
+  # job so a broken image is distinguishable at a glance from a failing test.
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          filter: tree:0
+
+      - uses: docker/setup-buildx-action@c47758b77c9736f4b2ef4073d4d51994fabfe349 # v3.7.1
+
+      - name: Build (no push — there is no registry for this project)
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: server
+          push: false
+          load: true
+          tags: football-trackers-server:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The image must be non-root and carry no personal data
+        # The .dockerignore and the explicit COPY list are the controls; this is the assertion that they
+        # WORKED. An image layer survives every later deletion and travels with the image, so a roster or
+        # an accounts file baked in by a stray `COPY . .` would be a permanent leak of children's names.
+        run: |
+          uid=$(docker run --rm --entrypoint sh football-trackers-server:ci -c 'id -u')
+          [ "$uid" != "0" ] || { echo "::error::the production image runs as root"; exit 1; }
+          echo "runs as uid $uid"
+          leaked=$(docker run --rm --entrypoint sh football-trackers-server:ci -c \
+            'for f in roster.json auth-accounts.json auth-sessions.json session-config.json telemetry.db mosquitto data test .env; do [ -e "/app/$f" ] && echo "$f"; done; true')
+          if [ -n "$leaked" ]; then echo "::error::personal data or secrets in the image: $leaked"; exit 1; fi
+          echo "no roster / accounts / store / secrets in the image"

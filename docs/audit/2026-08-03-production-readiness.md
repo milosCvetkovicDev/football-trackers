@@ -775,6 +775,112 @@ with absolute broker paths · `uncaughtException` handlers.
 
 **Accept:** `docker stop` exits 0 (not 137) in <2 s · healthcheck reports healthy/unhealthy correctly · backup restores to a byte-identical row count · purged player absent from every backup.
 
+> **✅ DONE 2026-08-27 — all four acceptance criteria met by execution against the real stack, plus the
+> item Phase 5 deferred here and the whole of §6's "Server" and "Infra" groups.**
+>
+> ACCEPTANCE, measured. **(1) `docker stop`** — the baseline was re-measured first and reproduced the
+> audit exactly: **exit 137 after 1.29 s**, `sh` as pid 1, no teardown at all. After `exec` + `init:
+> true` + `src/shutdown.ts`: **exit 0 in 0.23 s** on the dev stack and **0.10 s** on the production
+> image, with `db closed {checkpointed:2}` in the container's own log. `test/shutdown-e2e.ts` pins the
+> in-process half at 7–9 ms and asserts the step ORDER, not merely that steps ran. **(2) Healthcheck** —
+> `docker stop ft-mosquitto` flipped the server container to `unhealthy` at +50 s (interval 15 s ×
+> 3 retries, as configured), with the probe's own output recording
+> `{"ok":false,"mqtt":false,"db":true,...}`; restarting the broker returned it to `healthy` within 10 s.
+> The probe is `bun run healthcheck.ts`, because `oven/bun:1.3` ships no curl, wget or nc (verified).
+> **(3) Backup row count** — `test/backup.ts` compares source and copy in total AND per player per
+> session, then re-opens the copy independently. **(4) Purged player absent from every backup** —
+> `purge-player.ts` runs the same erasure statements against every `telemetry-*.db` in `BACKUP_DIR` and
+> re-counts each file; a copy that cannot be erased is exit 4 with the file named, and a test proves
+> that failure path fires (a read-only backup) rather than being skipped silently.
+>
+> ALSO SHIPPED ([ADR-0025](../decisions/0025-operability-lifecycle.md)): the `user_version` migration
+> ladder, with a store NEWER than the build refusing the boot (proven end to end — the process exits
+> non-zero and never opens a listener); `VACUUM INTO` backups whose rotation is bounded by **both**
+> `BACKUP_KEEP` and `RETENTION_DAYS`, because a copy is a fix and ADR-0010 applies to it; the
+> deferred **scan-cancellation** item — `request.signal` plus a 25 s wall-clock budget, checked inside
+> the existing yield helper so a new paged loop cannot forget it, with a test that fills every shared
+> slot with abandoned scans and requires a fresh read to succeed; a **production stack**
+> (`deploy/production/compose.yml` + `server/Dockerfile`) that is non-root, installs from the lockfile,
+> publishes nothing on `0.0.0.0`, has no anonymous access, and carries no roster/accounts/store in any
+> image layer — all of it guarded statically by `test/deploy-posture.ts` (37 checks) which runs
+> unfiltered in `repo-guard`; log rotation on both services; and the rest of §6's "Server" group:
+> `uncaughtException`/`unhandledRejection` handlers, `mode: 0o600` that is no longer a no-op on an
+> existing file, WS fan-out drops counted as drops, and coaches staying logged in across a restart.
+>
+> TWO FINDINGS FROM THIS PHASE'S OWN WORK, both fixed:
+> - **The SLO tests were asserting on a lie.** Making `server.publish()`'s return meaningful turned
+>   `history-e2e` and `events-e2e` red — because they used `ft_ws_messages_sent_total` as a proxy for
+>   "the live loop is being serviced" **with no WebSocket client connected at all**. The counter had
+>   been counting attempts. Both now attach a real `/live` subscriber, so the SLO measures delivery
+>   rather than intent, and a new `e2e.ts` case pins the accounting directly: publish into an empty
+>   room and `sent` must stay flat while `dropped` rises.
+> - **The store itself was 0644.** Noticed while checking the production image: the name and credential
+>   files are 0600, but the file holding the positions was left at the process umask. Tightened on open,
+>   sidecars included, best-effort so a mount that cannot chmod warns instead of refusing to boot.
+>
+> Each fix was then verified NON-VACUOUS by breaking it and watching its gate go red — ten of them:
+> the downgrade guard, the yield-point cancellation check, the SIGTERM handler, the drop accounting,
+> the backup retention bound, the backup erasure-failure report, the 0600 writer (all three CLIs), the
+> session handover, and both compose posture guards.
+>
+> THE SIX-LENS CHECKER PASS then found **twenty-two more defects in this phase's own first cut**, every
+> one reproduced by execution before it was believed. The four that mattered most:
+>
+> - **A `docker stop` during BOOT was worse than the bug being fixed.** The signal handlers were installed
+>   as the last statement of `server.ts`, leaving ~150 ms with none — and because bun is pid 1, the kernel
+>   DISCARDS a signal pid 1 has no handler for, so a stop in that window waited out the entire grace
+>   period and SIGKILLed: **exit 137 after 5.1 s, 3/3**, against a 1.3 s baseline. Handlers are now the
+>   first line of the module. The same window also destroyed the session handover (`loadSessions()`
+>   consumes the file during boot, and the step that writes it back had not been registered yet), so
+>   `auth.ts` now registers that step itself, at the moment it consumes the file. A six-point sweep across
+>   the window is the gate.
+> - **A mistyped `DB_PATH` wrote this schema into somebody else's database** — created `telemetry`,
+>   converted the file to WAL, and overwrote its `user_version`, the byte other migration tools key on,
+>   while this server served an empty pitch behind a green `/health`. `assertOurs()` now runs before any
+>   pragma that writes, and a foreign store is refused byte-for-byte.
+> - **The erasure receipt could say "erased" over backups it never opened.** `backups: []` was
+>   indistinguishable from a wrong `BACKUP_DIR` (host path vs container path), and a checker reproduced
+>   exit 0 with a clean receipt while every real copy still held 1,800 of the child's rows — the shape of
+>   §4.5(e), re-opened on the new surface. The receipt now carries `backupDir` and `backupsFound`, the
+>   same signal `rosterFound` provides, with an operator-visible note.
+> - **One authenticated principal could take the review surface offline for the whole club.** The
+>   per-principal rate bucket is not a fairness control for a SHARED cap: a caller well inside its own
+>   budget held every slot continuously and denied another coach **39 of 40 reads over 40 s**. The slots
+>   now have a per-principal share (2 of 4), so a coach's own Review page still works and no principal can
+>   reach zero for everyone else.
+>
+> And the rest, each with a test that fails without it: the session handover applied neither the current
+> TTL nor the per-user cap (so "shorten sessions and restart" — the response to a lost tablet — changed
+> nothing), was not consumed when the unlink failed (a signed-out coach came back on every boot, silently),
+> trusted a hand-written `e` of `1e308`, and read a 400 MB file into a 512 MB container before checking
+> its size; `abortAllScans()` marked budgets and returned, so `reason="shutdown"` was a permanently zero
+> metric and a coach mid-review got a socket reset instead of the promised 503; an aborted scan recorded
+> no volume and no principal in the bulk-export audit trail; the default `ScanBudget` leaked the very set
+> its leak-detector reads; migrations used a deferred BEGIN whose `SQLITE_BUSY_SNAPSHOT` the busy handler
+> never retries; `test/migrate.ts` did not test its own central claim (deleting a column from migration 1
+> left all six cases green — there is a frozen schema snapshot now, because migration 1 is append-only
+> forever); five concurrent `auth-user.ts add`s silently lost two accounts that reported success while
+> persisting two that reported failure (the roster's proven lock is now shared by all three CLIs);
+> `deploy-posture` passed 37/37 on a Dockerfile ending `USER root`; rotation only ran as a side effect of
+> a SUCCESSFUL backup, so a failing nightly cron expired nothing (`--rotate-only` and
+> `ft_backup_oldest_age_seconds` close that); a future-dated copy could never age out; an unreadable
+> `BACKUP_DIR` threw a stack trace outside the exit contract; an unwritable `/data` produced a raw
+> `SQLITE_CANTOPEN` crash-loop with no diagnostic; and the production README left you with a healthy
+> backend and no coach UI, because nothing told you to build the client.
+>
+> The checkers also REFUTED plenty, which is the other half of the value: no byte-level residue of a
+> purged player in any backup (8,000 interleaved rows, 0 hits, `-wal` included); no missed site in the
+> session re-keying (11 sites, 14/14 assertions); no timing oracle; no drift between migration 1 and the
+> pre-Phase-6 schema; no slot/budget desync from 400 malformed requests; no rate-limiter evasion via
+> abort-and-retry; no personal data in any image layer (all 12 blobs, zero whiteouts, content-grepped
+> against the real roster); and `deploy.resources.limits` DOES apply under Compose v5 — the "swarm only"
+> folklore is out of date.
+>
+> **Deliberately NOT done, and named rather than faked:** TLS termination for a field box. There is no
+> Caddyfile because the real decision is an internal CA and getting it trusted on the coaches' tablets,
+> which belongs with the person who owns those tablets. `deploy/production/README.md` says so, and says
+> what to do until then.
+
 ### Phase 7 — Vision & docs
 Fail-fast stubs · job queue + timeouts + artifact allow-list · streaming pipeline · TTL prune · ledger
 out of `out/` · checksum-pinned fetch · consumed lockfile · README/CLAUDE.md drift + `vision/` visibility

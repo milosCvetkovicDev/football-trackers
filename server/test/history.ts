@@ -30,7 +30,8 @@ process.env.LOG_LEVEL = 'error';
 // Small caps so the DoS-gate assertions are fast + deterministic (not the prod defaults).
 process.env.HISTORY_RATE_BURST = '3';
 process.env.HISTORY_RATE_PER_MIN = '6';
-process.env.OFFLOOP_MAX_INFLIGHT = '2'; // PM-1: inflight cap is now the SHARED history+events scanLoad slot
+process.env.OFFLOOP_MAX_INFLIGHT = '3'; // PM-1: inflight cap is now the SHARED history+events scanLoad slot
+process.env.OFFLOOP_MAX_PER_PRINCIPAL = '2'; // ...and one principal may hold at most this many of them
 process.env.HISTORY_SCAN_CHUNK = '4'; // tiny chunk so paging genuinely loops over the fixture
 process.env.HISTORY_MAX_SPAN_MS = String(86_400_000); // 24h
 
@@ -58,6 +59,7 @@ try {
     _inflightCount,
     HistoryParamError,
   } = await import('../src/history');
+  const { OFFLOOP_MAX_PER_PRINCIPAL, _principalSlots } = await import('../src/scanLoad');
 
   const SESSION = 's-hist';
   const T0 = 1_700_000_000_000; // base server_ts for the seed
@@ -209,29 +211,51 @@ try {
   for (let i = 0; i < 3; i++) {
     const g = historyGate('coach-A');
     assert(g.ok, `coach-A request ${i + 1} should pass the burst`);
-    releaseInflight();
+    releaseInflight('coach-A');
   }
   const limited = historyGate('coach-A');
   assert(!limited.ok && limited.result === 'rate_limited', 'coach-A 4th rapid request → rate_limited');
   // Bucket isolation: a DIFFERENT principal is unaffected by coach-A draining its bucket.
   const other = historyGate('coach-B');
   assert(other.ok, 'coach-B has its own bucket — not starved by coach-A');
-  releaseInflight();
+  releaseInflight('coach-B');
 
-  // Inflight cap (MAX_INFLIGHT=2): hold two slots (fresh principals so the bucket allows it),
-  // the third concurrent → busy; releasing one frees a slot.
+  // Inflight cap (MAX_INFLIGHT=3): three DIFFERENT principals fill it; the fourth → busy.
   const g1 = historyGate('coach-C');
   const g2 = historyGate('coach-D');
-  assert(g1.ok && g2.ok, 'two concurrent reads occupy the two inflight slots');
-  assert(_inflightCount() === 2, `inflight should be 2, got ${_inflightCount()}`);
+  const g2b = historyGate('coach-G');
+  assert(g1.ok && g2.ok && g2b.ok, 'three concurrent reads occupy the three inflight slots');
+  assert(_inflightCount() === 3, `inflight should be 3, got ${_inflightCount()}`);
   const g3 = historyGate('coach-E');
-  assert(!g3.ok && g3.result === 'busy', 'a third concurrent read → busy (inflight cap)');
-  releaseInflight(); // free one slot
-  assert(_inflightCount() === 1, `inflight should drop to 1 after release, got ${_inflightCount()}`);
+  assert(!g3.ok && g3.result === 'busy', 'a fourth concurrent read → busy (inflight cap)');
+  releaseInflight('coach-C'); // free one slot
+  assert(_inflightCount() === 2, `inflight should drop to 2 after release, got ${_inflightCount()}`);
   const g4 = historyGate('coach-F');
   assert(g4.ok, 'a slot freed → the next read is admitted');
-  releaseInflight();
-  releaseInflight();
+  releaseInflight('coach-D');
+  releaseInflight('coach-F');
+  releaseInflight('coach-G');
+
+  // PHASE 6: the per-principal SHARE of the shared cap. The rate bucket is not a fairness control for
+  // the SURFACE — a checker pass had one authenticated principal, well inside its own bucket, hold every
+  // slot continuously and deny another coach 39 of 40 reads. A principal now gets at most
+  // OFFLOOP_MAX_PER_PRINCIPAL of them, so it can never take the review surface to zero for everyone else.
+  {
+    assert(_inflightCount() === 0, 'precondition: no slots held');
+    const mine = [historyGate('greedy'), historyGate('greedy')];
+    assert(mine.every((g) => g.ok), `a principal may hold ${OFFLOOP_MAX_PER_PRINCIPAL} slots (its Review page uses two)`);
+    const third = historyGate('greedy');
+    assert(!third.ok && third.result === 'busy', 'a THIRD slot for the same principal must be refused');
+    assert(_principalSlots('greedy') === 2, `the greedy principal should hold 2, got ${_principalSlots('greedy')}`);
+    // ...and the point of the whole thing: somebody else can still read.
+    const victim = historyGate('other-coach');
+    assert(victim.ok, 'ANOTHER principal must still get a slot — this is the starvation fix');
+    releaseInflight('other-coach');
+    releaseInflight('greedy');
+    releaseInflight('greedy');
+    assert(_principalSlots('greedy') === 0, 'a fully released principal must leave no map entry behind');
+    assert(_inflightCount() === 0, 'the shared counter must return to 0');
+  }
 
   // === 5. NO NAME FIELD IN ANY RESULT ROW (§0.1) ======================================
   // Scan every aggregate player + raw fix object for a name-shaped key. The structural guarantee:

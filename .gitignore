@@ -34,6 +34,17 @@ auth-accounts.json
 # Per-session config incl. age band. SESSION_CONFIG_FILE (server/session-config.ts).
 session-config.json
 *session-config*.json*
+# Session handover across a graceful restart (Phase 6). AUTH_SESSIONS_FILE (server/src/auth.ts).
+# It holds sha256(token), never a usable bearer token — but it names every logged-in coach and its
+# CSRF values, and it has no business in a diff.
+auth-sessions.json
+*auth-sessions*.json*
+# VACUUM INTO backups of the telemetry store (server/backup-db.ts). Each one is a COMPLETE copy of
+# children's raw location, so it is exactly as sensitive as telemetry.db — and the *.db rules below
+# already catch the filenames the tool writes; this covers the directory wholesale, including any
+# copy an operator drops in beside them.
+backups/
+/server/data/backups/
 # mosquitto credential DB: `mosquitto_passwd -c ft.passwd ingest` (server/mosquitto/README.md).
 # Upstream mosquitto/apache docs name this file half a dozen ways; cover the conventional ones.
 # NOTE: ft.acl is intentionally NOT ignored — it maps pseudonymous player ids to topic scopes
@@ -70,6 +81,9 @@ id_ed25519
 *.db
 *.db-wal
 *.db-shm
+# -journal: VACUUM against a backup (journal_mode=delete, which is what VACUUM INTO produces) writes
+# a rollback journal holding the PRE-erasure page images of children's positions.
+*.db-journal
 *.sqlite
 *.sqlite3
 # Backups and dumps carry exactly the same rows as the live store. `VACUUM INTO` backups

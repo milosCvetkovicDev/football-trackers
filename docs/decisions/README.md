@@ -50,3 +50,10 @@ has gone dark is visible from `/metrics` at all — deliberately not an error/RU
 (stack traces, URLs, DOM context) is exactly what 0010/0016 exist to keep children out of. The same phase
 amends **0019**, which now also stores each session's four measured **pitch corners** (they were compiled into
 the client bundle, pointing at a bench in Belgrade).
+ADR-0025 (audit Phase 6) makes the box **operable**: an ordered graceful teardown on a process that can
+actually receive SIGTERM (`docker stop` went from exit 137 in 1.3 s to exit 0 in 0.1 s), a `user_version`
+migration ladder that refuses a store newer than the build, and `VACUUM INTO` backups that inherit
+**0010**'s retention window and are reached by **0010**'s erasure CLI — because a backup is a complete copy
+of the same children's location. It also closes the item Phase 5 deferred (server-side scan cancellation)
+and stores session tokens as `sha256` verifiers, which is what makes carrying coaches' logins across a
+restart safe. TLS for the field box is explicitly still open.

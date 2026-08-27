@@ -204,6 +204,21 @@ try {
     }
   }, 100); // 12 players × 10 Hz = ~120 msg/s of live fan-out
 
+  // --- 8a. A REAL /live subscriber, so "fan-out" below means DELIVERED, not merely attempted. -------------
+  // Phase 6 made server.publish()'s return meaningful: 0 = dropped (no subscriber), -1 = backpressure.
+  // Before that, ft_ws_messages_sent_total counted ATTEMPTS — so this SLO section used to pass with no
+  // client connected at all: it measured "ingest kept running", not "frames reached a coach". With a real
+  // socket attached it measures what its own assertion claims, and it doubles as the regression guard for
+  // the drop accounting (delete the subscriber and the sanity check below goes red).
+  const liveWs = new WebSocket(`ws://127.0.0.1:${PORT}/live?sessionId=${SESSION}`, {
+    headers: { cookie, origin: ORIGIN },
+  } as unknown as string[]);
+  await new Promise<void>((res, rej) => {
+    liveWs.onopen = () => res();
+    liveWs.onerror = () => rej(new Error('/live subscriber failed to connect'));
+    setTimeout(() => rej(new Error('/live subscriber connect timeout')), 8000);
+  });
+
   await sleep(1200); // let the feed reach steady state
   const before = await wsSent();
   await sleep(500);

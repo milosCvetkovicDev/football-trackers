@@ -156,9 +156,123 @@ check(
   `${provision} is missing, but docker-compose.yml requires the .env and ft.passwd it writes`,
 );
 
+// ── 7. PHASE 6: the dev stack must stay SIGNAL-DELIVERABLE ───────────────────────────────────────
+// Measured before Phase 6: `docker stop ft-server` exited 137 (SIGKILL) in 1.3 s, because the command
+// was `sh -c "…"` — sh is pid 1, does not forward SIGTERM, and Bun therefore never ran a line of the
+// teardown. Two things fix it and BOTH must stay: `exec` (so bun replaces the shell) and `init: true`
+// (so a stop during `bun install` is also delivered). Dropping either silently restores the 137, and
+// no runtime test can see it because the suites spawn bare processes, not containers.
+check(
+  'the dev server command execs bun (so bun, not sh, receives SIGTERM)',
+  /command:\s*sh -c "[^"]*\bexec bun run src\/server\.ts"/.test(composeText),
+  'docker-compose.yml must run the server via `exec bun run src/server.ts` — without exec, sh stays pid 1 and `docker stop` is a SIGKILL (exit 137)',
+);
+check(
+  'the dev server sets init: true (signals are delivered during the install window too)',
+  /\binit:\s*true\b/.test(composeText),
+  'docker-compose.yml must set `init: true` on the server service',
+);
+check(
+  'the dev server installs from the lockfile (--frozen-lockfile)',
+  /bun install --frozen-lockfile/.test(composeText),
+  'the dev stack must install exactly what bun.lock says, not resolve something newer at container start',
+);
+check(
+  'the dev server has a healthcheck on /health',
+  /healthcheck:/.test(composeText) && /healthcheck\.ts/.test(composeText),
+  'docker-compose.yml must healthcheck the server via `bun run /app/healthcheck.ts` (this image has no curl/wget/nc)',
+);
+for (const svc of ['mosquitto', 'server']) {
+  check(
+    `the ${svc} service caps its log size`,
+    (composeText.match(/max-size/g) ?? []).length >= 2,
+    'both services need `logging: driver: json-file, options: {max-size, max-file}` — the default json-file driver is unbounded and fills the disk the store lives on',
+  );
+}
+
+// ── 8. PHASE 6: the PRODUCTION stack (audit I-1) ─────────────────────────────────────────────────
+// The audit's finding was "no production artifact" — so these checks are about the artifact existing
+// AND not quietly inheriting the dev stack's deliberate compromises (anon mode, a LAN-published port).
+const PROD = join(REPO, 'deploy', 'production', 'compose.yml');
+check('deploy/production/compose.yml exists (audit I-1)', existsSync(PROD), `${PROD} is missing`);
+if (existsSync(PROD)) {
+  const prod = readFileSync(PROD, 'utf8');
+  const prodLines = directives(PROD);
+  check(
+    'production does NOT enable anonymous live access',
+    !/^\s*ALLOW_ANONYMOUS_LIVE:\s*"?true"?/m.test(prod),
+    'deploy/production/compose.yml sets ALLOW_ANONYMOUS_LIVE=true — production must authenticate every read of a child position',
+  );
+  check(
+    "production publishes the server on loopback only (it belongs behind the TLS proxy)",
+    prodLines.some((l) => /^-\s*"127\.0\.0\.1:\d+:3000"$/.test(l)),
+    `no "127.0.0.1:<port>:3000" mapping in ${PROD}`,
+  );
+  check(
+    'production does NOT publish the broker on every interface',
+    !prodLines.some((l) => /^-\s*"(0\.0\.0\.0:)?\d+:1883"$/.test(l)),
+    `${PROD} publishes 1883 on all interfaces — it must bind the field AP address (\${FIELD_AP_IP})`,
+  );
+  check(
+    'production mounts the SAME authenticated broker config as dev',
+    /server\/mosquitto:\/mosquitto\/config/.test(prod),
+    `${PROD} must mount server/mosquitto — one broker config, exercised on every bench run`,
+  );
+  check(
+    'production sets init: true + a stop_grace_period (the teardown can actually run)',
+    /\binit:\s*true\b/.test(prod) && /stop_grace_period:/.test(prod),
+    `${PROD} must set init: true and stop_grace_period on the server service`,
+  );
+  check(
+    'production sets AUTH_COOKIE_SECURE=true',
+    /AUTH_COOKIE_SECURE:\s*"?true"?/.test(prod),
+    `${PROD} must keep session cookies Secure`,
+  );
+}
+
+// ── 9. PHASE 6: the production IMAGE must be non-root and carry no personal data ─────────────────
+const DOCKERFILE = join(REPO, 'server', 'Dockerfile');
+const DOCKERIGNORE = join(REPO, 'server', '.dockerignore');
+check('server/Dockerfile exists', existsSync(DOCKERFILE), `${DOCKERFILE} is missing`);
+if (existsSync(DOCKERFILE)) {
+  const df = readFileSync(DOCKERFILE, 'utf8');
+  // The LAST USER wins, so a lookahead over "any USER line" passes on a Dockerfile that ends `USER root`
+  // — a checker pass appended exactly that and this file still printed "37 checks passed ... non-root".
+  const lastUser = [...df.matchAll(/^USER\s+(\S+)/gm)].map((m) => m[1]).pop();
+  check(
+    'the image runs as a non-root user (the LAST USER instruction wins)',
+    lastUser !== undefined && lastUser !== 'root' && lastUser !== '0',
+    `${DOCKERFILE}'s effective USER is ${lastUser ?? '(none — defaults to root)'}`,
+  );
+  check('the image installs from the lockfile', /--frozen-lockfile/.test(df), `${DOCKERFILE} must use bun install --frozen-lockfile`);
+  check(
+    'the image uses an exec-form CMD (so SIGTERM reaches bun)',
+    /^CMD\s*\[/m.test(df),
+    `${DOCKERFILE} must use the JSON/exec form of CMD — a shell form re-creates the exit-137 bug`,
+  );
+  check('the image pins its base tags (no :latest)', !/^FROM\s+\S+:latest/m.test(df), `${DOCKERFILE} must not use a :latest base image`);
+  check(
+    'the image never COPYs the whole context',
+    !/^COPY\s+\.\s+\.?/m.test(df),
+    `${DOCKERFILE} uses \`COPY . .\` — that would bake roster.json / auth-accounts.json / the store into a layer`,
+  );
+}
+check('server/.dockerignore exists', existsSync(DOCKERIGNORE), `${DOCKERIGNORE} is missing`);
+if (existsSync(DOCKERIGNORE)) {
+  const di = directives(DOCKERIGNORE);
+  // These four are the reason the file exists: names, password hashes, the raw store, broker creds.
+  for (const must of ['roster.json', 'auth-accounts.json', 'data', 'mosquitto/ft.passwd']) {
+    check(
+      `.dockerignore excludes ${must}`,
+      di.includes(must),
+      `${DOCKERIGNORE} must list ${must} — an image layer survives every later deletion and travels with the image`,
+    );
+  }
+}
+
 if (failures.length) {
   console.error(`\n❌ deploy-posture: ${failures.length} of ${checks} checks FAILED:\n`);
   for (const f of failures) console.error(`   • ${f}\n`);
   process.exit(1);
 }
-console.log(`\n✅ deploy-posture: ${checks} checks passed — the dev stack is loopback-published and its broker is authenticated.\n`);
+console.log(`\n✅ deploy-posture: ${checks} checks passed — the dev stack is loopback-published, signal-deliverable and its broker is authenticated;\n   the production stack authenticates every read, publishes nothing on 0.0.0.0, and its image is non-root with no personal data in it.\n`);

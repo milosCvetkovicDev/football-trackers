@@ -22,7 +22,9 @@
  * offending value so the operator sees exactly what was rejected — and the file is left UNTOUCHED
  * (validate before load/write), so a typo can never corrupt an existing config.
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { writeSecretFile } from './src/secretFile';
+import { withFileLock } from './src/fileLock';
 
 type AgeBand = 'U12' | 'U14' | 'U16' | 'U19';
 interface LatLon {
@@ -70,7 +72,10 @@ function load(): SessionConfigFile {
 }
 
 function save(file: SessionConfigFile): void {
-  writeFileSync(FILE, JSON.stringify(file, null, 2) + '\n', { mode: 0o600 });
+  // 0600 via an atomic temp+rename+chmod (src/secretFile.ts). `writeFileSync(..., { mode })`
+  // applies the mode only when the file is CREATED, so an existing 0644 file stayed 0644 —
+  // the audit's "mode 0o600 is a no-op" finding, verified on both write paths.
+  writeSecretFile(FILE, JSON.stringify(file, null, 2) + '\n');
 }
 
 function cmdSet(): void {
@@ -230,18 +235,25 @@ function cmdList(): void {
   if (total === 0) console.log(`(no session configs in ${FILE})`);
 }
 
+/** Mutating commands serialise on the shared file lock — see auth-user.ts's note on the same change. */
+const mutate = async (fn: () => void | Promise<void>): Promise<void> => {
+  await withFileLock(FILE, { what: 'session-config', envHint: 'SESSION_CONFIG_FILE' }, async () => {
+    await fn();
+  });
+};
+
 switch (cmd) {
   case 'set':
-    cmdSet();
+    await mutate(cmdSet);
     break;
   case 'set-pitch':
-    cmdSetPitch();
+    await mutate(cmdSetPitch);
     break;
   case 'clear-pitch':
-    cmdClearPitch();
+    await mutate(cmdClearPitch);
     break;
   case 'remove':
-    cmdRemove();
+    await mutate(cmdRemove);
     break;
   case 'list':
     cmdList();

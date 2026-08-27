@@ -8,11 +8,45 @@
  */
 
 import { Database } from 'bun:sqlite';
+import { chmodSync, existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import type { Telemetry } from './types';
 import { DB_PATH } from './db-path';
 import { envInt } from './env';
+import { assertOurs, migrate } from './migrate';
+import { metrics } from './metrics';
+import { log } from './log';
+import { purgePlayerBatchOn, purgePlayerOn } from './erase';
 
-const db = new Database(DB_PATH, { create: true });
+function openStore(): Database {
+  try {
+    return new Database(DB_PATH, { create: true });
+  } catch (err) {
+    // A raw `SQLiteError: unable to open database file` naming line 20 of this file is not something an
+    // operator can act on — and under `restart: unless-stopped` it repeats forever (measured: 8 restarts
+    // in 25 s against a read-only /data). The store's own directory is the single most likely thing to be
+    // wrong on a first deployment, and the production README's own named trap: Docker creates a missing
+    // bind-mount directory owned by ROOT, while the image deliberately runs as uid 1000. Say that.
+    const code = (err as { code?: string })?.code ?? 'error';
+    log.error('cannot open the telemetry store — the server cannot start', {
+      dbPath: resolve(DB_PATH),
+      directory: dirname(resolve(DB_PATH)),
+      code,
+      uid: typeof process.getuid === 'function' ? process.getuid() : null,
+      fix: 'the directory must exist and be writable by THIS uid. In Docker: `sudo mkdir -p <dir> && sudo chown -R 1000:1000 <dir>` on the host (the image runs as uid 1000, and Docker creates a missing bind-mount directory as root). Otherwise check DB_PATH.',
+    });
+    throw err;
+  }
+}
+
+const db = openStore();
+
+// BEFORE any pragma that writes. `PRAGMA journal_mode = WAL` rewrites the file header, so checking
+// afterwards means a boot that is about to refuse the store has already converted it (checker finding).
+// Throws SchemaTooNewError (a rollback / the wrong path) or ForeignStoreError (a SQLite database that is
+// not ours — a DB_PATH typo used to get our schema written into it, `user_version` and all).
+assertOurs(db);
+
 db.exec('PRAGMA journal_mode = WAL;');
 db.exec('PRAGMA synchronous = NORMAL;');
 // Audit §4.5(a): secure_delete zeroes freed pages in the page images THIS connection writes — and in
@@ -30,50 +64,30 @@ db.exec('PRAGMA busy_timeout = 5000;');
 // freed pages on every DELETE so the retention sweep and purge-player erasure
 // actually destroy the bytes (defence-in-depth alongside OS full-disk encryption).
 db.exec('PRAGMA secure_delete = ON;');
-db.exec(`
-  CREATE TABLE IF NOT EXISTS telemetry (
-    server_ts  INTEGER NOT NULL,   -- authoritative ingest timestamp
-    session_id TEXT    NOT NULL,
-    player_id  TEXT    NOT NULL,
-    device_id  TEXT    NOT NULL,
-    device_ts  INTEGER NOT NULL,   -- device clock, ordering only
-    lat        REAL    NOT NULL,
-    lon        REAL    NOT NULL,
-    spd        REAL,
-    hdg        REAL,
-    fix        INTEGER,
-    sats       INTEGER,
-    pdop       REAL
-  );
-`);
-db.exec(
-  'CREATE INDEX IF NOT EXISTS idx_telemetry_session_ts ON telemetry(session_id, server_ts);',
-);
-// The retention sweep deletes by server_ts alone; the composite index above can't
-// serve that range (session_id leads), so give it a dedicated index to avoid a
-// full-table scan every sweep.
-db.exec('CREATE INDEX IF NOT EXISTS idx_telemetry_server_ts ON telemetry(server_ts);');
-// Erasure deletes by player (optionally within a session). Without this index that DELETE is a full
-// table SCAN holding the write lock — with secure_delete zeroing every freed page — for tens of seconds
-// during a match (audit §4.5). (player_id, session_id) serves both the all-sessions and the one-session
-// form, and the rowid-subquery batching below keeps each statement short.
-db.exec('CREATE INDEX IF NOT EXISTS idx_telemetry_player ON telemetry(player_id, session_id);');
-// Phase 4 (audit F-1): the firmware's crash-safe backlog replay re-sends up to one checkpoint window of
-// records after a reboot; dedupe them here. `seq` is the device's monotonic sequence (nullable — pre-Phase-4
-// firmware sends none, and NULLs are exempt from the unique index). ALTER-if-missing keeps existing stores
-// working without a migration framework (that's Phase 6).
+
+// Phase 6: the schema is a `PRAGMA user_version` ladder in migrate.ts, not a pile of IF NOT EXISTS run
+// on every boot. This throws SchemaTooNewError when the store is NEWER than this build knows — an
+// uncaught throw here is deliberate: the process must not come up and start writing through a schema
+// it does not understand. `dbSchemaVersion` makes the resulting version answerable from /metrics, so a
+// field box that failed to migrate is not indistinguishable from one that did.
+const schemaAt = migrate(db);
+metrics.dbSchemaVersion.set({}, schemaAt);
+
+// The store is children's raw location, and bun:sqlite creates it at the process umask — observed 0644
+// inside the production image, i.e. readable by every account on the box. The name and credential files
+// are 0600 (src/secretFile.ts); there is no reason the positions themselves should be looser. The two
+// sidecars carry the same page images, so they get the same treatment.
 //
-// The key is (player_id, DEVICE_ID, seq), not (player_id, seq): the crash re-send this exists to catch always
-// comes from the SAME device, while a replacement tracker enrolled for the same player starts its sequence
-// fresh — with a player-scoped key its real fixes would collide with the dead device's retained rows and be
-// silently swallowed for up to the retention window (checker finding). device_id embeds the MAC tail, so a
-// replacement never collides; a full-NVS-erase of the SAME device is covered by the firmware's random seq base.
-{
-  const cols = db.query("PRAGMA table_info(telemetry)").all() as { name: string }[];
-  if (!cols.some((c) => c.name === 'seq')) db.exec('ALTER TABLE telemetry ADD COLUMN seq INTEGER;');
+// Best-effort by design: some mounts (a Windows/CIFS bind, for one) do not implement chmod, and a field
+// box refusing to boot over a permission bit it cannot set would be a worse failure than the one this
+// prevents. It warns instead — loudly enough to be actionable, quietly enough not to be fatal.
+for (const p of [DB_PATH, `${DB_PATH}-wal`, `${DB_PATH}-shm`]) {
+  try {
+    if (existsSync(p)) chmodSync(p, 0o600);
+  } catch (err) {
+    log.warn('could not tighten store permissions', { path: p, err: String(err) });
+  }
 }
-db.exec('DROP INDEX IF EXISTS idx_telemetry_dedupe;'); // v1 (player-scoped) — superseded; no-op once gone
-db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_telemetry_dedupe2 ON telemetry(player_id, device_id, seq) WHERE seq IS NOT NULL;');
 
 // OR IGNORE: a conflict on the (player_id, seq) dedupe index is a replay re-send, not an error — the caller
 // reads `changes` to tell "inserted" from "duplicate" (and only fans out the former).
@@ -134,13 +148,8 @@ const deleteOlderThanBatch = db.query(
   'DELETE FROM telemetry WHERE rowid IN (SELECT rowid FROM telemetry WHERE server_ts < $cutoff LIMIT $limit)',
 );
 const minServerTs = db.query('SELECT MIN(server_ts) AS m FROM telemetry');
-// Same bounded-DELETE shape as the retention sweep, keyed on idx_telemetry_player.
-const deletePlayerAllBatch = db.query(
-  'DELETE FROM telemetry WHERE rowid IN (SELECT rowid FROM telemetry WHERE player_id = $player LIMIT $limit)',
-);
-const deletePlayerSessionBatch = db.query(
-  'DELETE FROM telemetry WHERE rowid IN (SELECT rowid FROM telemetry WHERE player_id = $player AND session_id = $session LIMIT $limit)',
-);
+// The per-player erasure DELETEs live in erase.ts so that purge-player.ts can run the IDENTICAL
+// statements against every VACUUM INTO backup (Phase 6). One definition, two callers.
 // One indexed seek per roster session (idx_telemetry_session_ts leads on session_id). NOT `SELECT
 // DISTINCT session_id` — that plans as a full covering-index SCAN, linear in ROWS, and the sweep runs on the
 // live event loop (the checker measured ~170 ms+ at a 30-day store, hourly).
@@ -171,9 +180,7 @@ export function oldestServerTs(): number | null {
  * session). Returns rows removed. Exposed so the loop below is testable at the batch boundary.
  */
 export function purgePlayerBatch(playerId: string, sessionId: string | undefined, limit: number): number {
-  return sessionId
-    ? deletePlayerSessionBatch.run({ $player: playerId, $session: sessionId, $limit: limit }).changes
-    : deletePlayerAllBatch.run({ $player: playerId, $limit: limit }).changes;
+  return purgePlayerBatchOn(db, playerId, sessionId, limit);
 }
 
 /**
@@ -187,15 +194,7 @@ export async function purgePlayer(
   sessionId?: string,
   opts: { batch?: number } = {},
 ): Promise<number> {
-  const limit = opts.batch ?? PURGE_BATCH_DEFAULT;
-  let removed = 0;
-  let n: number;
-  do {
-    n = purgePlayerBatch(playerId, sessionId, limit);
-    removed += n;
-    if (n === limit) await Bun.sleep(2); // let the server's pending insert through between batches
-  } while (n === limit);
-  return removed;
+  return purgePlayerOn(db, playerId, sessionId, opts.batch ?? PURGE_BATCH_DEFAULT);
 }
 
 export interface CheckpointResult { busy: number; log: number; checkpointed: number }
@@ -253,6 +252,34 @@ export function dbProbe(): boolean {
   const now = Date.now();
   if (lastInsertErrorTs > lastInsertOkTs && now - lastInsertErrorTs < INSERT_ERROR_HOLD_MS) return false;
   return true;
+}
+
+/**
+ * Phase 6 shutdown step: flush what we can into the main file, then close the handle.
+ *
+ * PASSIVE, not TRUNCATE. A TRUNCATE checkpoint takes the write lock and busy-waits for readers — which
+ * is exactly the step most likely to blow the 1.5 s shutdown budget and hand the kill back to Docker,
+ * for a benefit that is cosmetic here (WAL frames are not lost; the next boot replays them). Erasure is
+ * the case that genuinely needs TRUNCATE, and purge-player.ts does it there with its own short timeout.
+ *
+ * Returns the checkpoint result for the log. Never throws: shutdown steps that throw are logged by the
+ * runner, but a store that is already gone should not look like a shutdown failure.
+ */
+export function closeDb(): { checkpointed: number; busy: number } | null {
+  try {
+    setBusyTimeout(200); // do not sit on a reader while the process is trying to exit
+    const r = checkpointPassive();
+    // `close(false)` = throwOnError:false. Verified in this Bun build: `close(true)` with a live
+    // prepared statement throws "database is locked", and this module ALWAYS has prepared statements
+    // alive — so `true` here would fail every shutdown, get caught below, and leak the handle. Not
+    // throwing is the right call on an exit path; the comment that used to sit here claimed the opposite.
+    db.close(false);
+    log.info('db closed', { checkpointed: r.checkpointed, busy: r.busy, walFrames: r.log });
+    return { checkpointed: r.checkpointed, busy: r.busy };
+  } catch (err) {
+    log.warn('db close incomplete', { err: String(err) });
+    return null;
+  }
 }
 
 /** Does this session still have at least one stored fix? One indexed seek. */

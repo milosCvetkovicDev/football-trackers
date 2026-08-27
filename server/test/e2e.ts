@@ -39,6 +39,9 @@ const ORIGIN = 'http://localhost:5173';
 const COACH = 'coach-e2e';
 const COACH_PW = 'coach-e2e-pw';
 const ACCOUNTS_FILE = '/tmp/ft-e2e-accounts.json';
+// Phase 6: the server writes the restart handover next to the accounts file. Named here so the test
+// cleans it up rather than leaving a file of session hashes in /tmp between runs.
+const SESSIONS_FILE = '/tmp/auth-sessions.json';
 // With AUTH_COOKIE_SECURE=false the cookie name is 'ft_session' (no __Host- prefix). See server/src/auth.ts.
 const COOKIE_NAME = 'ft_session';
 
@@ -431,6 +434,43 @@ try {
     assert(n === 270, `(P4) a ~45/s sustained replay+live load must be fully accepted (cap 50/s) — a cap regression to 15/s drops ~half; got ${n}/270`);
   }
 
+  // --- 14b. PHASE 6 (audit §6 "Server"): a publish with NO subscriber is a DROP, not a send -------------
+  // server.publish()'s return was discarded, so ft_ws_messages_sent_total counted ATTEMPTS and called
+  // them sends: a coach tablet stalling behind a slow link lost frames while the "sent" rate climbed at
+  // full speed. Close every socket, publish a valid fix, and require the two counters to move in
+  // OPPOSITE directions — sent flat, dropped up. (Runs BEFORE the /health cases: it ends the WS
+  // session, and case 16 drops the telemetry table — after which ingest throws on insert and never
+  // reaches publish() at all, so a drop could never be observed there.)
+  {
+    /** Sum of a counter's samples across every label set. */
+    const sumCounter = (text: string, name: string): number => {
+      let sum = 0;
+      for (const line of text.split('\n')) {
+        if (!line.startsWith(name)) continue;
+        const v = Number(line.slice(line.lastIndexOf(' ') + 1));
+        if (Number.isFinite(v)) sum += v;
+      }
+      return sum;
+    };
+    ws.close();
+    unauth.close();
+    await sleep(300); // let the server observe the closes before it is asked to publish into an empty room
+    const before = await fetch(`http://127.0.0.1:${METRICS_PORT}/metrics`).then((r) => r.text());
+    const sentBefore = sumCounter(before, 'ft_ws_messages_sent_total');
+    const droppedBefore = sumCounter(before, 'ft_ws_dropped_total');
+    pub.publish(TOPIC_01, JSON.stringify({ ...good, ts: 999, lat: 44.8126 }), { qos: 0 });
+    await sleep(700);
+    const after = await fetch(`http://127.0.0.1:${METRICS_PORT}/metrics`).then((r) => r.text());
+    const sentAfter = sumCounter(after, 'ft_ws_messages_sent_total');
+    const droppedAfter = sumCounter(after, 'ft_ws_dropped_total');
+    assert(droppedAfter > droppedBefore,
+      `a publish with no subscriber must be counted as a DROP (ft_ws_dropped_total ${droppedBefore} -> ${droppedAfter})`);
+    assert(sentAfter === sentBefore,
+      `"sent" must mean DELIVERED — with no subscriber it must not move (${sentBefore} -> ${sentAfter})`);
+    assert(/ft_ws_dropped_total\{[^}]*reason="dropped"[^}]*\}/.test(after),
+      'the drop must carry reason="dropped" so backpressure is distinguishable from an empty room');
+  }
+
   // --- 15. (S-4) /health tells the truth: 200 + ok while subscribed, 503 + mqtt:false within 5 s of broker loss
   const healthy = await fetch(`http://127.0.0.1:${METRICS_PORT}/health`);
   const hb = (await healthy.json()) as { ok: boolean; mqtt: boolean; db: boolean };
@@ -464,11 +504,10 @@ try {
   }
 
   console.log('\n✅ E2E PASSED — authed broker, cookie-gated WS, id_mismatch + ACL spoof blocked, 1 row persisted, /metrics correct, '
-    + 'wire fields coerced (no injection), skewed status harmless, session labels bounded, /health truthful');
+    + 'wire fields coerced (no injection), skewed status harmless, session labels bounded, /health truthful, '
+    + 'undelivered fan-out counted as dropped rather than sent');
   pub.end();
-  ws.close();
-  unauth.close();
-  for (const f of [PW_FILE, ACL_FILE, CONF_FILE, ACCOUNTS_FILE]) { if (existsSync(f)) rmSync(f); }
+  for (const f of [PW_FILE, ACL_FILE, CONF_FILE, ACCOUNTS_FILE, SESSIONS_FILE]) { if (existsSync(f)) rmSync(f); }
   stop();
   process.exit(0);
 } catch (err) {

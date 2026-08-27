@@ -67,10 +67,13 @@ const MUST_IGNORE: Array<[path: string, why: string]> = [
   ['server/data/roster.json', 'same file under the containerised store (Phase 2b bind mount)'],
   ['server/auth-accounts.json', 'argon2id coach password hashes (AUTH_ACCOUNTS_FILE — auth-user.ts)'],
   ['server/session-config.json', 'per-session config incl. age band (session-config.ts)'],
+  ['server/auth-sessions.json', 'the Phase 6 restart handover: sha256(token) + every logged-in coach + their CSRF values'],
+  ['server/data/backups/telemetry-2026-08-27T11-42-05Z.db', 'a VACUUM INTO backup is a COMPLETE copy of children\u2019s location'],
   ['server/mosquitto/ft.passwd', 'mosquitto credential DB — every wearable authenticates with it'],
   ['server/telemetry.db', "children's positions at rest"],
   ['server/telemetry.db-wal', 'WAL sidecar — holds pre-checkpoint page images of the same rows'],
   ['server/telemetry.db-shm', 'shared-memory index for the WAL'],
+  ['server/telemetry.db-journal', "VACUUM against a DELETE-mode store (what VACUUM INTO produces) writes pre-erasure page images here"],
   ['.env', 'ROBOFLOW_API_KEY and any MQTT/AUTH override'],
   ['vision/.env', 'docker compose sources it for ROBOFLOW_API_KEY'],
   ['.claude/settings.local.json', 'machine-local permissions, may name local paths'],
@@ -139,6 +142,7 @@ const SENSITIVE_SHAPES: Array<[re: RegExp, what: string]> = [
   [/(^|\/)[^/]*roster[^/]*\.json(\.\w+)?$/i, 'child-name roster (or a copy of one)'],
   [/(^|\/)[^/]*auth-accounts[^/]*\.json(\.\w+)?$/i, 'password hashes (or a copy)'],
   [/(^|\/)[^/]*session-config[^/]*\.json(\.\w+)?$/i, 'session config (or a copy)'],
+  [/(^|\/)[^/]*auth-sessions[^/]*\.json(\.\w+)?$/i, 'the restart session handover (or a copy)'],
   // Broker credentials: *.passwd is the repo's convention, but mosquitto's own docs use bare
   // `passwd`/`pwfile`/`passwords` just as often.
   [/\.passwd$/i, 'broker credential DB'],

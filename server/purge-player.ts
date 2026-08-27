@@ -34,8 +34,9 @@
  *      become an "erased 0" success record that gets filed for the real player).
  *   3  TRANSIENT: the erasure did not complete (roster locked by a live writer, DB busy, delete failed). The
  *      receipt's `erased` is the TRUE number of rows already deleted. Re-run; it is idempotent.
- *   4  rows and roster entry erased, but the on-disk rebuild did not complete (a reader pinned the WAL, or a
- *      live writer held the checkpoint lock) — residue may remain. Re-run the SAME command until it exits 0.
+ *   4  rows and roster entry erased, but the on-disk rebuild did not complete (a reader pinned the WAL, a
+ *      live writer held the checkpoint lock, or a BACKUP could not be erased) — residue may remain. Re-run
+ *      the SAME command until it exits 0.
  *   5  PERMANENT — fix something, do not just retry: DB_PATH is the wrong file (missing, empty, not SQLite,
  *      read-only), the disk is too full for the rebuild, or the roster is unreadable/malformed/unwritable
  *      (wrong AUTH_ROSTER_FILE path, permissions, a lock that cannot be removed, a name inside a structure the
@@ -43,10 +44,22 @@
  *      otherwise CREATE a missing DB or INITIALISE an empty one and report "erased 0" as success (audit §4.5 e).
  *   `rosterFound` is null on a receipt emitted before the roster was read; false = no file at the path named.
  *
- * Residuals this CLI cannot reach from a separate process: (a) per-player Prometheus series in the RUNNING
- * server's in-memory registry (pseudonymous, loopback-only /metrics; restart the server to clear them);
- * (b) any file-level backup of telemetry.db taken before this wipe. See the erasure runbook in
- * docs/architecture/observability.md.
+ * READ `backupsFound` ON THE RECEIPT. It says whether the directory named in `backupDir` existed at all.
+ * `backups: []` alone cannot distinguish "this box takes no backups" from "BACKUP_DIR is the host path
+ * and the container's copies were never opened" — and this receipt is a compliance record, so it must not
+ * be able to say "erased" over copies it never looked at. Same signal, same reason, as `rosterFound`.
+ *
+ * BACKUPS ARE ERASED TOO (Phase 6). This used to read "a file-level backup taken before this wipe is a
+ * residual this CLI cannot reach" — which stopped being acceptable the moment backups became a supported
+ * feature (src/backup.ts). Every `telemetry-*.db` in BACKUP_DIR now gets the SAME erasure statements
+ * (src/erase.ts) plus its own VACUUM, and the receipt carries a per-file result that PROVES it by
+ * re-counting. A backup that could not be erased is exit 4 with `retry:true`, never a silent success.
+ * Backups THIS command cannot see — copies an operator made elsewhere, an SD-card image — remain the
+ * operator's responsibility, and the runbook says so.
+ *
+ * The one residual that genuinely remains: per-player Prometheus series in the RUNNING server's in-memory
+ * registry (pseudonymous, loopback-only /metrics; restart the server to clear them). See the erasure
+ * runbook in docs/architecture/observability.md.
  */
 
 import { dirname, resolve } from 'node:path';
@@ -114,6 +127,13 @@ let checkpointMs = -1;
 let walTruncated = false;
 let wal: { busy: number; log: number; checkpointed: number } | undefined;
 let failure: Error | undefined;
+let backups: Awaited<ReturnType<typeof import('./src/backup').purgePlayerFromBackups>> = [];
+let backupsMs = -1;
+// Which directory was searched, and did it exist? `backups: []` on its own is indistinguishable from
+// "BACKUP_DIR is a typo / the host path instead of the container one" — and the receipt is a compliance
+// record. This is the same signal `rosterFound` already provides for the roster, for the same reason.
+let backupDir: string | null = null;
+let backupsFound: boolean | null = null;
 
 let dbMod: typeof import('./src/db') | undefined;
 try {
@@ -140,6 +160,16 @@ try {
   await withRosterLock(async () => {
     rosterEntriesErased = await purgeRosterPlayer(playerId, sessionId);
   });
+  // 4. Every backup is a full copy of the same children's location data (Phase 6). Same statements, same
+  //    VACUUM, and the count is re-read afterwards so the receipt proves the erasure instead of claiming it.
+  //    Runs after the live store so a crash between the two leaves the SMALLER surface behind, and so a
+  //    re-run (this command is idempotent) always converges.
+  const tb = performance.now();
+  const { purgePlayerFromBackups, BACKUP_DIR, backupDirExists } = await import('./src/backup');
+  backupDir = BACKUP_DIR;
+  backupsFound = backupDirExists();
+  backups = await purgePlayerFromBackups(playerId, sessionId);
+  backupsMs = Math.round(performance.now() - tb);
 } catch (err) {
   failure = err instanceof Error ? err : new Error(String(err)); // content-free by construction (roster.ts code-only errors, SQLite codes)
 } finally {
@@ -181,6 +211,15 @@ const receipt = {
   vacuumMs,
   checkpointMs,
   totalMs: Math.round(performance.now() - t0),
+  backupsMs,
+  // One entry per backup file, each with rows erased and rows REMAINING (which must be 0). Paths only —
+  // a backup filename carries a timestamp, never a player id or a name.
+  backups: backups.map((b) => ({ path: b.path, erased: b.erased, remaining: b.remaining, ok: b.ok, ...(b.error ? { error: b.error } : {}) })),
+  backupsErased: backups.reduce((n, b) => n + b.erased, 0),
+  // `backupsFound:false` = there is no directory at `backupDir`. That is a valid posture (nobody takes
+  // backups) AND the signature of a wrong BACKUP_DIR — the operator has to be able to tell which.
+  backupDir: backupDir === null ? null : shown(backupDir),
+  backupsFound,
   storeBytes,
   playerId,
   scope: sessionId ? { sessionId } : 'all sessions',
@@ -190,10 +229,21 @@ const receipt = {
 
 if (failure !== undefined) {
   const { RosterPermanentError } = await import('./src/roster');
+  const { SchemaTooNewError, ForeignStoreError } = await import('./src/migrate');
   const msg = String(failure.message ?? failure);
   // Permanent conditions — wrong path/permissions/disk — are exit 5: "retry" would never succeed. A read-only
   // store (root-owned bind mount on Linux, host vs container) and a full disk land here too.
-  if (failure instanceof RosterPermanentError || /readonly|read-only|SQLITE_FULL|disk is full/i.test(msg)) {
+  //
+  // The two schema refusals belong here as well, and used to fall through to the transient branch (checker
+  // finding): a store newer than this binary, or a DB_PATH pointing at somebody else's database, are
+  // exactly "the wrong file" — the receipt told the operator to re-run an erasure that can never succeed,
+  // and that receipt is a compliance record.
+  if (
+    failure instanceof RosterPermanentError ||
+    failure instanceof SchemaTooNewError ||
+    failure instanceof ForeignStoreError ||
+    /readonly|read-only|SQLITE_FULL|disk is full/i.test(msg)
+  ) {
     console.error(JSON.stringify({ ...receipt, error: /readonly|read-only/i.test(msg) ? `${msg} — the store is read-only for this user; run inside the container (docker compose exec) or fix ownership` : msg, retry: false }));
     process.exit(5);
   }
@@ -201,6 +251,18 @@ if (failure !== undefined) {
   // operator might mistake for a transient glitch.
   console.error(JSON.stringify({ ...receipt, error: msg, retry: true }));
   process.exit(3);
+}
+const badBackups = backups.filter((b) => !b.ok);
+if (badBackups.length > 0) {
+  // The store itself is clean, but a COPY still holds the player's fixes — which is not an erasure. Exit 4
+  // (residue), the same class as an incomplete rebuild: re-run once the cause (permissions, a locked file)
+  // is gone, or delete the offending backup outright.
+  console.error(JSON.stringify({
+    ...receipt,
+    error: `${badBackups.length} of ${backups.length} backup(s) still hold this player's fixes — the erasure is NOT complete. Fix the listed file(s) (permissions, or remove them) and re-run`,
+    retry: true,
+  }));
+  process.exit(4);
 }
 if (!walTruncated || !vacuumed) {
   // log === -1: the checkpoint could not even take the lock (a live writer's own checkpoint in progress);
@@ -211,6 +273,11 @@ if (!walTruncated || !vacuumed) {
 }
 if (rosterFound === false) {
   console.error(`note: no roster file at ${shown(rosterFile)} — names were not provisioned there (or this is the wrong cwd/AUTH_ROSTER_FILE); the receipt says rosterFound:false`);
+}
+if (backupsFound === false) {
+  console.error(`note: no backup directory at ${backupDir === null ? '(unknown)' : shown(backupDir)} — nothing was searched for copies. If this box DOES take backups, BACKUP_DIR is wrong (host path vs container path?) and the copies still hold this player; the receipt says backupsFound:false`);
+} else if (backups.length === 0 && backupsFound) {
+  console.error(`note: ${shown(backupDir!)} exists but holds no telemetry-*.db backups — nothing to erase there`);
 }
 console.log(JSON.stringify(receipt));
 process.exit(0);
