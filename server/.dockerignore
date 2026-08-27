@@ -1,0 +1,39 @@
+# What must NOT enter the build context.
+#
+# On this project this is a SECURITY control, not a size optimisation. The build context is uploaded to
+# the daemon and anything COPY'd is baked into a layer that survives every later deletion and travels
+# with the image. Four of the entries below are the reason this file exists at all:
+#
+#   roster.json          children's real names (the only place they live at rest, ADR-0016)
+#   auth-accounts.json   coaches' argon2id password hashes
+#   data/                the raw telemetry store — children's location, plus the backups beside it
+#   mosquitto/ft.passwd  broker credentials
+#
+# The Dockerfile COPYs an explicit list of files rather than `COPY . .`, so these are already excluded
+# by construction; this file is the belt to that pair of braces, and it is also what keeps a stray
+# `docker build` from shipping a 300 MB context.
+
+node_modules
+data
+backups
+*.db
+*.db-wal
+*.db-shm
+
+# Secrets and personal data — never in an image.
+roster.json
+*roster*.json*
+auth-accounts.json
+*auth-accounts*.json*
+auth-sessions.json
+session-config.json
+.env
+.env.*
+mosquitto/ft.passwd
+
+# Not needed at runtime.
+test
+tsconfig.json
+Dockerfile
+.dockerignore
+*.md

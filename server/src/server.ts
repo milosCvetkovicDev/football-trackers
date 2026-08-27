@@ -25,8 +25,9 @@ import { wsRoom, type Telemetry } from './types';
 import { startIngest } from './ingest';
 import { metrics, registry, updateRuntimeMetrics, capLabel, seedLabel } from './metrics';
 import { envInt, envNumber, envString, envBool, envTimerMs, logResolvedConfig } from './env';
-import { dbProbe } from './db';
+import { dbProbe, closeDb } from './db';
 import { startRetention, refreshRetentionGauges } from './retention';
+import { refreshBackupGauges } from './backup';
 import { log } from './log';
 import {
   initAuth,
@@ -63,6 +64,15 @@ import {
   EventsParamError,
   type EventsParams,
 } from './events';
+import { newScanBudget, ScanAborted, abortAllScans, type ScanBudget } from './scanLoad';
+import { onShutdown, installLifecycleHandlers, isDraining, STEP } from './shutdown';
+
+// FIRST, before any await, any listener and any registered step: a signal that arrives during boot must
+// be HANDLED. Bun is pid 1 in the container, and the kernel discards a signal pid 1 has no handler for —
+// so without this line a `docker stop` in the first ~150 ms waited out the whole grace period and
+// SIGKILLed (measured: exit 137 after 5.1 s). A signal at t+0 now runs whatever steps exist (none) and
+// exits 0, which is exactly right for a process that has not opened anything yet.
+installLifecycleHandlers();
 
 const PORT = envInt('PORT', 3000, { min: 1, max: 65535 });
 const METRICS_PORT = envInt('METRICS_PORT', 9464, { min: 1, max: 65535 });
@@ -196,6 +206,47 @@ function sessionGetGate(request: Request, id: string, allowAnonymous = false): G
   if (!validSessionId(id)) return { ok: false, status: 400, result: 'bad_session', username: p.username };
   if (!authorizedFor(p, id)) return { ok: false, status: 403, result: 'forbidden', username: p.username };
   return { ok: true, principal: p };
+}
+
+/**
+ * One shape for "the scan stopped early" on both off-loop surfaces (Phase 6).
+ *
+ * `client_gone` is not an error and must not be logged as one — it is the NORMAL outcome of a coach
+ * closing the tab mid-review, and before this phase it was invisible *and* kept its shared inflight
+ * slot to the very end. The status code is academic (nobody is listening), but a 499 would be a
+ * non-standard code on a surface whose other answers are all standard; 503 with the same `busy`-family
+ * semantics is honest and, crucially, `no-store` already applies.
+ *
+ * `budget` and `shutdown` DO reach a client: 503 tells the coach view to show its retry affordance
+ * rather than a permanent failure, which is the truthful reading of both.
+ */
+function scanAbortResponse(
+  surface: 'history' | 'events',
+  err: ScanAborted,
+  set: { status?: number | string },
+  sessionId: string,
+  username: string | null,
+  scan: ScanBudget | undefined,
+): { error: string } {
+  metrics.scanAborted.inc({ surface, reason: err.reason });
+  (surface === 'history' ? metrics.historyRequests : metrics.eventsRequests).inc({ result: 'aborted' });
+  // THE AUDIT TRAIL MUST NOT HAVE A HOLE WHERE THE BIGGEST READS ARE. Both the `history read` audit line
+  // and ft_history_rows_scanned_total sit AFTER the paged loop, so an aborted scan recorded no volume and
+  // no principal — on the most sensitive read in the system, the requests that touched the most of a
+  // child's trace and returned nothing were the only ones with nobody's name against them. The rows are
+  // counted here instead, from the budget, and the principal is logged like every other read.
+  const scannedRows = scan?.rowsScanned ?? 0;
+  if (scannedRows > 0) {
+    (surface === 'history' ? metrics.historyRowsScanned : metrics.eventsRowsScanned).inc(
+      surface === 'history' ? { mode: 'aborted' } : {},
+      scannedRows,
+    );
+  }
+  const fields = { surface, session: sessionId, username, scannedRows, reason: err.reason };
+  if (err.reason === 'client_gone') log.info('scan abandoned by client', fields);
+  else log.warn('scan aborted', fields);
+  set.status = 503;
+  return { error: err.reason === 'client_gone' ? 'client_gone' : 'scan_aborted' };
 }
 
 // Per-principal token bucket for the name-bearing /roster reads (bulk-export bound; ADR-0016 §1.2). Mirrors
@@ -460,13 +511,17 @@ export function createApp() {
           return g.status === 401 ? { authenticated: false } : { error: g.result };
         }
         // Per-principal gate; anon (username null) keys by IP so one LAN tablet can't starve the others.
-        const gate = historyGate(g.principal.username ?? clientIp(request, server)); // rate-limit BEFORE the inflight slot
+        // ONE key for the gate and the release: the per-principal slot share (Phase 6) only balances if
+        // the slot is given back under the identity it was taken by.
+        const principalKey = g.principal.username ?? clientIp(request, server);
+        const gate = historyGate(principalKey); // rate-limit BEFORE the inflight slot
         if (!gate.ok) {
           metrics.historyRequests.inc({ result: gate.result });
           log.warn('history rejected', { reason: gate.result, session: params.id, username: g.principal.username });
           set.status = gate.result === 'busy' ? 503 : 429;
           return { error: gate.result };
         }
+        let scan: ScanBudget | undefined;
         try {
           let p: HistoryParams;
           try {
@@ -489,7 +544,8 @@ export function createApp() {
             set.status = 400;
             return { error: 'bad_params' };
           }
-          const result = await readHistory(p); // paged + yields between chunks — off the live loop
+          scan = newScanBudget(request.signal); // Phase 6: a vanished client, or 25 s, stops the scan
+          const result = await readHistory(p, scan); // paged + yields between chunks — off the live loop
           metrics.historyRequests.inc({ result: 'ok' });
           // Audit: scannedRows is the bulk-export volume signal; playerId is pseudonymous (OK per §0.1).
           log.info('history read', {
@@ -503,12 +559,14 @@ export function createApp() {
           });
           return result;
         } catch (err) {
+          if (err instanceof ScanAborted) return scanAbortResponse('history', err, set, params.id, g.principal.username, scan);
           metrics.historyRequests.inc({ result: 'internal' });
           log.error('history failed', { session: params.id, err: String(err) }); // never the raw player value
           set.status = 500;
           return { error: 'internal' };
         } finally {
-          releaseInflight(); // always free the slot we took on gate.ok
+          scan?.release();
+          releaseInflight(principalKey); // always free the slot we took on gate.ok
         }
       })
       // --- tactical events: review-only movement-derived phases (ADR-0020). Same off-loop posture as /history
@@ -523,13 +581,15 @@ export function createApp() {
           set.status = g.status;
           return g.status === 401 ? { authenticated: false } : { error: g.result };
         }
-        const gate = eventsGate(g.principal.username ?? clientIp(request, server)); // rate-limit BEFORE the inflight slot
+        const principalKey = g.principal.username ?? clientIp(request, server);
+        const gate = eventsGate(principalKey); // rate-limit BEFORE the inflight slot
         if (!gate.ok) {
           metrics.eventsRequests.inc({ result: gate.result });
           log.warn('events rejected', { reason: gate.result, session: params.id, username: g.principal.username });
           set.status = gate.result === 'busy' ? 503 : 429;
           return { error: gate.result };
         }
+        let scan: ScanBudget | undefined;
         try {
           let p: EventsParams;
           try {
@@ -541,7 +601,8 @@ export function createApp() {
             set.status = 400;
             return { error: 'bad_params' };
           }
-          const result = await readEvents(p); // paged + yields between chunks — off the live loop
+          scan = newScanBudget(request.signal); // Phase 6: same cancellation contract as /history
+          const result = await readEvents(p, scan); // paged + yields between chunks — off the live loop
           metrics.eventsRequests.inc({ result: 'ok' });
           // PM-N3: audit {username, session, from, to, scannedRows} ONLY — no player dimension on this surface.
           log.info('events read', {
@@ -553,12 +614,14 @@ export function createApp() {
           });
           return result;
         } catch (err) {
+          if (err instanceof ScanAborted) return scanAbortResponse('events', err, set, params.id, g.principal.username, scan);
           metrics.eventsRequests.inc({ result: 'internal' });
           log.error('events failed', { session: params.id, err: String(err) }); // never a raw query value
           set.status = 500;
           return { error: 'internal' };
         } finally {
-          releaseEventsInflight(); // always free the shared slot we took on gate.ok
+          scan?.release();
+          releaseEventsInflight(principalKey); // always free the shared slot we took on gate.ok
         }
       })
       // --- live fan-out: cookie auto-attached on the same-origin upgrade; principal-bound session authz ---
@@ -658,15 +721,28 @@ function createInternalApp() {
     .get('/health', ({ set }) => {
       const mqtt = mqttReady;
       const dbUp = dbProbe();
-      const ok = mqtt && dbUp;
-      // 503 when not ok: Playwright's webServer wait (200–403 = available) and a compose healthcheck
-      // (`curl -f`) then both mean what they say. Every consumer in this repo parses the body regardless.
+      // Phase 6: a draining process is NOT healthy. Once SIGTERM has landed the listeners are about to
+      // go, and a health check that keeps answering 200 for the last second of the process's life is
+      // the reason orchestrators route requests into a closing socket. `draining` is reported as its
+      // own field so an operator reading the body can tell "shutting down" from "broken".
+      const draining = isDraining();
+      const ok = mqtt && dbUp && !draining;
+      // 503 when not ok: Playwright's webServer wait (200–403 = available) and the compose healthcheck
+      // then both mean what they say. Every consumer in this repo parses the body regardless.
       set.status = ok ? 200 : 503;
-      return { ok, mqtt, db: dbUp, version: VERSION, uptimeSeconds: Math.round((Date.now() - startedAt) / 1000) };
+      return {
+        ok,
+        mqtt,
+        db: dbUp,
+        draining,
+        version: VERSION,
+        uptimeSeconds: Math.round((Date.now() - startedAt) / 1000),
+      };
     })
     .get('/metrics', ({ set }) => {
       updateRuntimeMetrics();
       refreshRetentionGauges(); // keep oldest-fix age current between hourly sweeps
+      refreshBackupGauges(); // and the same question for the COPIES — see ft_backup_oldest_age_seconds
       set.headers['content-type'] = 'text/plain; version=0.0.4; charset=utf-8';
       return registry.render();
     });
@@ -683,7 +759,7 @@ const app = createApp().listen({ port: PORT, hostname: PUBLIC_HOST });
 const server = app.server;
 if (!server) throw new Error('Elysia server failed to start');
 
-createInternalApp().listen({ port: METRICS_PORT, hostname: '127.0.0.1' });
+const internalApp = createInternalApp().listen({ port: METRICS_PORT, hostname: '127.0.0.1' });
 
 metrics.buildInfo.set({ version: VERSION, runtime: `bun-${Bun.version}` }, 1);
 
@@ -701,16 +777,44 @@ if (!ANON_MODE && ALLOWED_ORIGINS.length === 0) {
   );
 }
 
-startIngest({
+/**
+ * Publish one envelope into a session room and COUNT WHAT ACTUALLY HAPPENED (audit §6 "Server").
+ *
+ * Bun's `server.publish()` returns bytes sent, `0` when the message was dropped (no subscriber, or the
+ * socket went away) and `-1` under backpressure. That return was discarded, so `ft_ws_messages_sent_total`
+ * counted attempts and called them sends: a coach tablet stalling behind a slow link lost frames while
+ * the "sent" rate climbed at full speed, and the one metric an operator would check could not say no.
+ *
+ * It is also the try/catch the audit named. `publish()` sat OUTSIDE ingest's error handling, so a throw
+ * here reached the process-level handler and took the server down. Ingest must never be able to kill the
+ * process by fanning out — the fan-out is best-effort by construction, and a failed publish is a counted
+ * drop, not a fatal.
+ */
+const publishToRoom = (
+  session: string,
+  payload: string,
+  sent: { inc: (l: Record<string, string>) => void },
+): void => {
+  const label = capLabel('session', session);
+  try {
+    const n = server.publish(wsRoom(session), payload);
+    if (n === -1) metrics.wsDropped.inc({ session: label, reason: 'backpressure' });
+    else if (n === 0) metrics.wsDropped.inc({ session: label, reason: 'dropped' });
+    else sent.inc({ session: label });
+  } catch (err) {
+    metrics.wsDropped.inc({ session: label, reason: 'error' });
+    log.warn('ws publish failed', { session: label, err: String(err) }); // never the payload — it carries positions
+  }
+};
+
+const mqttClient = startIngest({
   publish: (session: string, telemetry: Telemetry) => {
-    server.publish(wsRoom(session), JSON.stringify({ event: 'telemetry', data: telemetry }));
-    metrics.wsSent.inc({ session: capLabel('session', session) });
+    publishToRoom(session, JSON.stringify({ event: 'telemetry', data: telemetry }), metrics.wsSent);
   },
   // Phase 3: the minimised device-health envelope rides the SAME session room, so only sockets already
   // authorised for that session (the /live open() gate) ever receive it. No name on the wire.
   publishStatus: (session: string, h) => {
-    server.publish(wsRoom(session), JSON.stringify({ event: 'status', data: h }));
-    metrics.wsStatusSent.inc({ session: capLabel('session', session) });
+    publishToRoom(session, JSON.stringify({ event: 'status', data: h }), metrics.wsStatusSent);
   },
   onSubscribed: () => {
     mqttReady = true;
@@ -733,9 +837,54 @@ for (const sid of accountSessionIds()) seedLabel('session', sid);
 // appears the first time it happens has no baseline, so `increase(...[15m]) > 0` cannot fire on the
 // very occurrence that matters most — a coach's view going dark mid-match.
 for (const kind of BEACON_KINDS) metrics.clientEvents.inc({ kind }, 0);
+// Same rule, same reason, for the Phase 6 counters whose documented alert is "any increase": a series
+// that springs into existence at 1 gives increase(...[15m]) ~ 0, so the alert cannot fire on the very
+// first occurrence — and for an unhandled rejection that may be the ONLY occurrence.
+for (const kind of ['uncaught_exception', 'unhandled_rejection']) metrics.processFatal.inc({ kind }, 0);
+for (const surface of ['history', 'events']) {
+  for (const reason of ['client_gone', 'budget', 'shutdown']) metrics.scanAborted.inc({ surface, reason }, 0);
+}
 
 // Bound the raw-fix store in time (children's location must not linger). See ADR-0010.
-startRetention();
+const retentionTimer = startRetention();
+
+// ── Phase 6: the graceful teardown, declared ONCE, in the order it runs. ─────────────────────────
+// Registration order IS execution order (shutdown.ts) — deliberately not a LIFO stack, because the
+// right order here is not the reverse of boot. Stop being reachable, stop producing work, stop
+// listening, then touch the store last, when nothing else can be writing to it.
+//
+// Every step is individually wrapped by the runner and the whole sequence is capped at
+// SHUTDOWN_DEADLINE_MS, so a step that wedges cannot turn `docker stop` back into a SIGKILL.
+onShutdown('abort-scans', STEP.SCANS, async () => {
+  // AWAITED, because marking a budget is not aborting a scan: a scan only notices at its next page
+  // boundary, which is a yield away. The first version returned immediately, process.exit() fired ~1 ms
+  // later, and the coach mid-review got a socket reset while `reason="shutdown"` stayed a permanently
+  // zero metric (measured: 3 marked, 0 aborted). The drain returns as soon as the last one lets go.
+  const { marked, drained } = await abortAllScans();
+  if (marked > 0) log.info('shutdown: aborted off-loop scans', { scans: marked, drained });
+});
+onShutdown('stop-timers', STEP.TIMERS, () => {
+  clearInterval(retentionTimer); // the sweep takes the write lock; it must not start during teardown
+});
+onShutdown('mqtt', STEP.MQTT, async () => {
+  // Polite DISCONNECT, but never wait on it: QoS0 means there is nothing in flight worth preserving,
+  // and the broker being unreachable is one of the reasons an operator restarts in the first place.
+  await Promise.race([
+    new Promise<void>((resolve) => mqttClient.end(false, {}, () => resolve())),
+    Bun.sleep(250),
+  ]);
+});
+onShutdown('listeners', STEP.LISTENERS, () => {
+  // `true` = close active connections, which is what closes the /live sockets. The coach view treats a
+  // close as a reconnect trigger (Phase 5), so the tablets come back on their own once we are up again.
+  server.stop(true);
+  internalApp.server?.stop(true);
+});
+// STEP.SESSIONS is registered by initAuth() itself, at the moment it consumes the handover file — a
+// window this block could not cover, because it runs after the awaits above.
+onShutdown('db', STEP.STORE, () => {
+  closeDb(); // PASSIVE checkpoint + close; never TRUNCATE here (see closeDb's note on the budget)
+});
 
 // Audit S-3: print the whole resolved configuration once, where an operator looks — and shout about any env
 // value that was rejected in favour of a default (a typo'd cap is otherwise invisible until it matters).

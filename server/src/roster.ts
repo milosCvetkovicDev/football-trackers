@@ -19,6 +19,7 @@
 import { readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { log } from './log';
+import { FileLockError, withFileLock } from './fileLock';
 import { envNumber, envString } from './env';
 
 // ----- config (env) ---------------------------------------------------------------------
@@ -219,75 +220,20 @@ async function rosterTarget(file: string): Promise<string> {
 // two contenders cannot both "break" the same lock and both proceed.
 //
 // Critical sections are kept to the file round-trip (milliseconds) — never across the DB delete.
-const ROSTER_LOCK_WAIT_MS = 3_000;
-const ROSTER_LOCK_STALE_MS = 60_000;
-const ROSTER_LOCK_POLL_MS = 50;
-
 /** A lock problem that no retry will fix (directory in the way, missing/unwritable parent) — exit 5 territory. */
 export class RosterPermanentError extends Error {}
 
-function pidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return (e as NodeJS.ErrnoException)?.code === 'EPERM'; // exists, not ours — treat as alive
-  }
-}
-
 export async function withRosterLock<T>(fn: () => Promise<T>, file: string = ROSTER_FILE): Promise<T> {
-  // Beside the CONFIGURED path (every writer in this repo uses the same AUTH_ROSTER_FILE string), not the
-  // realpath target: a roster symlinked into a directory only the server can write must still be lockable
-  // by the operator's CLI, which then fails honestly at the rename rather than at the lock.
-  const lock = `${file}.lock`;
-  const deadline = Date.now() + ROSTER_LOCK_WAIT_MS;
-  for (;;) {
-    try {
-      await writeFile(lock, String(process.pid), { flag: 'wx', mode: 0o600 });
-      break;
-    } catch (e) {
-      const code = (e as NodeJS.ErrnoException)?.code;
-      if (code !== 'EEXIST') throw new RosterPermanentError(`roster lock ${lock} is not creatable (${code ?? 'error'}) — wrong AUTH_ROSTER_FILE path or directory permissions`);
-    }
-    // Someone holds it. Who, and are they alive?
-    let ageMs = 0;
-    let holderPid: number | undefined;
-    try {
-      const st = await stat(lock);
-      ageMs = Date.now() - st.mtimeMs;
-      if (st.isDirectory()) throw new RosterPermanentError(`roster lock ${lock} is a directory — remove it by hand`);
-      const pid = Number((await readFile(lock, 'utf8')).trim());
-      if (Number.isInteger(pid) && pid > 0) holderPid = pid;
-    } catch (e) {
-      if (e instanceof RosterPermanentError) throw e;
-      if ((e as NodeJS.ErrnoException)?.code === 'ENOENT') continue; // vanished — retry the create at once
-    }
-    const dead = holderPid !== undefined ? !pidAlive(holderPid) : ageMs > ROSTER_LOCK_STALE_MS;
-    if (dead) {
-      // Atomic break: only ONE contender's rename succeeds; the others see ENOENT and simply retry.
-      const breaking = `${lock}.breaking.${process.pid}`;
-      try {
-        await rename(lock, breaking);
-      } catch {
-        continue;
-      }
-      try {
-        await unlink(breaking);
-      } catch (e) {
-        throw new RosterPermanentError(`roster lock ${lock} is stale but cannot be removed (${(e as NodeJS.ErrnoException)?.code ?? 'error'}) — remove it by hand`);
-      }
-      log.warn('roster: broke a dead lock', { holderPid: holderPid ?? null, ageMs: Math.round(ageMs) }); // never a name
-      continue;
-    }
-    if (Date.now() > deadline) {
-      throw new Error(`roster file is locked by another writer: ${lock} held by pid ${holderPid ?? '?'} (alive) for ${Math.round(ageMs / 1000)} s — a purge, the retention sweep or roster-user is running; retry when it finishes`);
-    }
-    await new Promise((r) => setTimeout(r, ROSTER_LOCK_POLL_MS));
-  }
+  // The mechanics moved to src/fileLock.ts in Phase 6 so the accounts and session-config CLIs could use
+  // the SAME proven lock instead of racing (a checker pass measured two coach accounts silently lost in
+  // five concurrent `auth-user.ts add` runs). This wrapper keeps the roster's own error contract:
+  // purge-player.ts distinguishes RosterPermanentError (exit 5, fix something) from a transient
+  // "someone else holds it" (exit 3, re-run), and that mapping must not change.
   try {
-    return await fn();
-  } finally {
-    await unlink(lock).catch(() => undefined);
+    return await withFileLock(file, { what: 'roster', envHint: 'AUTH_ROSTER_FILE' }, fn);
+  } catch (e) {
+    if (e instanceof FileLockError) throw new RosterPermanentError(e.message);
+    throw e;
   }
 }
 

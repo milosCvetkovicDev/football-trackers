@@ -21,7 +21,7 @@
  * Exits 0 on success, 1 on any failed assertion; cleans up its temp roster file + the subprocesses it spawns.
  */
 
-import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 
 // A dedicated temp file that no other test/tool touches, so a stray leftover can't poison this run.
 const ROSTER_FILE = '/tmp/ft-rostercli-roster.json';
@@ -77,6 +77,19 @@ try {
   // --- 1a. file mode is 0o600 (owner-only — it holds child names) ---------------------------------------
   const mode = statSync(ROSTER_FILE).mode & 0o777;
   assert(mode === 0o600, `roster file mode must be 0o600, got 0o${mode.toString(8)}`);
+
+  // --- 1a-ii. PHASE 6 (audit §6 "Server"): an EXISTING loose file must be TIGHTENED, not left as found.
+  // `writeFileSync(path, text, { mode: 0o600 })` applies the mode only when the file is CREATED, so
+  // every write over a file that already existed — one restored from a backup, `scp`ed, or made by an
+  // editor — silently kept its old permissions while the docs claimed owner-only. The case above cannot
+  // catch that: it only ever inspects a file the CLI itself just created.
+  chmodSync(ROSTER_FILE, 0o644);
+    const tighten = await runCli(['set', SESSION, PID_A, NAME_A]);
+  assert(tighten.code === 0, `set over a 0644 file should exit 0, got ${tighten.code}`);
+  assert(
+    (statSync(ROSTER_FILE).mode & 0o777) === 0o600,
+    'a pre-existing 0644 file must be rewritten as 0600 — writeFileSync mode is a no-op on an existing file',
+  );
 
   // --- 1b. JSON shape: sessions.s1 = [{playerId:'07', displayName:'Alex M.'}] ---------------------------
   let sessions = readRoster();

@@ -57,10 +57,12 @@ const SUITES: Array<[file: string, proves: string]> = [
   ['scan-load.ts', 'the off-loop inflight cap is shared across /history and /events'],
   ['boundary.ts', 'wire fields coerced, env knobs fall back loudly, metrics never non-finite, labels capped (Phase 3)'],
   ['retention.ts', 'the retention sweep deletes on schedule'],
+  ['backup.ts', 'VACUUM INTO copies verify row-for-row; rotation is bounded by count AND retention; a purged player is absent from every backup (Phase 6)'],
   // --- spawn a CLI + temp files ---
   ['auth-cli.ts', 'auth-user.ts add/remove/sessions'],
   ['roster-cli.ts', 'roster-user.ts set/remove, 0600 mode'],
   ['session-config-cli.ts', 'session-config.ts set/remove, 0600 mode'],
+  ['migrate.ts', 'the user_version schema ladder; a store newer than the build refuses to start (Phase 6)'],
   // --- spawn mosquitto + the real server ---
   ['e2e.ts', 'MQTT -> ingest -> WS fan-out -> sqlite, and /metrics'],
   ['ws-origin.ts', 'the /live Origin allow-list'],
@@ -73,6 +75,8 @@ const SUITES: Array<[file: string, proves: string]> = [
   ['device-health-e2e.ts', 'the .../status topic reaches /live as {event:"status"}'],
   ['config-e2e.ts', 'GET /sessions/:id/config serves the age band + the pitch corners'],
   ['beacon-e2e.ts', 'POST /sessions/:id/client-beacon counts coach-view failures, gated + minimised'],
+  ['scan-cancel.ts', 'an abandoned /history or /events request stops its scan and frees the shared off-loop slot (Phase 6)'],
+  ['shutdown-e2e.ts', 'SIGTERM exits 0 in order and in budget; sessions survive the restart; the fault handlers (Phase 6)'],
   ['erasure-e2e.ts', 'right-to-erasure: purge removes the player and the name'],
   ['erasure-audit.ts', 'the five audit §4.5 erasure defects stay fixed (WAL, dup id, collateral, bad file, missing DB)'],
 ];

@@ -21,7 +21,7 @@ import { readFixesPage, type FixRow } from './db';
 import { envInt, envNumber } from './env';
 import { ageBandFor, thresholdsForSession } from './sessionConfig';
 import type { AgeBand, ZoneThresholds } from './types';
-import { acquireScanSlot, releaseScanSlot, _scanInflight } from './scanLoad';
+import { acquireScanSlot, releaseScanSlot, _scanInflight, newScanBudget, type ScanBudget } from './scanLoad';
 import { metrics } from './metrics';
 import { log } from './log';
 
@@ -254,7 +254,15 @@ export function validateHistoryParams(raw: {
 }
 
 // ----- the read --------------------------------------------------------------------------
-const yieldLoop = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+/**
+ * Surrender the loop between pages — AND, since Phase 6, the one place a scan can be told to stop.
+ * The check lives inside the yield helper deliberately: every paged loop here already has to call it,
+ * so cancellation cannot be forgotten at a new loop the way a separate `if (aborted) break` would be.
+ */
+const yieldLoop = async (scan: ScanBudget): Promise<void> => {
+  await new Promise((r) => setTimeout(r, 0));
+  scan.check(); // throws ScanAborted: client gone, wall-clock budget spent, or the server is shutting down
+};
 
 /** Equirectangular metres between two lat/lon — cheap + good enough for a pitch-scale step. */
 function stepMetres(aLat: number, aLon: number, bLat: number, bLon: number): number {
@@ -276,17 +284,27 @@ function stepMetres(aLat: number, aLon: number, bLat: number, bLon: number): num
  * Observes ft_history_read_seconds{mode} + ft_history_rows_scanned_total{mode}. NO displayName
  * anywhere in the result (pseudonymous; client joins the roster at render).
  */
-export async function readHistory(p: HistoryParams): Promise<AggregateResult | RawResult> {
+export async function readHistory(
+  p: HistoryParams,
+  scan?: ScanBudget,
+): Promise<AggregateResult | RawResult> {
+  // A caller that passes no budget still gets one (the wall-clock bound is not optional) — but WE own it
+  // and WE release it. As a default parameter it registered itself in scanLoad's live set and nothing
+  // ever removed it, so every such call leaked an entry and `_liveScanBudgets()` — the seam whose whole
+  // purpose is leak detection — could never be used as a guard, because the tests leaked into it.
+  const own = scan === undefined ? newScanBudget() : null;
+  const budget = scan ?? own!;
   const t0 = performance.now();
   try {
-    return p.mode === 'raw' ? await readRaw(p) : await readAggregate(p);
+    return p.mode === 'raw' ? await readRaw(p, budget) : await readAggregate(p, budget);
   } finally {
+    own?.release();
     metrics.historyReadSeconds.observe({ mode: p.mode }, (performance.now() - t0) / 1000);
   }
 }
 
 /** mode=raw: one bounded page resumed by the composite cursor; never `.all()` a match. */
-async function readRaw(p: HistoryParams): Promise<RawResult> {
+async function readRaw(p: HistoryParams, scan: ScanBudget): Promise<RawResult> {
   const player = p.player as string;
   const limit = p.limit ?? HISTORY_RAW_LIMIT_DEFAULT;
   // First page: start strictly before the window so no real fix is skipped. Subsequent pages
@@ -308,6 +326,7 @@ async function readRaw(p: HistoryParams): Promise<RawResult> {
   while (fixes.length < limit) {
     const rows = readFixesPage(p.sessionId, p.from, p.to, afterTs, afterRowid, HISTORY_SCAN_CHUNK);
     scanned += rows.length;
+    scan.noteRows(rows.length); // so an abort can still be audited for volume
     if (rows.length === 0) {
       windowExhausted = true; // no more rows in the window at all
       break;
@@ -329,7 +348,7 @@ async function readRaw(p: HistoryParams): Promise<RawResult> {
     // Yield AFTER every full page — including a page-aligned final page — BEFORE the limit-break, so a
     // page-aligned tail can never run a full synchronous page without surrendering the loop (matches the
     // aggregate scan + buildHeatmapPaged; keeps the ~1–2 ms/page SLO honest).
-    await yieldLoop();
+    await yieldLoop(scan);
     if (fixes.length >= limit) break; // page boundary and we already have a full page of fixes
   }
 
@@ -401,7 +420,7 @@ interface Acc {
 }
 
 /** mode=aggregate: scan the whole window once, fold into per-player stats + an occupancy grid. */
-async function readAggregate(p: HistoryParams): Promise<AggregateResult> {
+async function readAggregate(p: HistoryParams, scan: ScanBudget): Promise<AggregateResult> {
   // The session's resolved youth thresholds (§3.2) — the SAME band the live colour uses, fetched ONCE for the
   // whole scan (the band can't change mid-scan; a periodic reload only affects the NEXT request). Zone + sprint
   // metrics classify against these, so the review breakdown can never disagree with the live colour at a boundary.
@@ -424,6 +443,7 @@ async function readAggregate(p: HistoryParams): Promise<AggregateResult> {
     const rows = readFixesPage(p.sessionId, p.from, p.to, afterTs, afterRowid, HISTORY_SCAN_CHUNK);
     if (rows.length === 0) break;
     scanned += rows.length;
+    scan.noteRows(rows.length); // so an abort can still be audited for volume
     for (const r of rows) {
       foldRow(accs, r, thresholds, sprintMps);
       if (r.lat < minLat) minLat = r.lat;
@@ -435,7 +455,7 @@ async function readAggregate(p: HistoryParams): Promise<AggregateResult> {
     afterTs = last.serverTs;
     afterRowid = last.rowid;
     if (rows.length < HISTORY_SCAN_CHUNK) break;
-    await yieldLoop(); // yield the live loop between pages
+    await yieldLoop(scan); // yield the live loop between pages
   }
 
   // Scan-end flush (§4.1, REQUIRED): a player sprinting through the window's end has an in-progress run that
@@ -470,7 +490,7 @@ async function readAggregate(p: HistoryParams): Promise<AggregateResult> {
     });
   }
 
-  const heatmap = await buildHeatmapPaged(p, minLat, minLon, maxLat, maxLon);
+  const heatmap = await buildHeatmapPaged(p, minLat, minLon, maxLat, maxLon, scan);
   metrics.historyRowsScanned.inc({ mode: 'aggregate' }, scanned);
   // Top-level ageBand is the SAME provenance the thresholds came from (band-or-U14-default) — so the client
   // can show which thresholds the metrics were scored against (§4.1/§4.2). NO names anywhere in this result.
@@ -665,6 +685,7 @@ async function buildHeatmapPaged(
   minLon: number,
   maxLat: number,
   maxLon: number,
+  scan: ScanBudget,
 ): Promise<{ cols: number; rows: number; bins: number[]; bbox: { minLat: number; minLon: number; maxLat: number; maxLon: number } | null }> {
   const bins = new Array(HEATMAP_COLS * HEATMAP_ROWS).fill(0);
   const latSpan = maxLat - minLat;
@@ -678,6 +699,7 @@ async function buildHeatmapPaged(
   for (;;) {
     const rows = readFixesPage(p.sessionId, p.from, p.to, afterTs, afterRowid, HISTORY_SCAN_CHUNK);
     if (rows.length === 0) break;
+    scan.noteRows(rows.length); // pass 2 reads the window again — an abort here has read it twice
     for (const r of rows) {
       // Clamp the top/right edge into the last bin (a value at max maps to index COLS, off-grid).
       const col = Math.min(HEATMAP_COLS - 1, Math.floor(((r.lon - minLon) / lonSpan) * HEATMAP_COLS));
@@ -688,7 +710,7 @@ async function buildHeatmapPaged(
     afterTs = last.serverTs;
     afterRowid = last.rowid;
     if (rows.length < HISTORY_SCAN_CHUNK) break;
-    await yieldLoop(); // yield the live loop between pages, same as pass 1
+    await yieldLoop(scan); // yield the live loop between pages, same as pass 1
   }
   // Ship the grid's GPS extent so the client maps bin (col,row) → lat/lon → pixels (ADR-0017 one-renderer).
   return { cols: HEATMAP_COLS, rows: HEATMAP_ROWS, bins, bbox: { minLat, minLon, maxLat, maxLon } };
@@ -739,13 +761,15 @@ export type GateResult = { ok: true } | { ok: false; result: 'rate_limited' | 'b
  */
 export function historyGate(principalKey: string): GateResult {
   if (!rateOk(principalKey)) return { ok: false, result: 'rate_limited' };
-  if (!acquireScanSlot()) return { ok: false, result: 'busy' }; // PM-1: shared history+events inflight cap
+  // PM-1: the shared history+events inflight cap, PLUS this principal's share of it (Phase 6) —
+  // the global cap is loop protection; without a per-principal share one caller can hold every slot.
+  if (!acquireScanSlot(principalKey)) return { ok: false, result: 'busy' };
   return { ok: true };
 }
 
 /** Release one inflight slot. The caller pairs this with a successful historyGate() in `finally`. */
-export function releaseInflight(): void {
-  releaseScanSlot();
+export function releaseInflight(principalKey: string): void {
+  releaseScanSlot(principalKey);
 }
 
 /** Test-only: current COMBINED inflight count (history + events), so a unit test can assert the cap. */

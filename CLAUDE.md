@@ -27,10 +27,11 @@ Server (from `server/`):
 bun install
 bun start          # run; bun --watch for dev (bun run dev)
 bun run typecheck  # bunx tsc --noEmit (Bun does not typecheck at runtime)
-bun run test       # THE GATE: all 26 suites, sequential, ~47 s (test/run-all.ts)
+bun run test       # THE GATE: all 30 suites, sequential, ~64 s (test/run-all.ts)
 bun run test:e2e   # one suite; every suite also has its own test:* script
 bun run test/mosquitto-pub-demo.ts   # the README's literal mosquitto_pub -> WS path
 ```
+bun run backup     # backup-db.ts: one verified VACUUM INTO copy + rotation (--list, --no-rotate)
 `bun run test` is `test/run-all.ts`, not bare `bun test`. It refuses to start if any file in
 `test/` is neither a declared suite nor a declared non-suite — so adding a test file without
 wiring it in fails loudly instead of quietly shrinking the gate.
@@ -99,6 +100,15 @@ A real wearable connects to this Mac's **Wi-Fi** IP on 1883 (set firmware `MQTT_
 on the same Wi-Fi (a wired dock Ethernet was found isolated from the Wi-Fi). Full runbook +
 troubleshooting: [docs/dev/local-bench-runbook.md](docs/dev/local-bench-runbook.md)
 ([ADR-0021](docs/decisions/0021-local-dev-docker-stack.md)).
+Since Phase 6 the stack has a **healthcheck** (`docker compose ps` shows healthy/unhealthy — stop the broker
+and the server goes unhealthy within ~45 s), **capped logs**, and a **graceful `docker stop`** (exit 0 in
+~0.2 s, WAL checkpointed; it used to be a SIGKILL). For a real deployment use
+[deploy/production/](deploy/production/README.md), NOT this file — that one authenticates every read.
+
+**This is the dev stack, and its compromises are deliberate.** Production is
+[deploy/production/compose.yml](deploy/production/compose.yml): a built non-root image, no anonymous access,
+nothing published on `0.0.0.0`, resource limits. `server/test/deploy-posture.ts` (37 static checks, run
+unfiltered by `repo-guard`) fails the build if either stack drifts from that.
 
 ## Architecture (the parts that span files)
 
@@ -147,11 +157,16 @@ clock from telemetry: since Phase 4 a replayed fix carries its GPS time as `serv
 loading during a backlog drain would read "the server is hours behind" and then draw stale fixes as
 live dots. An unknown `event` is ignored client-side, so the addition is backward-compatible.
 Fan-out uses Bun's native WS pub/sub directly — **not** socket.io — so the (not-yet-built)
-coach UI uses a plain `WebSocket`, not `socket.io-client`. `GET /health` returns
-`{ok, mqtt, db, version, uptimeSeconds}` — HTTP 200 when `ok` (= `mqtt && db`), 503 otherwise — where `mqtt`
+coach UI uses a plain `WebSocket`, not `socket.io-client`. `publish()`'s RETURN is read (Phase 6): 0 = dropped
+(no subscriber), -1 = backpressure, both counted as `ft_ws_dropped_total{reason}` — before that,
+`ft_ws_messages_sent_total` counted attempts, so a stalling tablet lost frames while the graph climbed at full
+rate. `GET /health` returns
+`{ok, mqtt, db, draining, version, uptimeSeconds}` — HTTP 200 when `ok` (= `mqtt && db && !draining`), 503 otherwise — where `mqtt`
 follows the broker client's connect/close events (true once subscribed, false on close/offline) and `db` is a
 probe that READS the telemetry table and folds in the last insert's outcome (a bare `SELECT 1` stayed green with
-the table dropped); the e2e tests poll it as a readiness gate to avoid the QoS0 publish-before-subscribe race.
+the table dropped); `draining` is true from the moment SIGTERM lands, so a health check stops routing into a
+closing socket. The e2e tests poll it as a readiness gate to avoid the QoS0 publish-before-subscribe race, and
+the compose healthcheck runs the same endpoint via `bun run healthcheck.ts` (the bun image has no curl/wget/nc).
 `GET /metrics` is the Prometheus scrape target. One write comes the other way: `POST /sessions/:id/client-beacon`
 (Phase 5) lets the coach view report its OWN failures — a closed four-value enum (`ws_gave_up`, `ws_manual_retry`,
 `render_error`, `fetch_timeout`) counted as `ft_client_events_total{kind}`, with no free text, no player id and
@@ -160,6 +175,39 @@ no session label.
 **Persistence** (`server/src/db.ts`): bun:sqlite, WAL mode, one prepared insert per packet
 (no batching needed at ~100 msg/s). This is the "local SQLite" option from the original
 plan; swap this module for a TimescaleDB writer later without touching `ingest.ts`.
+The schema is a `PRAGMA user_version` **ladder** (`src/migrate.ts`, Phase 6), append-only: a store NEWER
+than the build makes the server REFUSE TO START (a rollback must not write through a schema it does not
+understand), and `ft_db_schema_version` publishes the result. `src/erase.ts` holds the per-player DELETE
+**once**, so the live store and every backup are erased by the same statements.
+
+**Operability** (`server/src/shutdown.ts`, `backup.ts`, `secretFile.ts`, Phase 6). Three rules that span files.
+(1) **The teardown is ordered, and the container must be able to deliver the signal.** `docker stop` used to
+exit **137 in 1.3 s** (`sh` was pid 1); compose now uses `exec` + `init: true` and the server runs a
+NUMBER-ordered teardown (`STEP` in shutdown.ts) — drain (`/health` 503) → abort in-flight scans (awaited,
+so a scan in flight gets a 503 rather than a reset) → stop timers → broker → listeners → hand over auth
+sessions → checkpoint + close the store — capped by `SHUTDOWN_DEADLINE_MS` (1.5 s), which force-exits with
+a DISTINCT code (75) so a wedged teardown is not mistaken for a clean one. Measured: **exit 0 in ~0.1–0.2 s**.
+`installLifecycleHandlers()` is the FIRST line of server.ts: bun is pid 1 in the container and the kernel
+DISCARDS a signal pid 1 has no handler for, so handlers installed late meant a stop during boot waited out
+the whole grace period (measured 137 after 5.1 s — worse than the baseline). `uncaughtException` runs the
+same teardown and exits 1; `unhandledRejection` is counted and does NOT exit.
+(2) **A backup is children's location, so it inherits every rule the live store has.** `VACUUM INTO` (never
+`cp` — a WAL-mode copy is torn), verified row-for-row or deleted; rotation bounded by **both** `BACKUP_KEEP`
+and `RETENTION_DAYS`, run even when the backup itself fails (`--rotate-only` too) and observable as
+`ft_backup_oldest_age_seconds`; and `purge-player.ts` erases the player from **every** backup, re-counts to
+prove it (exit 4, file named, if one cannot be erased), and reports `backupDir`/`backupsFound` so a receipt
+can never say "erased" over copies a mistyped `BACKUP_DIR` never opened.
+(3) **Owner-only means temp + rename + chmod** (`src/secretFile.ts`): `writeFileSync(..., {mode})` applies
+the mode only on CREATE, so every write over an existing roster/accounts/config file silently kept its old
+permissions. All three CLIs now also serialise on the shared `src/fileLock.ts` (the roster's proven lock) —
+unlocked, five concurrent `auth-user.ts add`s lost two accounts that reported success. Sessions survive a
+graceful restart via a 0600 file of `sha256(token)` verifiers, consumed on read (unconditionally: if it
+cannot be removed, nothing is restored) and re-validated against the CURRENT TTL and caps, because a
+restart is how an operator APPLIES a tightened policy. A crash still logs everyone out, and
+`ft_auth_sessions_restored_total` says so.
+See [ADR-0025](docs/decisions/0025-operability-lifecycle.md) and
+[deploy/production/](deploy/production/README.md) (non-root image, nothing on `0.0.0.0`, no anon access;
+TLS is the one piece deliberately left open).
 
 **Field resilience** (`firmware/src/main.cpp` + `firmware/src/resilience.h`, Phase 4): connectivity
 is a non-blocking state machine (jittered backoff; the GPS drain never stalls more than one ~3 s TCP
@@ -212,7 +260,11 @@ Track A** (off-loop `GET /sessions/:id/events` — a time-bucketed team-shape se
 high-tempo/transition/stoppage phases, review-mode timeline; team-aggregate, movement-derived
 **not** ball events; [ADR-0020](docs/decisions/0020-tactical-event-detection.md)). The events read
 shares the off-loop inflight cap with `/history` via `server/src/scanLoad.ts` (one global
-concurrent-scan slot). All e2e/browser-verified without hardware. **First real prototype validated end-to-end
+concurrent-scan slot, capped at 2 per principal so one coach cannot take the review surface to zero for the
+club; since Phase 6 a scan is cancellable — an abandoned request or a 25 s budget frees the slot, and an
+aborted scan is still audited for principal + rows scanned). Also operable (Phase 6): graceful shutdown, `user_version` migrations, verified `VACUUM INTO` backups
+whose rotation and erasure follow ADR-0010, and a production stack at
+[deploy/production/](deploy/production/README.md). All e2e/browser-verified without hardware. **First real prototype validated end-to-end
 2026-06-17** (device → Wi-Fi → broker → server → live view; the server received the device's real `.../status`
 health + 10 Hz telemetry; indoors positions correctly dropped `no_fix`) via the local Docker dev stack + the
 bench runbook ([docs/dev/local-bench-runbook.md](docs/dev/local-bench-runbook.md),

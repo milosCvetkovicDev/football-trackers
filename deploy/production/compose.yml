@@ -1,0 +1,108 @@
+# Production stack for a FIELD BOX (audit I-1 + §8 Phase 6).
+#
+# The audit's finding was blunt: "No production artifact. No Caddyfile, no prod compose, no unit." The
+# dev stack (../../docker-compose.yml) is not it and was never meant to be — it runs the live view with
+# NO LOGIN on an isolated LAN, installs dependencies at container start, and bind-mounts the source.
+#
+#   cd deploy/production
+#   cp .env.example .env && $EDITOR .env       # then: chmod 600 .env
+#   docker compose -f compose.yml up -d --build
+#
+# HOW THIS DIFFERS FROM THE DEV STACK, and why each difference is here:
+#   - ANON MODE IS OFF. Every surface needs a real login, so every access to a child's position is
+#     attributable to a named coach in the audit log. This is the single most important line in the file.
+#   - The server runs from a BUILT IMAGE (../../server/Dockerfile): non-root, dependencies resolved from
+#     the lockfile at build time, no source mount, an explicit file list (no roster/accounts/store in it).
+#   - Nothing is published on 0.0.0.0. The broker binds the FIELD AP interface (the wearables must reach
+#     it); the server binds LOOPBACK, because in production it belongs behind a TLS reverse proxy.
+#   - Resource limits, log rotation and healthchecks are set, because nobody is watching this box.
+#
+# THE ONE PIECE THIS FILE DOES NOT PROVIDE: TLS termination. A field box has no public DNS and no ACME
+# reachability, so "add a Caddyfile" is really "choose an internal CA / a self-signed trust story for the
+# coaches' tablets", which is a decision, not a config file. It is written down as such in README.md
+# rather than faked here with a config that cannot be validated. Until it is made, run the coach tablets
+# on the same physically isolated LAN as the box and treat this as Profile A (ADR-0008).
+
+# Container names are prefixed (STACK_PREFIX, default `ftprod`) rather than hardcoded to `ft-server` /
+# `ft-mosquitto`: those are the DEV stack's names, and identical names mean the two can never run on one
+# host — including the perfectly reasonable case of validating this stack on the bench machine.
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: ${STACK_PREFIX:-ftprod}-mosquitto
+    restart: unless-stopped
+    # The SAME authenticated config the dev stack mounts — one broker config, exercised on every bench
+    # run, so there is no prod-only auth path that has never been tested (audit §4.6). Its password_file
+    # and acl_file are absolute container paths, which is the other half of I-1: they used to be
+    # cwd-relative ("./ft.passwd"), and mosquitto exits rather than starting when it cannot find them.
+    volumes:
+      - ../../server/mosquitto:/mosquitto/config:ro
+    ports:
+      # Bound to the FIELD AP's address, not 0.0.0.0: the wearables reach it over the AP and nothing else
+      # should. Set FIELD_AP_IP in .env (e.g. 192.168.4.1). Compose fails to start if it is unset — an
+      # unset variable would otherwise expand to "" and publish on every interface, which is precisely
+      # the §4.6 exposure this line exists to prevent.
+      - "${FIELD_AP_IP:?set FIELD_AP_IP in .env — the AP address the wearables connect to}:1883:1883"
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    deploy:
+      resources:
+        limits: { memory: 128M, cpus: "0.50" }
+
+  server:
+    build:
+      context: ../../server
+      dockerfile: Dockerfile
+    image: football-trackers-server:prod
+    container_name: ${STACK_PREFIX:-ftprod}-server
+    restart: unless-stopped
+    init: true              # pid 1 that forwards SIGTERM to bun — without it, shutdown.ts never runs
+    stop_grace_period: 5s   # the in-process budget is 1.5 s and force-exits; more than this means wedged
+    depends_on:
+      - mosquitto
+    environment:
+      MQTT_URL: mqtt://mosquitto:1883
+      MQTT_USERNAME: ${MQTT_USERNAME:?run server/mosquitto/dev-provision.sh (or provision by hand) and set it in .env}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:?set MQTT_PASSWORD in .env}
+      PORT: "3000"
+      METRICS_PORT: "9464"
+      DB_PATH: /data/telemetry.db
+      BACKUP_DIR: /data/backups
+      # THE LINE THAT MATTERS: no anonymous access in production. Every read of a child's position is
+      # authenticated and attributable. (Unset, not "false" — the knob defaults closed.)
+      # ALLOW_ANONYMOUS_LIVE: intentionally absent
+      AUTH_COOKIE_SECURE: "true"     # cookies only over TLS — see the TLS note at the top
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set ALLOWED_ORIGINS to the coach app origin, e.g. https://pitch.local}
+      TRUST_PROXY: ${TRUST_PROXY:-false}   # 'true' ONLY behind a single trusted reverse proxy
+      AUTH_ACCOUNTS_FILE: /config/auth-accounts.json
+      AUTH_ROSTER_FILE: /config/roster.json
+      AUTH_SESSIONS_FILE: /config/auth-sessions.json
+      SESSION_CONFIG_FILE: /config/session-config.json
+      RETENTION_DAYS: ${RETENTION_DAYS:-30}
+      BACKUP_KEEP: ${BACKUP_KEEP:-7}
+      APP_VERSION: ${APP_VERSION:-prod}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      # The store + its backups. A HOST-VISIBLE bind mount, not a named volume, so the operator can see,
+      # back up and erase it — audit §4.5(d) was a named volume making the documented erasure command
+      # unable to reach the data at all.
+      - ${DATA_DIR:?set DATA_DIR in .env — where the telemetry store lives on this box}:/data
+      # Names + password hashes + session config. Separate from /data because it has a different
+      # lifecycle (it is provisioned once and survives a store wipe) and a different backup story.
+      - ${CONFIG_DIR:?set CONFIG_DIR in .env}:/config
+    ports:
+      # LOOPBACK ONLY. In production the coach app is served through a TLS reverse proxy on this host;
+      # nothing on the LAN talks to this port directly. Dropping the 127.0.0.1 prefix here would put a
+      # cookie-authenticated (but plaintext) surface on the field LAN.
+      - "127.0.0.1:3000:3000"
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    deploy:
+      resources:
+        # A Pi-class box. The ingest path is ~100 msg/s with one prepared insert; the memory ceiling is
+        # there to make a leak fail loudly and locally rather than by taking the whole box down.
+        limits: { memory: 512M, cpus: "1.50" }
+    # /metrics and /health are NOT published: they are loopback-only inside the container by design
+    # (they carry per-child presence and version info). Scrape them from this host, never through the proxy.

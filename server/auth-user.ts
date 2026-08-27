@@ -16,7 +16,9 @@
  *
  * Exit 0 on success; non-zero with a clear message on error. Mirrors purge-player.ts.
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { writeSecretFile } from './src/secretFile';
+import { withFileLock } from './src/fileLock';
 
 type Role = 'coach' | 'admin';
 interface Account {
@@ -51,7 +53,10 @@ function load(): Account[] {
 }
 
 function save(accounts: Account[]): void {
-  writeFileSync(FILE, JSON.stringify({ accounts }, null, 2) + '\n', { mode: 0o600 });
+  // 0600 via an atomic temp+rename+chmod (src/secretFile.ts). `writeFileSync(..., { mode })`
+  // applies the mode only when the file is CREATED, so an existing 0644 file stayed 0644 —
+  // the audit's "mode 0o600 is a no-op" finding, verified on both write paths.
+  writeSecretFile(FILE, JSON.stringify({ accounts }, null, 2) + '\n');
 }
 
 /** Read a password without echoing it. Piped stdin → first line; a TTY → hidden raw-mode read. */
@@ -136,12 +141,25 @@ function cmdList(): void {
   }
 }
 
+/**
+ * MUTATING commands run under the shared file lock (src/fileLock.ts), the same one the roster has always
+ * used. Without it every command is an unguarded read-modify-write: a checker pass ran five concurrent
+ * `add`s and TWO accounts that reported success were silently lost, while two that reported failure were
+ * persisted — with a raw Bun stack trace instead of this CLI's error contract. `list` is a pure read and
+ * needs no lock.
+ */
+const mutate = async (fn: () => void | Promise<void>): Promise<void> => {
+  await withFileLock(FILE, { what: 'accounts', envHint: 'AUTH_ACCOUNTS_FILE' }, async () => {
+    await fn();
+  });
+};
+
 switch (cmd) {
   case 'add':
-    await cmdAdd();
+    await mutate(cmdAdd);
     break;
   case 'remove':
-    cmdRemove();
+    await mutate(cmdRemove);
     break;
   case 'list':
     cmdList();

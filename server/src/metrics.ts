@@ -324,6 +324,17 @@ export const metrics = {
       'Device-health envelopes pushed to WS rooms per session (Phase 3; second /live envelope from the .../status topic)',
     ),
   ),
+  // Phase 6 (audit §6 "Server"): server.publish()'s RETURN was discarded, so ft_ws_messages_sent_total
+  // counted attempts and called them sends. Bun documents 0 = the message was DROPPED (no subscriber, or
+  // the socket is gone) and -1 = backpressure. A coach tablet stalling behind a slow link therefore lost
+  // frames while the "sent" rate climbed at full speed — the one metric an operator would check to ask
+  // "is the live view getting the data" could not answer no.
+  wsDropped: registry.register(
+    new Counter(
+      'ft_ws_dropped_total',
+      'Live envelopes publish() did not deliver, by session and reason (dropped = no subscriber/closed socket, backpressure = the socket buffer is full). Compare against ft_ws_messages_sent_total: a rising ratio during a match means tablets are losing frames',
+    ),
+  ),
   // --- Phase 3 data endpoints (roster names + review/replay history) ---
   // result/mode labels are bounded; NEVER a session/player/name label — a per-session count on the
   // unauthenticated-scrapeable /metrics would enumerate which sessions have coaches/data (ADR-0016 §1.2/§3.1).
@@ -336,7 +347,7 @@ export const metrics = {
   historyRequests: registry.register(
     new Counter(
       'ft_history_requests_total',
-      'GET /sessions/:id/history requests by result (ok|rate_limited|busy|unauthorized|login_required|forbidden|bad_session|bad_params|forbidden_origin|internal)',
+      'GET /sessions/:id/history requests by result (ok|rate_limited|busy|unauthorized|login_required|forbidden|bad_session|bad_params|forbidden_origin|internal|aborted). `aborted` = the scan stopped early (Phase 6): the client vanished, the wall-clock budget ran out, or the server is shutting down — see ft_scan_aborted_total for which',
     ),
   ),
   historyReadSeconds: registry.register(
@@ -388,7 +399,7 @@ export const metrics = {
   eventsRequests: registry.register(
     new Counter(
       'ft_events_requests_total',
-      'GET /sessions/:id/events requests by result (ok|rate_limited|busy|unauthorized|login_required|forbidden|bad_session|bad_params|forbidden_origin|internal)',
+      'GET /sessions/:id/events requests by result (ok|rate_limited|busy|unauthorized|login_required|forbidden|bad_session|bad_params|forbidden_origin|internal|aborted). `aborted` = the scan stopped early (Phase 6): the client vanished, the wall-clock budget ran out, or the server is shutting down — see ft_scan_aborted_total for which',
     ),
   ),
   eventsReadSeconds: registry.register(
@@ -460,6 +471,53 @@ export const metrics = {
   ),
   buildInfo: registry.register(
     new Gauge('ft_build_info', 'Build/version info (always 1; read the labels)'),
+  ),
+  // --- Phase 6: lifecycle, schema, cancellation (audit §8 Phase 6) ---
+  // kind is a CLOSED two-value vocabulary set in shutdown.ts, never anything derived from an error
+  // message — an exception string is attacker-influenceable and would be unbounded cardinality.
+  processFatal: registry.register(
+    new Counter(
+      'ft_process_fatal_total',
+      'Process-level faults by kind (uncaught_exception|unhandled_rejection). uncaught_exception is followed by a graceful exit(1) and a restart; unhandled_rejection does NOT exit, so this counter is the only evidence it happened — alert on any increase',
+    ),
+  ),
+  shutdownSeconds: registry.register(
+    new Gauge(
+      'ft_shutdown_seconds',
+      'How long the last graceful shutdown took, by outcome (clean|deadline). Only ever visible on a scrape that races the exit; its real consumer is the shutdown e2e test, which asserts the sequence finished inside the budget',
+    ),
+  ),
+  dbSchemaVersion: registry.register(
+    new Gauge(
+      'ft_db_schema_version',
+      'PRAGMA user_version of the telemetry store after migrations. A field box that quietly failed to migrate is otherwise indistinguishable from one that did',
+    ),
+  ),
+  // surface = history|events (two values), reason = client_gone|budget|shutdown (three). Bounded by
+  // construction; no session or player label — same rule as the other read surfaces (ADR-0016 §1.2).
+  scanAborted: registry.register(
+    new Counter(
+      'ft_scan_aborted_total',
+      'Off-loop scans stopped before finishing, by surface (history|events) and reason (client_gone = the coach navigated away or their fetch deadline fired, budget = the wall-clock scan budget, shutdown = the server is going away). client_gone is the one that used to keep its shared inflight slot to the end',
+    ),
+  ),
+  backupCount: registry.register(
+    new Gauge('ft_backups', 'Verified VACUUM INTO copies currently on disk in BACKUP_DIR'),
+  ),
+  backupOldestAge: registry.register(
+    new Gauge(
+      'ft_backup_oldest_age_seconds',
+      "Age of the OLDEST backup. The compliance SLI for copies, mirroring ft_oldest_raw_fix_age_seconds for the live store: a backup is a complete copy of children's location and inherits ADR-0010's window. Rotation only runs when a new backup is taken, so a nightly cron that has been failing for a month leaves month-old copies with nothing else reporting them — alert when this exceeds RETENTION_DAYS",
+    ),
+  ),
+  backupBytes: registry.register(
+    new Gauge('ft_backup_bytes', 'Total bytes held by backups in BACKUP_DIR'),
+  ),
+  authSessionsRestored: registry.register(
+    new Counter(
+      'ft_auth_sessions_restored_total',
+      'Coach sessions carried across a graceful restart, by outcome (restored|expired|orphaned|capped|unreadable). Zero restored after a planned restart means every coach was logged out mid-match; `capped` means the handover held more sessions than the CURRENT per-user/global caps allow, which is what applying a tightened policy looks like; `unreadable` includes a handover that could not be CONSUMED (restoring it would replay logged-out sessions, so nothing is restored)',
+    ),
   ),
 };
 

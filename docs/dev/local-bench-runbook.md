@@ -38,11 +38,25 @@ credentials.
 
 ```sh
 docker compose up -d            # broker + server (first run installs server deps in the container)
-docker compose ps               # both Up?
+docker compose ps               # server should reach (healthy) within ~90 s of a cold first boot
 docker compose logs -f server   # expect "http listening" + "mqtt connected"
 ```
 > `MQTT_PASSWORD is not set` from compose means the provisioning step above hasn't run. That is on
 > purpose — the alternative used to be a broker that accepted anybody.
+
+**Since Phase 6** the server container has a healthcheck, capped logs and a graceful stop:
+- `docker compose ps` shows `(healthy)` / `(unhealthy)`. Stop the broker and the server goes unhealthy
+  within ~45 s (the probe reports `{"ok":false,"mqtt":false,...}`); restart it and it recovers in ~10 s.
+- `docker compose stop` exits **0 in ~0.2 s** with the WAL checkpointed and the coaches still logged in
+  (they used to be logged out on every restart, and the container used to be SIGKILLed at exit 137).
+- Take a verified backup between sessions — it is also the fastest way to snapshot a bench run:
+  ```sh
+  docker compose exec -T server bun run backup-db.ts          # + rotation
+  docker compose exec -T server bun run backup-db.ts --list   # incl. what is past RETENTION_DAYS
+  docker compose exec -T server bun run backup-db.ts --rotate-only
+  ```
+  Backups land in `server/data/backups/` (gitignored, 0600 in a 0700 directory) and are erased by
+  `purge-player.ts` along with the live store.
 
 The telemetry store is `./server/data/telemetry.db` on the host (a bind mount — it used to be a named volume no
 host path could reach, which broke erasure: audit §4.5 d). To erase a player while the stack is up, run the CLI

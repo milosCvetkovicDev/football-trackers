@@ -21,7 +21,8 @@
  * path and in `list` is in scope (the operator is the data controller; that is their own console). This
  * mirrors auth-user.ts, which likewise never echoes the password on a failure path.
  */
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { writeSecretFile } from './src/secretFile';
 import { withRosterLock } from './src/roster';
 
 interface RosterEntry {
@@ -65,7 +66,10 @@ function load(): RosterFile {
 }
 
 function save(file: RosterFile): void {
-  writeFileSync(FILE, JSON.stringify(file, null, 2) + '\n', { mode: 0o600 });
+  // 0600 via an atomic temp+rename+chmod (src/secretFile.ts). `writeFileSync(..., { mode })`
+  // applies the mode only when the file is CREATED, so an existing 0644 file stayed 0644 —
+  // the audit's "mode 0o600 is a no-op" finding, verified on both write paths.
+  writeSecretFile(FILE, JSON.stringify(file, null, 2) + '\n');
 }
 
 function cmdSet(): void {

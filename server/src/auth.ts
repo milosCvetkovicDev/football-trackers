@@ -22,11 +22,15 @@
  *
  * No heavyweight dependency: argon2id is Bun-native (Bun.password); tokens via node:crypto.
  */
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes, timingSafeEqual, createHash } from 'node:crypto';
 import { envBool, envInt, envNumber, envString } from './env';
 import { readFile, stat } from 'node:fs/promises';
+import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { writeSecretFile } from './secretFile';
 import { metrics } from './metrics';
 import { log } from './log';
+import { onShutdown, STEP } from './shutdown';
 
 export type Role = 'coach' | 'admin';
 
@@ -98,7 +102,21 @@ const b64 = () => randomBytes(32).toString('base64url'); // 256-bit opaque token
 // ----- state ----------------------------------------------------------------------------
 let accounts = new Map<string, Account>();
 let dummyHash = ''; // boot-precomputed argon2id hash for constant-work unknown-user verification
+/**
+ * Live sessions, keyed by sha256(token) — NOT by the token itself (Phase 6).
+ *
+ * Two reasons, and the second is why it changed. (1) The raw bearer token now exists in this process
+ * only for the microseconds between minting it and writing it into the Set-Cookie header; a heap dump
+ * of a running field box no longer yields usable credentials. (2) It is what makes surviving a restart
+ * safe: `saveSessions()` writes these keys verbatim, so the file on disk holds a VERIFIER, not a key —
+ * possession of it grants nothing without a sha256 preimage.
+ */
 const sessions = new Map<string, AuthSession>();
+
+/** Token -> store key. Fast hash on purpose: the token is 256 bits of CSPRNG, not a human password. */
+function tokenKey(token: string): string {
+  return createHash('sha256').update(token).digest('base64url');
+}
 const ipBuckets = new Map<string, { tokens: number; last: number }>();
 const lockouts = new Map<string, { fails: number; windowStart: number; until: number }>();
 let inflight = 0;
@@ -244,9 +262,185 @@ export async function initAuth(): Promise<void> {
     log.info('auth: accounts loaded', { count: accounts.size });
   }
 
+  // AFTER accounts: a restored session for an account that has since been removed must be dropped, and
+  // that check needs the account map. Before the listeners open, so no request can race a half-loaded store.
+  //
+  // The save step is registered RIGHT HERE, not in server.ts's block, and that is the whole point: this
+  // call CONSUMES the handover file, so from the moment it returns the only copy of those sessions is in
+  // memory. A SIGTERM between here and server.ts's registrations would previously have exited with the
+  // file already deleted and no step to write it back — measured: every coach logged out by a stop that
+  // landed 40-80 ms into boot, with `restored:0` in the log of the next boot, which the observability doc
+  // calls "a bug after a docker stop".
+  loadSessions();
+  onShutdown('auth-sessions', STEP.SESSIONS, () => {
+    saveSessions();
+  });
+
   setInterval(() => void reload(), RELOAD_MS).unref?.(); // async; fire-and-forget (re-entrancy-guarded)
   setInterval(sweep, 60_000).unref?.();
   updateSessionGauge();
+}
+
+// ----- surviving a restart (Phase 6; audit §6 "Server") -----------------------------------
+//
+// THE PROBLEM. Sessions live in a Map, so every restart logged out every coach — including the restart
+// an operator performs *because something is wrong mid-match*, which is exactly when a coach cannot
+// spare 30 seconds to find a password. Phase 6 makes planned restarts a normal, graceful operation, so
+// it also has to stop them costing the people using the thing.
+//
+// WHAT GOES ON DISK, AND WHY IT IS SAFE TO *READ*. The map is keyed by sha256(token), so what is
+// written is a VERIFIER: an attacker who can READ this file cannot mint a cookie from it without a
+// sha256 preimage. The CSRF synchronizer value is in the clear and is useless alone — it is only ever
+// checked against a request that ALSO carries the matching session cookie. 0600, next to
+// auth-accounts.json (argon2id password hashes, a strictly juicier target), gitignored alongside it.
+//
+// Someone who can WRITE it is a different matter, and the checker pass was right to press on it: they
+// can put sha256(a token they chose) in the file and walk in. That is not a privilege escalation — the
+// same write access lets them add an admin to auth-accounts.json — but a forged handover is a BETTER
+// backdoor, because the file deletes itself on read and leaves no artefact. So the restore applies the
+// live policy to every record rather than trusting it: the key must be the right SHAPE, a duplicate key
+// is dropped, the per-user and global caps apply, and the lifetime is CLAMPED to the current TTL.
+//
+// SINGLE USE. The file is deleted as soon as it is read — including when it is unreadable. A restart
+// hands the sessions over exactly once; a stale file can never resurrect sessions days later, and there
+// is no window where a copy sits around after the process that wrote it has started serving again.
+//
+// AN HONEST LIMIT: this only covers a GRACEFUL exit. A crash or a SIGKILL still logs everyone out,
+// because nothing wrote the file. That is stated rather than hidden — `ft_auth_sessions_restored_total`
+// reads 0 in exactly that case.
+const SESSIONS_FILE = envString('AUTH_SESSIONS_FILE', join(dirname(ACCOUNTS_FILE), 'auth-sessions.json'));
+const SESSIONS_MAX_BYTES = 1_000_000; // ~MAX_SESSIONS records; refuse to parse anything larger
+
+/** What saveSessions writes as a key: sha256 as base64url is exactly 43 chars of [A-Za-z0-9_-]. */
+const SESSION_KEY_RE = /^[A-Za-z0-9_-]{43}$/;
+
+interface PersistedSession {
+  h: string; // sha256(token), base64url — the map key, never the token
+  u: string; // username
+  c: string; // csrf synchronizer
+  e: number; // expiresAt, epoch ms
+}
+
+/**
+ * Write the live sessions out. Called as a shutdown step; safe to call when there are none (it removes
+ * any earlier file rather than leaving a stale one behind).
+ *
+ * Temp-file + rename, and an EXPLICIT chmod: `writeFile(..., { mode })` applies the mode only when the
+ * file is CREATED, so writing over an existing 0644 file would silently keep it world-readable — the
+ * audit's §6 "mode 0o600 is a no-op" finding, which this new file must not reproduce.
+ */
+export function saveSessions(): number {
+  const now = Date.now();
+  const live: PersistedSession[] = [];
+  for (const [h, s] of sessions) if (s.expiresAt > now) live.push({ h, u: s.username, c: s.csrf, e: s.expiresAt });
+
+  try {
+    if (live.length === 0) {
+      rmSync(SESSIONS_FILE, { force: true });
+      return 0;
+    }
+    // Atomic temp+rename+chmod, the same writer the roster/accounts CLIs use (src/secretFile.ts) —
+    // `writeFileSync(..., { mode })` honours the mode only on CREATE, and a half-written handover file
+    // would be parsed as corrupt and thrown away, logging every coach out for no reason.
+    writeSecretFile(SESSIONS_FILE, JSON.stringify({ v: 1, saved: now, sessions: live }))
+    log.info('auth sessions saved', { count: live.length, file: SESSIONS_FILE });
+    return live.length;
+  } catch (err) {
+    // Never fail the shutdown over this — losing sessions is an inconvenience, a stuck shutdown is an outage.
+    log.warn('auth sessions not saved', { err: String(err), file: SESSIONS_FILE });
+    return 0;
+  }
+}
+
+/** Read the file written by the previous process, restore what is still valid, and delete it. */
+export function loadSessions(): number {
+  if (!existsSync(SESSIONS_FILE)) return 0;
+  let restored = 0;
+  let expired = 0;
+  let orphaned = 0;
+  let capped = 0;
+
+  // 1. READ, with the size checked BEFORE the read (mirrors loadAccounts). Reading first and measuring
+  //    afterwards means a 400 MB file at this path is a 1.3 GB RSS spike inside initAuth() — measured —
+  //    which on the production container's 512 MB limit is an OOM kill before the listeners open, and
+  //    `restart: unless-stopped` turns that into a crashloop. Bytes, not `raw.length`: that is UTF-16
+  //    units, so it under-counts a multi-byte file by up to 3x.
+  let raw: string;
+  try {
+    const size = statSync(SESSIONS_FILE).size;
+    if (size > SESSIONS_MAX_BYTES) throw new Error(`sessions file too large (${size} bytes)`);
+    raw = readFileSync(SESSIONS_FILE, 'utf8');
+  } catch (err) {
+    log.warn('auth sessions not restored', { err: String(err), file: SESSIONS_FILE });
+    metrics.authSessionsRestored.inc({ outcome: 'unreadable' });
+    try { rmSync(SESSIONS_FILE, { force: true }); } catch { /* reported on the next boot too */ }
+    return 0;
+  }
+
+  // 2. CONSUME BEFORE RESTORING. "Single use" has to be unconditional, and doing the delete in a
+  //    `finally` was not: when the unlink failed (a read-only /config after an SD-card remount is the
+  //    realistic trigger on a Pi) the sessions were restored anyway and the file survived — so a coach
+  //    who pressed "sign out" had their session handed back at the next boot, and every boot after
+  //    that, with a cheerful "auth sessions restored" line and nothing said about the failed delete.
+  //    If the handover cannot be consumed, it is not a handover: restore NOTHING and say so loudly.
+  try {
+    rmSync(SESSIONS_FILE);
+  } catch (err) {
+    log.error('auth sessions file could not be removed — restoring NOTHING rather than risk replaying it', {
+      err: String(err),
+      file: SESSIONS_FILE,
+    });
+    metrics.authSessionsRestored.inc({ outcome: 'unreadable' });
+    return 0;
+  }
+
+  // 3. PARSE + restore, applying every control the live path applies.
+  try {
+    const parsed = JSON.parse(raw) as { v?: number; sessions?: unknown };
+    if (parsed.v !== 1 || !Array.isArray(parsed.sessions)) throw new Error('unrecognised sessions file shape');
+    const now = Date.now();
+    const perUser = new Map<string, number>();
+    for (const e of parsed.sessions as PersistedSession[]) {
+      // Fail closed per record: anything that is not exactly the expected shape is skipped, never coerced.
+      // `h` must LOOK like what saveSessions writes — sha256, base64url, 43 chars — so a hand-edited file
+      // cannot introduce a key of some other shape into the store.
+      if (typeof e?.h !== 'string' || !SESSION_KEY_RE.test(e.h)) { orphaned++; continue; }
+      if (typeof e?.u !== 'string' || typeof e?.c !== 'string' || e.c.length > 128) { orphaned++; continue; }
+      if (typeof e?.e !== 'number' || !Number.isFinite(e.e)) { orphaned++; continue; }
+      // One key, one owner. Duplicate `h` was last-wins, which is a silent identity swap on a key an
+      // earlier record already claimed.
+      if (sessions.has(e.h)) { orphaned++; continue; }
+      if (e.e <= now) { expired++; continue; }
+      if (!accounts.has(e.u)) { orphaned++; continue; } // account removed while we were down → revoked
+      const mine = perUser.get(e.u) ?? 0;
+      if (mine >= MAX_SESSIONS_PER_USER) { capped++; continue; } // the per-user cap, not just the global one
+      if (sessions.size >= MAX_SESSIONS) { capped++; break; }
+      // CLAMP the lifetime to the CURRENT policy. A restart is precisely how an operator applies a
+      // shortened AUTH_SESSION_TTL_SECONDS — the response to a lost or stolen coach tablet — so trusting
+      // the persisted expiry would exempt the very sessions being tightened against. (It also bounds a
+      // hand-written `e`: 1e308 was accepted before this line.)
+      const expiresAt = Math.min(e.e, now + SESSION_TTL_MS);
+      sessions.set(e.h, { username: e.u, csrf: e.c, expiresAt });
+      perUser.set(e.u, mine + 1);
+      restored++;
+    }
+    log.info('auth sessions restored', { restored, expired, orphaned, capped });
+  } catch (err) {
+    // A bad file must not stop the server booting — it just means everyone logs in again.
+    log.warn('auth sessions not restored', { err: String(err), file: SESSIONS_FILE });
+    metrics.authSessionsRestored.inc({ outcome: 'unreadable' });
+  }
+
+  metrics.authSessionsRestored.inc({ outcome: 'restored' }, restored);
+  metrics.authSessionsRestored.inc({ outcome: 'expired' }, expired);
+  metrics.authSessionsRestored.inc({ outcome: 'orphaned' }, orphaned);
+  metrics.authSessionsRestored.inc({ outcome: 'capped' }, capped);
+  return restored;
+}
+
+/** Test seam: the resolved path, so a test can assert the file's mode and that it is consumed. */
+export function _sessionsFile(): string {
+  return SESSIONS_FILE;
 }
 
 // ----- login controls -------------------------------------------------------------------
@@ -351,7 +545,7 @@ export async function attemptLogin(username: unknown, password: unknown, ip: str
       const drop = mine.shift(); // oldest first (Map insertion order)
       if (drop) sessions.delete(drop);
     }
-    sessions.set(token, { username, csrf, expiresAt: Date.now() + SESSION_TTL_MS });
+    sessions.set(tokenKey(token), { username, csrf, expiresAt: Date.now() + SESSION_TTL_MS });
     // Global cap stays as a hard backstop (the per-user cap keeps the map ~= users × MAX_SESSIONS_PER_USER).
     while (sessions.size > MAX_SESSIONS) {
       const oldest = sessions.keys().next().value; // Map preserves insertion order ≈ expiry order (const TTL)
@@ -373,12 +567,13 @@ export function logout(
   csrfHeader: string | undefined,
 ): { ok: boolean; status: number; error?: string } {
   const token = parseCookie(cookieHeader);
-  const s = token ? sessions.get(token) : undefined;
-  if (!token || !s) return { ok: false, status: 401 };
+  const key = token ? tokenKey(token) : undefined;
+  const s = key ? sessions.get(key) : undefined;
+  if (!key || !s) return { ok: false, status: 401 };
   // Synchronizer-token CSRF: compare the header against the value STORED IN THE SESSION (constant-time),
   // never against a cookie — so an attacker who can set a cookie cannot forge this.
   if (!csrfHeader || !constantTimeEqual(csrfHeader, s.csrf)) return { ok: false, status: 403, error: 'csrf' };
-  sessions.delete(token);
+  sessions.delete(key);
   updateSessionGauge();
   log.info('auth logout', { username: s.username });
   return { ok: true, status: 204 };
@@ -436,16 +631,17 @@ export function currentPrincipal(cookieHeader: string | undefined): Principal | 
 function principalFromCookie(cookieHeader: string | undefined): Principal | null {
   const token = parseCookie(cookieHeader);
   if (!token) return null;
-  const s = sessions.get(token);
+  const key = tokenKey(token);
+  const s = sessions.get(key);
   if (!s) return null;
   if (s.expiresAt <= Date.now()) {
-    sessions.delete(token);
+    sessions.delete(key);
     updateSessionGauge();
     return null;
   }
   const acc = accounts.get(s.username);
   if (!acc) {
-    sessions.delete(token); // account removed → revoke
+    sessions.delete(key); // account removed → revoke
     updateSessionGauge();
     return null;
   }

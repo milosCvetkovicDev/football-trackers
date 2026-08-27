@@ -21,7 +21,7 @@
  * Exits 0 on success, 1 on any failed assertion; cleans up the temp accounts file + the subprocesses it spawns.
  */
 
-import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 
 // A dedicated temp file that no other test/tool touches, so a stray leftover can't poison this run.
 const ACCOUNTS_FILE = '/tmp/ft-authcli-accounts.json';
@@ -88,6 +88,21 @@ try {
   // --- 1a. file mode is 0o600 (owner-only — it holds password hashes) ----------------------------------
   const mode = statSync(ACCOUNTS_FILE).mode & 0o777;
   assert(mode === 0o600, `accounts file mode must be 0o600, got 0o${mode.toString(8)}`);
+
+  // --- 1a-ii. PHASE 6 (audit §6 "Server"): an EXISTING loose file must be TIGHTENED, not left as found.
+  // `writeFileSync(path, text, { mode: 0o600 })` applies the mode only when the file is CREATED, so
+  // every write over a file that already existed — one restored from a backup, `scp`ed, or made by an
+  // editor — silently kept its old permissions while the docs claimed owner-only. The case above cannot
+  // catch that: it only ever inspects a file the CLI itself just created.
+  chmodSync(ACCOUNTS_FILE, 0o644);
+    const tighten = await runCli(['add', 'coach-tighten', '--role', 'coach', '--sessions', 's1'], 'correct-horse-battery-staple-9');
+  assert(tighten.code === 0, `add over a 0644 file should exit 0, got ${tighten.code}`);
+  const untighten = await runCli(['remove', 'coach-tighten']); // leave the account set as the later cases expect
+  assert(untighten.code === 0, 'removing the tightening probe account should exit 0');
+  assert(
+    (statSync(ACCOUNTS_FILE).mode & 0o777) === 0o600,
+    'a pre-existing 0644 file must be rewritten as 0600 — writeFileSync mode is a no-op on an existing file',
+  );
 
   // --- 1b. JSON contains coach1 with correct role + sessions -------------------------------------------
   let accounts = readAccounts();
@@ -161,6 +176,33 @@ try {
   accounts = readAccounts();
   assert(accounts.length === 1 && accounts[0].username === ADMIN,
     `a failed remove must leave the file intact (only ${ADMIN}), got ${JSON.stringify(accounts.map((a) => a.username))}`);
+
+  // --- 9. PHASE 6: CONCURRENT writers must not lose an account, or lie about it ------------------------
+  // Every command here is a read-modify-write. Unlocked, five concurrent `add`s produced TWO accounts
+  // that reported success and were LOST, and two that reported failure and were PERSISTED — the failures
+  // being raw Bun stack traces from `rename`, not this CLI's error contract. Provisioning silently
+  // dropping a coach while telling the operator it worked is not something to leave to "don't do that".
+  {
+    const NAMES = ['conc-1', 'conc-2', 'conc-3', 'conc-4', 'conc-5'];
+    const before = readAccounts().length;
+    const results = await Promise.all(
+      NAMES.map((n) => runCli(['add', n, '--role', 'coach', '--sessions', 's1'], `pw-for-${n}-longenough`)),
+    );
+    const persisted = readAccounts().map((a) => a.username);
+    for (const [i, n] of NAMES.entries()) {
+      // The two halves of the contract: every reported success is on disk, and every account on disk
+      // reported success. Either direction failing is the bug.
+      if (results[i].code === 0) {
+        assert(persisted.includes(n), `${n} reported success (exit 0) but is NOT in the file — a lost account`);
+      } else {
+        assert(!persisted.includes(n), `${n} reported FAILURE (exit ${results[i].code}) but IS in the file`);
+        assert(!/at writeSecretFile|ENOENT/.test(results[i].stderr), `a failure must be this CLI's error, not a raw stack trace: ${results[i].stderr.slice(0, 200)}`);
+      }
+    }
+    assert(results.every((r) => r.code === 0), `all five concurrent adds should succeed under the lock: ${results.map((r) => r.code).join(',')}`);
+    assert(readAccounts().length === before + NAMES.length, `all ${NAMES.length} accounts must survive, got ${readAccounts().length - before}`);
+    for (const n of NAMES) assert((await runCli(['remove', n])).code === 0, `cleanup: remove ${n}`);
+  }
 
   console.log('\n✅ AUTH CLI PASSED — add(stdin) writes 0o600 argon2id JSON (no plaintext), list shows both, remove drops one & keeps the other, remove-ghost errors without corrupting the file');
   if (existsSync(ACCOUNTS_FILE)) rmSync(ACCOUNTS_FILE);

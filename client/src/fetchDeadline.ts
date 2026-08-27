@@ -30,12 +30,18 @@ export const FETCH_DEADLINE_MS = 8_000;
  * a busy session on a Pi-class box can legitimately run for tens of seconds.
  *
  * A checker lens caught the original mistake here — every read shared the 8 s deadline, justified by a
- * comment claiming "the server's own off-loop scan cap is the slower bound", which does not exist. The
- * consequence was worse than a slow spinner: a legitimate long scan was aborted at 8 s and shown as a
- * failure, every "Try again" reproduced it exactly (so the window was permanently unreadable), and
- * because the server does not observe the client's disconnect, each abandoned attempt kept its
- * `scanLoad` slot until it finished — three of those and every review read in the deployment answers
- * 503 `busy`. Pressure on that shared slot is why this number is generous rather than tight.
+ * comment claiming "the server's own off-loop scan cap is the slower bound", which at the time did not
+ * exist. The consequence was worse than a slow spinner: a legitimate long scan was aborted at 8 s and
+ * shown as a failure, every "Try again" reproduced it exactly (so the window was permanently
+ * unreadable), and because the server did not observe the client's disconnect, each abandoned attempt
+ * kept its `scanLoad` slot until it finished — three of those and every review read in the deployment
+ * answers 503 `busy`.
+ *
+ * BOTH of those are now fixed on the server side (Phase 6): it reads `request.signal`, so abandoning a
+ * read releases the slot at the next page boundary, and `SCAN_BUDGET_MS` (25 s) is a real wall-clock
+ * cap. 30 s here is deliberately LONGER than that budget, so the server gives up first and answers 503
+ * — an honest, retryable response — rather than the client timing out against a scan that is still
+ * running. If you change one of these two numbers, change the other: the ordering is the contract.
  */
 export const SCAN_DEADLINE_MS = 30_000;
 

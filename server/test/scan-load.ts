@@ -44,7 +44,7 @@ try {
   assert(!h1.ok && h1.result === 'busy', 'history must be denied (503 busy) by the slots EVENTS holds — shared cap');
 
   // Free one EVENTS slot → a HISTORY scan can now take it (the slot is genuinely shared, not per-surface).
-  releaseEventsInflight();
+  releaseEventsInflight('coachA');
   assert(_scanInflight() === 1, `releasing one events slot drops the shared count to 1, got ${_scanInflight()}`);
   const h2 = historyGate('coachD');
   assert(h2.ok, 'history must acquire the slot freed by an events release (shared)');
@@ -56,8 +56,8 @@ try {
   assert(!e3.ok && e3.result === 'busy', 'events must be denied by the slot HISTORY holds — shared cap, reverse direction');
 
   // Balance the counter back to 0.
-  releaseEventsInflight(); // free the remaining events slot
-  releaseInflight(); // free the history slot
+  releaseEventsInflight('coachB'); // free the remaining events slot
+  releaseInflight('coachD'); // free the history slot
   assert(_scanInflight() === 0, `shared counter must return to 0 after balanced release, got ${_scanInflight()}`);
 
   console.log('\n✅ SCAN-LOAD PASSED — the off-loop inflight cap is genuinely SHARED across /history + /events (both directions); a private per-surface counter would fail this');

@@ -21,7 +21,7 @@ import { readFixesPage, type FixRow } from './db';
 import { envNumber } from './env';
 import { ageBandFor, thresholdsForSession } from './sessionConfig';
 import type { DetectorParams, EventsResult, TacticalEvent, TeamShapeBucket } from './types';
-import { acquireScanSlot, releaseScanSlot } from './scanLoad';
+import { acquireScanSlot, releaseScanSlot, newScanBudget, type ScanBudget } from './scanLoad';
 import { metrics } from './metrics';
 
 // ----- config (env) — bounds on the scan + the DoS controls (§1.5) -----------------------
@@ -209,7 +209,11 @@ function finalizeBucket(ts: number, players: Map<string, BucketFix>, hsrMps: num
 }
 
 // ----- the read --------------------------------------------------------------------------
-const yieldLoop = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+/** Yield between pages AND give the scan its one chance to stop (see history.ts's copy for the why). */
+const yieldLoop = async (scan: ScanBudget): Promise<void> => {
+  await new Promise((r) => setTimeout(r, 0));
+  scan.check();
+};
 
 /**
  * Read a session's tactical events for the validated window, OFF the live loop: keyset-page over the raw trace
@@ -217,7 +221,10 @@ const yieldLoop = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
  * series, `await`-yielding between pages. Then run the detectors over the bounded series (a cheap synchronous
  * post-pass, O(buckets) ≤ MAX_BUCKETS). NO playerId/name anywhere in the result.
  */
-export async function readEvents(p: EventsParams): Promise<EventsResult> {
+export async function readEvents(p: EventsParams, scan?: ScanBudget): Promise<EventsResult> {
+  // Same ownership rule as readHistory: a budget we created is a budget we release (see its note).
+  const own = scan === undefined ? newScanBudget() : null;
+  const budget = scan ?? own!;
   const t0 = performance.now();
   try {
     const thresholds = thresholdsForSession(p.sessionId);
@@ -242,6 +249,7 @@ export async function readEvents(p: EventsParams): Promise<EventsResult> {
       const rows = readFixesPage(p.sessionId, p.from, p.to, afterTs, afterRowid, EVENTS_SCAN_CHUNK);
       if (rows.length === 0) break;
       scanned += rows.length;
+      budget.noteRows(rows.length); // so an abort can still be audited for volume
       for (const r of rows) {
         // Rows ascend by (server_ts, rowid), so bucket index is monotonic non-decreasing: a higher index
         // closes the open bucket. Empty intermediate buckets are simply never created (skipped).
@@ -263,7 +271,7 @@ export async function readEvents(p: EventsParams): Promise<EventsResult> {
       afterTs = last.serverTs;
       afterRowid = last.rowid;
       if (rows.length < EVENTS_SCAN_CHUNK) break;
-      await yieldLoop(); // yield the live loop between pages (the §5 SLO depends on this)
+      await yieldLoop(budget); // yield the live loop between pages (the §5 SLO depends on this)
     }
     // PM-3: flush the final open bucket — close-on-index-advance never closes the last one (mirrors the
     // history.ts scan-end flush). Without this the end-of-window bucket is silently dropped.
@@ -501,13 +509,14 @@ export type GateResult = { ok: true } | { ok: false; result: 'rate_limited' | 'b
  */
 export function eventsGate(principalKey: string): GateResult {
   if (!rateOk(principalKey)) return { ok: false, result: 'rate_limited' };
-  if (!acquireScanSlot()) return { ok: false, result: 'busy' };
+  // Same two bounds as /history — they share the counter (PM-1) and the per-principal share.
+  if (!acquireScanSlot(principalKey)) return { ok: false, result: 'busy' };
   return { ok: true };
 }
 
 /** Release the shared scan slot taken by a successful eventsGate(). Pair in a `finally`. */
-export function releaseEventsInflight(): void {
-  releaseScanSlot();
+export function releaseEventsInflight(principalKey: string): void {
+  releaseScanSlot(principalKey);
 }
 
 export { EVENTS_MAX_SPAN_MS, EVENTS_SCAN_CHUNK, MAX_BUCKETS, MIN_BUCKET_MS, EVENTS_MAX_PLAYERS_PER_BUCKET, MIN_PLAYERS_FOR_EVENTS };
