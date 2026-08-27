@@ -207,7 +207,10 @@ try {
 
   // --- 3. the wall-clock budget stops a scan that outlives it ---------------------------------------------
   {
-    const budgeted = await startServer({ SCAN_BUDGET_MS: '1000' }); // min is 1000; the scan above exceeds it
+    // Derived from the baseline THIS machine measured, not a fixed number: a fast CI runner finished the
+    // scan inside a hardcoded 1 s budget and the case became unreachable there while passing locally.
+    const budgetMs = Math.max(100, Math.round(scanMs * 0.3));
+    const budgeted = await startServer({ SCAN_BUDGET_MS: String(budgetMs) });
     const cookie2 = await loginCookie();
     const r = await fetch(url, { headers: { cookie: cookie2, origin: ORIGIN } });
     const body = (await r.json()) as { error?: string };
@@ -224,7 +227,7 @@ try {
     assert(small.status === 200, `a small read after a budget abort must succeed, got ${small.status}`);
     budgeted.kill('SIGTERM');
     await budgeted.exited;
-    ok('a scan that outlives SCAN_BUDGET_MS is stopped with an honest 503 and frees its slot');
+    ok(`a scan that outlives SCAN_BUDGET_MS (${budgetMs}ms, vs a ${Math.round(scanMs)}ms scan) is stopped with an honest 503 and frees its slot`);
   }
 
   // --- 6. A SCAN IN FLIGHT AT SHUTDOWN gets an honest 503, not a socket reset -------------------------

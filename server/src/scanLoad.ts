@@ -110,7 +110,11 @@ export class ScanAborted extends Error {
  * client timing out against a scan that keeps running and keeps its slot — which is the exact failure
  * Phase 5 could only reduce the frequency of.
  */
-const SCAN_BUDGET_MS = envTimerMs('SCAN_BUDGET_MS', 25_000, { min: 1_000 });
+// The floor is 100 ms rather than 1 s only so a test can set a budget BELOW the machine it runs on can
+// complete a scan in — the CI runner is fast enough that a 1 s floor made the budget case unreachable
+// there while passing locally. It is still a nonsense-rejecting floor (0, negative and non-numeric all
+// fall back loudly via envTimerMs); a deliberate 100 ms is a choice, not a typo.
+const SCAN_BUDGET_MS = envTimerMs('SCAN_BUDGET_MS', 25_000, { min: 100 });
 
 const liveScans = new Set<ScanBudget>();
 
