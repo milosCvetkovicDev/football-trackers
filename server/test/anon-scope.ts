@@ -332,7 +332,14 @@ try {
   ok('/roster with a cookie → 200 WITH the name (the rule is "log in", not "never")');
 
   // The point of requiring a login is attribution: the audit line must name who read it.
-  assert(new RegExp(`"msg":"roster read"[^\\n]*"username":"${COACH}"`).test(anonLog),
+  //
+  // WAITED for, not asserted on the spot. `anonLog` is filled by an async reader draining the child's
+  // stdout, so the line can exist in the server and not yet in this string — a capture race that passes
+  // on a quiet laptop and fails on a loaded CI runner (it did, once, on main). Waiting turns a flake into
+  // a real failure only when the line genuinely never arrives.
+  const auditLine = new RegExp(`"msg":"roster read"[^\\n]*"username":"${COACH}"`);
+  for (let i = 0; i < 50 && !auditLine.test(anonLog); i++) await sleep(100);
+  assert(auditLine.test(anonLog),
     `the roster read must be audited against the coach's username; log tail:\n${anonLog.slice(-800)}`);
   ok('the read is audited against the coach by name (anon reads logged username:null)');
 
