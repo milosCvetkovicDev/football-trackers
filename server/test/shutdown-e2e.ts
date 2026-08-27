@@ -23,7 +23,7 @@
  * Only adult coach usernames and pseudonymous ids appear here — never a child's name.
  */
 
-import { chmodSync, existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -45,7 +45,12 @@ const dir = mkdtempSync(join(tmpdir(), 'ft-shutdown-'));
 const DB_PATH = join(dir, 'telemetry.db');
 const ACCOUNTS_FILE = join(dir, 'auth-accounts.json');
 const ROSTER_FILE = join(dir, 'roster.json');
-const SESSIONS_FILE = join(dir, 'auth-sessions.json');
+// The handover file lives in its OWN directory. One case below makes that directory unwritable to prove
+// a handover that cannot be CONSUMED restores nothing — and chmod'ing the shared temp dir would also stop
+// SQLite creating the store's -wal/-shm sidecars, so the server would fail to start for the wrong reason
+// (it did, on Linux CI, while passing on macOS where the sidecars happened to survive).
+const HANDOVER_DIR = join(dir, 'handover');
+const SESSIONS_FILE = join(HANDOVER_DIR, 'auth-sessions.json');
 const CONF_FILE = join(dir, 'mosquitto.conf');
 
 const children: { kill: (sig?: number | NodeJS.Signals) => void }[] = [];
@@ -112,6 +117,7 @@ const at = (logs: string, needle: string): number => logs.indexOf(needle);
 
 try {
   // --- fixtures: a broker, an account, an empty roster --------------------------------------------------
+  mkdirSync(HANDOVER_DIR, { recursive: true });
   writeFileSync(CONF_FILE, `listener ${BROKER_PORT} 127.0.0.1\nallow_anonymous true\n`);
   children.push(Bun.spawn([Bun.which('mosquitto') ?? 'mosquitto', '-c', CONF_FILE], { stdout: 'ignore', stderr: 'ignore' }));
 
@@ -294,19 +300,28 @@ try {
     await src.proc.exited;
     assert(existsSync(SESSIONS_FILE), 'precondition: a handover file exists');
 
-    chmodSync(dir, 0o500); // read + execute, no write: the file can be read but not unlinked
+    chmodSync(HANDOVER_DIR, 0o500); // read + execute, no write: readable, not unlinkable
     const locked = startServer();
     await waitReady();
-    chmodSync(dir, 0o700); // restore before any assertion can throw and skip the cleanup
+    // Did the setup actually take? ROOT ignores directory write permission (DAC_OVERRIDE), so in a
+    // root container the unlink succeeds and this case simply cannot be staged. Say so rather than
+    // asserting a property the environment did not create — a test that quietly cannot run is worse
+    // than one that admits it. (CI runs as a non-root user, where it does run.)
+    const stillThere = existsSync(SESSIONS_FILE);
+    chmodSync(HANDOVER_DIR, 0o700); // restore before any assertion can throw and skip the cleanup
     const me = await fetch(`http://127.0.0.1:${PORT}/auth/me`, { headers: { cookie: doomed, origin: ORIGIN } });
     const who = (await me.json()) as { username?: string };
     const logs = locked.logs();
     locked.proc.kill('SIGTERM');
     await locked.proc.exited;
-    assert(who.username !== COACH, 'a handover that could not be consumed must NOT be restored — it would replay logged-out sessions');
-    assert(/could not be removed/.test(logs), `the failure must be LOUD, not silent. logs: ${logs.slice(-500)}`);
+    if (stillThere) {
+      assert(who.username !== COACH, 'a handover that could not be consumed must NOT be restored — it would replay logged-out sessions');
+      assert(/could not be removed/.test(logs), `the failure must be LOUD, not silent. logs: ${logs.slice(-500)}`);
+      ok('a handover file that cannot be deleted restores nothing, loudly');
+    } else {
+      console.log('  --: handover-unlink-failure case SKIPPED — this user can unlink from a 0500 directory (running as root?)');
+    }
     rmSync(SESSIONS_FILE, { force: true });
-    ok('a handover file that cannot be deleted restores nothing, loudly');
   }
   {
     // (iv) A hand-written handover is treated as untrusted input. Someone who can WRITE this file can
@@ -382,8 +397,19 @@ try {
     await src.proc.exited;
     assert(existsSync(SESSIONS_FILE), 'precondition: a handover file exists');
 
-    const handled: number[] = [];
-    for (const delayMs of [0, 20, 40, 60, 80, 120]) {
+    // Sample RELATIVE to how long this machine actually takes to boot, not at fixed millisecond marks:
+    // a cold container is several times slower than a warm laptop, and fixed marks would land entirely
+    // inside module loading there (measured — 5 of 6 fixed samples missed) and entirely after it here.
+    const tReady = Date.now();
+    const timing = startServer();
+    await waitReady();
+    const readyMs = Date.now() - tReady;
+    timing.proc.kill('SIGTERM');
+    await timing.proc.exited;
+
+    const samples: Array<{ at: number; code: number | null; ms: number }> = [];
+    for (const frac of [0.05, 0.2, 0.5, 0.65, 0.8, 0.95]) {
+      const delayMs = Math.round(readyMs * frac);
       const early = startServer();
       await sleep(delayMs);
       const t = Date.now();
@@ -391,15 +417,21 @@ try {
       const code = await early.proc.exited;
       const took = Date.now() - t;
       // PROMPT in every case is the property that failed: the container symptom was waiting out the whole
-      // grace period. A 143 at t+0 (before Bun has executed a line of the module) is the OS default
-      // disposition and is fine — it is prompt, and there is no handler to install yet.
-      assert(took < BUDGET_MS, `SIGTERM at +${delayMs}ms must exit inside ${BUDGET_MS}ms, took ${took}ms (exit ${code})`);
-      if (code === 0) handled.push(delayMs);
+      // grace period. A 143 in the first few per cent (before Bun has executed a line of the module) is
+      // the OS default disposition and is fine — it is prompt, and there is no handler to install yet.
+      assert(took < BUDGET_MS, `SIGTERM at ${Math.round(frac * 100)}% of boot must exit inside ${BUDGET_MS}ms, took ${took}ms (exit ${code})`);
+      samples.push({ at: frac, code, ms: took });
     }
-    // ...and it must be HANDLED (exit 0, teardown run) from early in the boot, not only once the listeners
-    // are up. With the handlers installed at the END of server.ts — where they were — every one of these
-    // samples lands before installation and this is empty.
-    assert(handled.length >= 3, `the signal must be handled early in boot; only ${handled.length} of 6 samples exited 0 (at ${handled.join(',')}ms)`);
+    // From two-thirds of the way through boot onward it must be HANDLED — exit 0, teardown run. Not
+    // earlier: MODULE LOADING dominates a cold container's boot, and until Bun has executed the first
+    // line of server.ts there is nothing to install (measured on Linux, 50% of a 205 ms boot is still
+    // inside the imports). With the handlers where they were — the LAST statement of the module, after
+    // both listeners are already up — every one of these samples is 143 instead.
+    const late = samples.filter((x) => x.at >= 0.65);
+    assert(
+      late.every((x) => x.code === 0),
+      `the signal must be handled from mid-boot onward; got ${JSON.stringify(late.map((x) => ({ at: x.at, code: x.code })))} (readyMs=${readyMs})`,
+    );
 
     // The sessions must have survived every one of those. They are either still on disk (the kill landed
     // before the restore) or were written back by the shutdown step (it landed after) — never neither.
