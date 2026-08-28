@@ -49,6 +49,7 @@ const SUITES: Array<[file: string, proves: string]> = [
   // --- no broker, no ports: fail here in seconds rather than after ten stack spin-ups ---
   ['gitignore-guard.ts', 'no personal data or secret can enter git'],
   ['deploy-posture.ts', 'the dev stack stays loopback-published with an authenticated broker'],
+  ['docs-guard.ts', 'the entry-point docs match the repo: links resolve, commands exist, counts agree, no subproject is invisible (Phase 7)'],
   ['auth-loader.ts', 'account file parsing + fail-closed posture'],
   ['roster-loader.ts', 'roster parsing; names never leave the loader'],
   ['session-config-loader.ts', 'session config parsing + reload'],

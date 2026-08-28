@@ -9,12 +9,24 @@ from __future__ import annotations
 import os
 import re
 import glob
+import signal
 import subprocess
+import threading
 
 # --- limits / vocab -------------------------------------------------------------------------
 MAX_SECONDS = 600                      # cap the downloaded section (a clip, not a whole match)
 DEFAULT_SECONDS = 60
 LOG_CAP = 400                          # keep only the last N log lines per job
+
+# Deadlines. BOTH stages can hang without exiting: yt-dlp blocks on a stalled CDN or an interactive
+# prompt, and CPU inference on a longer clip than the operator meant to hand over runs for hours.
+# `_default_run` iterated proc.stdout and then called proc.wait(), neither of which has a deadline,
+# so the job thread parked in "Skidanje snimka…" permanently — and with the one-job-at-a-time cap
+# the web UI now enforces, a permanently-parked job means the UI never accepts another one.
+# The numbers are bounded by what the tool is for: a clip of at most MAX_SECONDS, on CPU.
+DOWNLOAD_TIMEOUT_S = float(os.environ.get("FT_DOWNLOAD_TIMEOUT_S", "600"))    # 10 min
+PIPELINE_TIMEOUT_S = float(os.environ.get("FT_PIPELINE_TIMEOUT_S", "5400"))   # 90 min
+TIMEOUT_RC = 124                       # the conventional `timeout(1)` status
 
 # v1 = players + teams + annotated video. It needs NO homography/calibration, so it runs fully
 # automatically from a link. v2 (ball+radar) / v3 (analytics) need a pitch calibration step,
@@ -124,14 +136,54 @@ def _fail(job: dict, msg: str) -> dict:
     return job
 
 
-def _default_run(cmd: list[str], on_line) -> int:
-    """Run a subprocess, streaming combined stdout/stderr line-by-line into the job log."""
+def _kill_group(proc: "subprocess.Popen") -> None:
+    """Kill the process GROUP, not just the child.
+
+    yt-dlp shells out to ffmpeg, and the pipeline may too. Killing only the direct child leaves the
+    grandchild running AND holding the write end of the pipe open, so the reader below keeps
+    blocking on a process that has already been 'killed' — a timeout that does not time out.
+    `start_new_session=True` on the Popen is what gives us a group id to aim at.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()                       # no process group (Windows, or an odd platform)
+        except OSError:
+            pass
+
+
+def _default_run(cmd: list[str], on_line, timeout_s: float | None = None) -> int:
+    """Run a subprocess, streaming combined stdout/stderr line-by-line into the job log.
+
+    `timeout_s` is a WALL-CLOCK deadline on the whole command, enforced by a timer that kills the
+    process group. It is not `subprocess.run(timeout=)` because this reads the output as it arrives
+    (that is the job log the UI shows); the read is what would block forever, so the deadline has to
+    come from outside the read.
+    """
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1)
+                            text=True, bufsize=1, start_new_session=True)
     assert proc.stdout is not None
-    for line in proc.stdout:
-        on_line(line.rstrip())
-    proc.wait()
+
+    timed_out = threading.Event()
+    timer = None
+    if timeout_s and timeout_s > 0:
+        def _fire():
+            timed_out.set()
+            _kill_group(proc)
+        timer = threading.Timer(timeout_s, _fire)
+        timer.daemon = True
+        timer.start()
+    try:
+        for line in proc.stdout:
+            on_line(line.rstrip())
+        proc.wait()
+    finally:
+        if timer is not None:
+            timer.cancel()
+    if timed_out.is_set():
+        on_line(f"timeout: the command exceeded {timeout_s:.0f}s and was killed")
+        return TIMEOUT_RC
     return int(proc.returncode or 0)
 
 
@@ -143,7 +195,12 @@ def run_job(job: dict, *, run=_default_run, out_root: str = "out") -> dict:
     on_line = lambda l: _log(job, l)  # noqa: E731
     try:
         job["state"], job["stage"], job["pct"] = "downloading", "Skidanje snimka (yt-dlp)…", 5
-        if run(build_download_cmd(job["url"], out_dir, job["seconds"]), on_line) != 0:
+        rc = run(build_download_cmd(job["url"], out_dir, job["seconds"]), on_line,
+                 timeout_s=DOWNLOAD_TIMEOUT_S)
+        if rc == TIMEOUT_RC:
+            return _fail(job, f"Skidanje snimka je prekinuto posle {int(DOWNLOAD_TIMEOUT_S)}s "
+                              "(predugo). Probaj kraći isečak ili drugi link.")
+        if rc != 0:
             return _fail(job, "Skidanje snimka nije uspelo (yt-dlp). Proveri link / dostupnost.")
         clip = find_clip(out_dir)
         if not clip:
@@ -151,8 +208,13 @@ def run_job(job: dict, *, run=_default_run, out_root: str = "out") -> dict:
 
         job["state"], job["stage"], job["pct"] = "processing", \
             "Obrada: detekcija + praćenje + podela na timove…", 40
-        if run(build_pipeline_cmd(clip, out_dir, job["level"], job["device"],
-                                  job["sample_fps"], job["imgsz"]), on_line) != 0:
+        rc = run(build_pipeline_cmd(clip, out_dir, job["level"], job["device"],
+                                    job["sample_fps"], job["imgsz"]), on_line,
+                 timeout_s=PIPELINE_TIMEOUT_S)
+        if rc == TIMEOUT_RC:
+            return _fail(job, f"Obrada je prekinuta posle {int(PIPELINE_TIMEOUT_S / 60)} min "
+                              "(predugo). Probaj kraći isečak.")
+        if rc != 0:
             return _fail(job, "Obrada nije uspela (pipeline). Vidi log ispod.")
 
         job["outputs"] = collect_outputs(out_dir)

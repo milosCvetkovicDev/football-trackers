@@ -1,9 +1,17 @@
-# vision/requirements-test.txt — deps for the CPU test image (docker compose `test`/`selftest`).
-# The 24-test suite needs ONLY these: torch/ultralytics/transformers are lazy/guarded in the code,
-# so the suite runs without them (they live in the GPU image's requirements.txt instead).
+# vision/requirements-test.txt — DECLARED deps for the CPU test image (docker compose `test`/`selftest`).
+# The exact resolved set is `requirements-test.lock`, and the image installs from THAT (see Dockerfile).
+# This file is the intent; the lock is what gets built.
+#
+# The suite needs only these: torch/ultralytics/transformers are lazy/guarded in the code, so it
+# runs without them (they live in the GPU image's requirements.txt instead).
+#
+# opencv is bounded to <5 to match requirements.txt. Without the bound, the test image resolved
+# opencv-python 5.0.0.93 while the images that actually decode match footage pinned <5 — so CI was
+# exercising a different major version of the library every frame passes through than the one the
+# pipeline runs on. A test image is only evidence about the run image to the extent the two agree.
 pytest
 PyYAML
 numpy
-opencv-python
+opencv-python>=4.9,<5
 scikit-learn
 supervision==0.29.*

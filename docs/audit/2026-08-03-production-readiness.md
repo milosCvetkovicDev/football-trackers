@@ -888,6 +888,68 @@ out of `out/` · checksum-pinned fetch · consumed lockfile · README/CLAUDE.md 
 
 **Accept:** `--ball` exits non-zero · second concurrent POST returns 429 · `_iter_world_states` peak < 1/10 naive · docs guard passes.
 
+> **✅ DONE 2026-08-28 — all four acceptance criteria met by execution, plus the whole of §6's "Vision"
+> and "Docs" groups and P1 items V-1, V-2 and Q-1.**
+>
+> ACCEPTANCE, measured. **(1) `--ball` exits non-zero** — `--ball`, `--radar` and `--stats` now exit
+> **3** (a status distinct from argparse's 2 and from a real failure's 1) with the reason on stderr,
+> and create nothing: `ls /tmp/o1 /tmp/o2 /tmp/o3` → no such file. `--selftest` still exits 0.
+> **(2) 429** — driven over a real socket in `test/test_webui_server.py`: the first POST gets 202, the
+> second while it runs gets **429** with a message, and the slot is released when the job ends
+> (verified by polling until a third POST is accepted). **(3) Peak retention** — measured at 720p
+> rather than asserted: **200 frames naive = 553 MB, streaming peak = 1 frame = 2.8 MB, a ratio of
+> 1/200** against the required 1/10. At the stated 90-min/720p/5 fps target that is the difference
+> between 69.5 GiB and ~3 MB. **(4) Docs guard** — two of them: `server/test/docs-guard.ts`, **24
+> checks**, wired into the unfiltered `repo-guard` workflow and the 31-suite server gate; and
+> `vision/test/test_docs_guard.py` for the subproject's own claims.
+>
+> ALSO SHIPPED: the v2/v3 `...` stubs replaced by `NotImplementedStage` raised as the FIRST statement
+> (so the refusal is identical with or without weights, and cannot be mistaken for a missing
+> manifest); `_iter_world_states` rebuilt as a two-decode-pass stream keeping only detections plus one
+> **copied** sample crop per track id; the web UI bound to loopback, capped at one job, given
+> deadlines on both subprocess stages that kill the process **group** (yt-dlp shells out to ffmpeg;
+> killing the child alone leaves the pipe open and the read blocked forever), and an artifact
+> **allow-list** — `clip.<ext>`, the raw downloaded source, was reachable to anyone who guessed a
+> 12-hex job id; a 24 h TTL prune of `out/`, with the attestation ledger moved OUT of it first;
+> checksum-**pinned** weight fetch, where the manifest records the pin and never the digest of what
+> arrived; both lockfiles made real and actually installed from (the CPU one is a full verified
+> `pip freeze`, rebuilt and re-run); and `ffmpeg`'s exit status finally read.
+>
+> THREE FINDINGS FROM THIS PHASE'S OWN WORK, all beyond the brief:
+> - **The README's third-party attribution was false, not merely unfilled.** It said Roboflow `sports`
+>   (MIT) *"is vendored … at commit `<RECORD SHA HERE>`"*. Nothing was ever copied — the module's own
+>   header has always said these are *"NOT a verbatim copy … independent minimal equivalents"*, ~90
+>   lines of original code. Filling the blank would have meant inventing a SHA for code nobody took.
+>   The accurate claim is now in `vendor/sports/PROVENANCE.json` with a `copied_code` flag the guard
+>   keys off; if real source is ever brought in, the guard starts demanding the 40-char commit.
+> - **CI was testing a different major version of the decoder than the pipeline runs on.** The CPU test
+>   image resolved `opencv-python 5.0.0.93` while the inference images pin `<5`. A test image is only
+>   evidence about the run image to the extent the two agree; the bound is now in both.
+> - **`samples/` held footage ADR-0023 §3 requires to be discarded.** The empty manifest was not a
+>   paperwork gap: two clips of an amateur pitch whose competition and players' ages cannot be
+>   identified from the footage — exactly the ambiguous case §3's default-deny rule is written for.
+>   Reported to the owner, who deleted them. `clip.mp4` was verified by eye to be synthetic (a green
+>   rectangle and white bars, no people) and is recorded as such.
+>
+> NON-VACUITY: **21 mutations**, each breaking one fix and requiring its gate to go red. Three tests
+> failed that bar and were rewritten, which is the whole reason for running it:
+> - the streaming test passed with `_crop` reverted to a numpy **view**, because the fake provider
+>   reused three track ids so every crop pinned the same single frame, and the measurement ran after
+>   the crops were released. Real tracking emits a stream of NEW ids — that is what `track_id_space:
+>   "raw"` is confessing — and under views each pins its own parent frame for all of pass 1. There is
+>   now an id-churn case measuring **inside `embed()`**, the one instant every crop is live at once;
+> - the no-pin test asserted `"pin" in message`, which the *mismatch* path also satisfies ("expected
+>   the pinned None"). It now asserts the downloader is **never called** — refusing before a 137 MB
+>   download is the behaviour that matters;
+> - the lockfile-consumed check searched the whole Dockerfile stage for `requirements-test.lock` and
+>   so matched the `COPY` line, staying green when the `pip install` was flipped back to the range
+>   file. It now reads the install line specifically.
+>
+> **Deliberately NOT done, and named rather than faked:** v2 (ball + radar) and v3-over-video remain
+> unbuilt. Wiring them needs real weights, a calibrated clip and a GPU — none of which CI has — so
+> they refuse loudly instead of returning a hollow success. That is the fix; building them is not
+> this phase.
+
 ---
 
 ## 9. Recommended sequencing note

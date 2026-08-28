@@ -1,7 +1,7 @@
 # Server CI — the Bun + Elysia ingest / fan-out / persistence service (server/).
 #
 # Gate order (fail fast, cheapest first): install -> typecheck -> full suite. `bun run test` is
-# server/test/run-all.ts, which runs all 30 suites sequentially and REFUSES TO START if any file in
+# server/test/run-all.ts, which runs all 31 suites sequentially and REFUSES TO START if any file in
 # test/ is undeclared — so a suite added without being wired in turns this red instead of silently
 # shrinking the gate.
 #
@@ -68,7 +68,7 @@ jobs:
         # Bun executes .ts without typechecking, so nothing else in the pipeline would catch a type error.
         run: bun run typecheck
 
-      - name: Full suite (30 suites, sequential)
+      - name: Full suite (31 suites, sequential)
         # `bun run test` — the package script (run-all.ts), NOT bare `bun test`, which would try to
         # execute the e2e harnesses as if they were bun:test files.
         run: bun run test

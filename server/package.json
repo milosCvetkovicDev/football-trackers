@@ -13,6 +13,7 @@
     "typecheck": "bunx tsc -p tsconfig.json --noEmit",
     "test": "bun run test/run-all.ts",
     "test:gitignore": "bun run test/gitignore-guard.ts",
+    "test:docs-guard": "bun run test/docs-guard.ts",
     "test:e2e": "bun run test/e2e.ts",
     "test:auth": "bun run test/auth-e2e.ts",
     "test:auth-cli": "bun run test/auth-cli.ts",

@@ -29,6 +29,7 @@ requirements discussion (June 2026).
 | [0022](0022-dynamic-provisioning.md) | Dynamic provisioning: NVS broker host + mDNS (`name.local`) + captive-portal Wi-Fi setup |
 | [0023](0023-camera-cv-offline-analysis.md) | Offline camera/CV match analysis (`vision/`, build-spec form): realises Track B / Path 2; prototyped on public footage, youth-footage gate deferred |
 | [0024](0024-client-reliability-signals.md) | The coach view reports its own failures: a four-value client beacon, no free text (no error/RUM SDK) |
+| [0025](0025-operability-lifecycle.md) | Operability: ordered graceful shutdown on a signal-deliverable PID 1, `user_version` migrations, verified `VACUUM INTO` backups inside ADR-0010's retention |
 
 Format: Context → Decision → Consequences → Alternatives considered.
 

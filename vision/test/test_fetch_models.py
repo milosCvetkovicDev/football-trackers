@@ -1,4 +1,8 @@
+import hashlib
 import json
+
+import pytest
+
 import fetch_models
 from footballcv.models_io import sha256_of, resolve_weight, load_manifest
 
@@ -9,6 +13,17 @@ FAKE = {
     "ball":    b"fake-ball-weights",
     "field":   b"fake-field-weights",
 }
+
+
+@pytest.fixture(autouse=True)
+def _pin_the_fakes(monkeypatch):
+    """Since the fetch became checksum-PINNED (audit §6 "Vision"), a download whose bytes do not
+    match the pin is refused — which is the whole point, and which these fakes would otherwise trip
+    on every call. So the pins are re-pointed at the fake blobs for this module: it tests the
+    orchestration, and test_fetch_pinning.py tests the pin comparison itself."""
+    pinned = {n: dict(m, sha256=hashlib.sha256(FAKE[n]).hexdigest())
+              for n, m in fetch_models.WEIGHTS.items()}
+    monkeypatch.setattr(fetch_models, "WEIGHTS", pinned)
 
 
 def _fake_downloader(file_id, dest):

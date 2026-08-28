@@ -1,0 +1,13 @@
+{
+  "what_this_is": "An independent, minimal reimplementation of the small part of Roboflow `sports`' public API that this project consumes. NO upstream source was copied.",
+  "copied_code": false,
+  "upstream": "https://github.com/roboflow/sports",
+  "upstream_license": "MIT",
+  "upstream_commit": null,
+  "api_surface": [
+    "ViewTransformer(source, target).transform_points(points)",
+    "SoccerPitchConfiguration(length, width).vertices"
+  ],
+  "recorded_at": "2026-08-27",
+  "note": "vision/README.md previously stated that this directory held Roboflow `sports` vendored 'at commit <RECORD SHA HERE>'. That description was wrong, not merely incomplete: the module is ~90 lines written against the upstream API shape (its own header has said so since it was written), so there has never been a commit to fill in. Recorded here because an attribution claim is what a licence review reads, and 'vendored MIT code with an unknown revision' and 'our own code matching a third-party interface' carry entirely different obligations. If real upstream source is ever copied in, set copied_code true and record upstream_commit — test_docs_guard.py then requires the SHA and requires the README to name it."
+}

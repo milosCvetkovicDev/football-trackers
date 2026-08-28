@@ -1,7 +1,7 @@
 # vision/docker-compose.yml — the CV subproject runs ENTIRELY in Docker. Nothing on the host.
 # From the vision/ directory:
 #
-#     docker compose run --rm test       # the 24-test suite (CPU image; works on the Mac too)
+#     docker compose run --rm test       # the test suite (CPU image; works on the Mac too)
 #     docker compose run --rm selftest   # pipeline --selftest (offline guards + no-network)
 #     docker compose --profile gpu run --rm run   # the real pipeline — RTX 3060 desktop ONLY
 #
@@ -72,9 +72,14 @@ services:
       ROBOFLOW_API_KEY: ${ROBOFLOW_API_KEY:-}   # for fetch_models (run that once, separately)
 
   # --- The "drop a YouTube link → process" web UI (webui/). Mac/CPU image; open it in a browser
-  # at http://localhost:8077. yt-dlp + the pipeline run inside the container — nothing on the host.
-  # The privacy gate (public-adult OR consented-youth attestation) is enforced server-side.
+  # at http://127.0.0.1:8077. yt-dlp + the pipeline run inside the container — nothing on the host.
+  # The privacy gate (public-adult attestation ONLY — no youth footage in any phase, ADR-0023 §2)
+  # is enforced server-side.
   #   docker compose up webui        # start it; Ctrl-C to stop
+  #
+  # PUBLISHED ON 127.0.0.1, NOT 0.0.0.0. This server has no authentication of any kind and holds
+  # downloaded footage plus everything derived from it. The container-side bind is loopback too
+  # (webui/server.py BIND), so the two agree; changing one without the other just breaks it.
   webui:
     build:
       context: .
@@ -82,11 +87,14 @@ services:
     image: ft-vision-cpurun
     container_name: ft-vision-webui
     ports:
-      - "8077:8077"
+      - "127.0.0.1:8077:8077"
     volumes:
       - .:/app
     environment:
       FT_DEVICE: "cpu"
+      FT_BIND: "0.0.0.0"          # inside the container only; the PORT above is what limits reach
+      FT_LEDGER_PATH: "var/attestations.jsonl"   # outside out/, which retention prunes
+      FT_OUT_TTL_HOURS: "24"
       ROBOFLOW_API_KEY: ${ROBOFLOW_API_KEY:-}
     command: ["python", "-m", "webui.server"]
 
@@ -100,11 +108,14 @@ services:
     image: ft-vision-gpu
     container_name: ft-vision-webui-gpu
     ports:
-      - "8077:8077"
+      - "127.0.0.1:8077:8077"
     volumes:
       - .:/app
     environment:
       FT_DEVICE: "cuda"
+      FT_BIND: "0.0.0.0"          # inside the container only; the PORT above is what limits reach
+      FT_LEDGER_PATH: "var/attestations.jsonl"
+      FT_OUT_TTL_HOURS: "24"
       ROBOFLOW_API_KEY: ${ROBOFLOW_API_KEY:-}
     deploy:
       resources:

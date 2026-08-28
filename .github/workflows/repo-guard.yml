@@ -11,7 +11,8 @@
 #
 # The same argument put the deploy-posture guard here: a commit that re-publishes the server on
 # 0.0.0.0 or re-points the broker at an anonymous config edits docker-compose.yml at the repo ROOT,
-# which no path filter in this repo covers.
+# which no path filter in this repo covers. And the docs guard, for the third variant of it: README.md
+# and CLAUDE.md are at the root, and the things they can go stale ABOUT live in every subproject.
 name: repo-guard
 
 on:
@@ -52,3 +53,10 @@ jobs:
         # is no value in a second red check underneath it.
         working-directory: server
         run: bun run test/deploy-posture.ts
+
+      - name: The entry-point docs still describe this repo
+        # Third guard, here for the same reason as the other two: a commit that renames a doc, drops an
+        # ADR from the index, or deletes a script the README tells people to run touches none of the
+        # paths a filtered workflow watches. Dependency-free (node:fs + node:path).
+        working-directory: server
+        run: bun run test/docs-guard.ts

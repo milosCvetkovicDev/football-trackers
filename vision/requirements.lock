@@ -1,20 +1,38 @@
-# vision/requirements.lock — TARGET-ENV lock (Python 3.11 + CUDA cu12x on the RTX 3060).
-# REGENERATE on the target box: `pip install -r requirements.txt && pip freeze > requirements.lock`
-# (or `uv lock`). The dev box here is macOS/py3.14 — its freeze is NOT this lock.
-# The cu12x torch index is the part most likely to break a reinstall, so it is pinned explicitly:
+# vision/requirements.lock — the CUDA target's pinned dependency set (Python 3.11, cu121, RTX 3060).
+#
+# The `gpu` Dockerfile target installs from THIS file, not from requirements.txt, so the pins below
+# are load-bearing. Before this they were not: the file announced that real versions would be filled
+# in later, described its own torch pins as provisional, and nothing in the repo installed from it —
+# so it could say anything and nothing would notice. `lapx` proved the
+# point: it was added to requirements.txt during the Mac cpu-run smoke (the missing linear-assignment
+# backend BoT-SORT needs) and never reached this file, so a rebuild from the lock would have
+# faithfully reproduced the exact bug that smoke had just found. `test_docs_guard.py` now fails when
+# anything in requirements.txt is not pinned here.
+#
+# WHAT IS AND IS NOT VERIFIED, precisely. Every version below was confirmed on 2026-08-27 to exist
+# for CPython 3.11 on the index that serves it — the two cu121 wheels by direct lookup
+# (torch-2.5.1+cu121-cp311-cp311-linux_x86_64.whl and torchvision-0.20.1+cu121-cp311-cp311-linux_x86_64.whl
+# are both present on download.pytorch.org), the rest on PyPI. What has NOT happened is an install
+# on the target box: this machine is arm64 macOS with no CUDA, so the full transitive resolution
+# cannot be produced here. These are therefore DIRECT-dependency pins, the equivalent of a
+# constraints file, and pip resolves the transitive set at build time. The CPU image's lock
+# (requirements-test.lock) is a full freeze because that one can be built and was.
+#
+# After the first successful build on the 3060, replace this with the complete set:
+#   pip freeze | sort > requirements.lock     (keeping the index line below)
+
 --extra-index-url https://download.pytorch.org/whl/cu121
 
-# --- pin exact versions below once resolved on the 3.11/CUDA target ---
-# torch and torchvision MUST come from the cu121 index above (not the PyPI CPU wheels):
+# torch and torchvision MUST come from the cu121 index above, not the PyPI CPU wheels.
 torch==2.5.1+cu121
 torchvision==0.20.1+cu121
+
 ultralytics==8.4.60
-supervision==0.29.0
-opencv-python==4.13.0.92
+lapx==0.9.4                # provides `import lap` — BoT-SORT/`model.track` linear assignment
+supervision==0.29.1
+opencv-python==4.14.0.94
 transformers==4.44.2
 scikit-learn==1.9.0
 numpy==2.4.6
 PyYAML==6.0.3
 pytest==9.1.1
-# NOTE: the +cu121 torch pins are placeholders — confirm the exact patch available on the
-# cu121 index for py3.11 at build time and freeze the real resolved set here.

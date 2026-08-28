@@ -10,7 +10,7 @@ A DIY real-time tracking system for youth football players. Each player wears an
 fans out to a live coach view over WebSocket. Private hobby project; not wired to any
 work platform.
 
-Two independently-scoped parts:
+Four independently-scoped parts:
 
 - **`firmware/`** — a complete, buildable PlatformIO/Arduino sketch for the wearable.
 - **`server/`** — a standalone **Bun + Elysia** app (no build step; Bun runs the `.ts`
@@ -19,6 +19,12 @@ Two independently-scoped parts:
 - **`client/`** — the coach live view: **Vite + React + TS**, a plain `WebSocket` to
   `/live`, positions in a `useRef` Map, rendered on a `<canvas>` via `requestAnimationFrame`
   with a GPS→pitch homography.
+- **`vision/`** — offline camera/CV analysis of RECORDED video: **Python + Docker only**, shares no
+  code or runtime with the tracker ([ADR-0023](docs/decisions/0023-camera-cv-offline-analysis.md)).
+  Detect + track players → two anchored teams → annotated video (v1, verified end to end on public
+  adult footage). **PUBLIC ADULT FOOTAGE ONLY** — never youth footage, in any phase, with or without a
+  claim of parental consent; that is a separate DPIA/consent gate ADR-0023 §14 defers, and the check is
+  enforced server-side, not by a checkbox. It exists as the part-built camera route for Track B.
 
 ## Commands
 
@@ -27,7 +33,7 @@ Server (from `server/`):
 bun install
 bun start          # run; bun --watch for dev (bun run dev)
 bun run typecheck  # bunx tsc --noEmit (Bun does not typecheck at runtime)
-bun run test       # THE GATE: all 30 suites, sequential, ~64 s (test/run-all.ts)
+bun run test       # THE GATE: all 31 suites, sequential, ~64 s (test/run-all.ts)
 bun run test:e2e   # one suite; every suite also has its own test:* script
 bun run test/mosquitto-pub-demo.ts   # the README's literal mosquitto_pub -> WS path
 ```
@@ -66,6 +72,20 @@ form, turning a reconnect test into a session-loss test.
 Review needs its own **auth-ON** stack because Phase 2 scoped the anonymous principal to the live
 pitch: `/roster`, `/history` and `/events` answer 403 without a real login, so the review specs
 sign in.
+
+Vision (from `vision/`) — **everything runs in Docker; never python/pytest on the host**:
+```
+docker compose run --rm test       # the CPU test suite (176 tests, no torch/weights/network)
+docker compose run --rm selftest   # pipeline --selftest: asserts the offline guards are armed
+docker compose up webui            # http://127.0.0.1:8077 (loopback only, one job at a time)
+docker compose --profile gpu run --rm run   # the real pipeline — RTX 3060 desktop ONLY
+```
+`--ball`/`--radar` (v2) and `--stats` (v3) **exit non-zero**: those loops are not built, and they used
+to exit 0 having done nothing. Weights are checksum-PINNED in `fetch_models.py` (the manifest records
+the pin, never the digest of whatever arrived). `out/` is pruned after `FT_OUT_TTL_HOURS`; the
+attestation ledger lives OUTSIDE it at `var/attestations.jsonl` so retention cannot erase the record of
+what was processed. Every clip in `samples/` needs a provenance row (`samples_manifest.py`) — ADR-0023
+§3 is default-deny, so a clip whose competition/age cannot be positively identified is discarded.
 
 Firmware (from `firmware/`):
 ```
