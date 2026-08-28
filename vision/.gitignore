@@ -7,7 +7,11 @@
 models/*
 samples/
 out/
-var/                        # the attestation ledger's home, outside the pruned out/
+# The attestation ledger's home — deliberately OUTSIDE out/, which retention prunes. It records
+# every link processed, so it is working data and never enters version control.
+# (This comment is on its own line on purpose: .gitignore honours '#' only at the START of a line,
+# so a trailing comment becomes part of the pattern and the rule silently matches nothing.)
+var/
 config/calibration.yaml
 *.360
 *.mp4
