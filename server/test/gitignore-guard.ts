@@ -22,8 +22,8 @@
  *   bun run test/gitignore-guard.ts   — exits 0 on success, 1 on any failed assertion.
  */
 
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
 /**
  * Every git call is made with the repo's OWN rules and nothing else:
@@ -76,6 +76,7 @@ const MUST_IGNORE: Array<[path: string, why: string]> = [
   ['server/telemetry.db-journal', "VACUUM against a DELETE-mode store (what VACUUM INTO produces) writes pre-erasure page images here"],
   ['.env', 'ROBOFLOW_API_KEY and any MQTT/AUTH override'],
   ['vision/.env', 'docker compose sources it for ROBOFLOW_API_KEY'],
+  ['vision/var/attestations.jsonl', 'every video link this machine processed, with its attestation and timestamp'],
   ['.claude/settings.local.json', 'machine-local permissions, may name local paths'],
   ['.DS_Store', 'Finder metadata (leaks directory names)'],
   ['server/.DS_Store', 'the same, one level down'],
@@ -253,6 +254,28 @@ try {
       'again (the parent directory is excluded, so git never descends to evaluate it). Use `models/*`, not `models/`.',
   );
   checks++;
+
+  // ── No .gitignore may carry an INLINE comment. ────────────────────────────────────────────────
+  // git honours `#` only at the START of a line, so `var/   # the ledger's home` is not the pattern
+  // `var/` with a note — it is one long literal pattern that matches nothing, silently. This was
+  // written into vision/.gitignore during Phase 7 and shipped a rule that ignored nothing at all;
+  // the only reason it surfaced was an unrelated `git status`. A rule that silently matches nothing
+  // is the worst failure mode a .gitignore has, because it looks exactly like a rule that works.
+  for (const gi of gitZ(['ls-files', '-z', '--', '*.gitignore', '.gitignore'], REPO)) {
+    const lines = readFileSync(join(REPO, gi), 'utf8').split('\n');
+    lines.forEach((line, i) => {
+      const trimmed = line.trim();
+      if (trimmed === '' || trimmed.startsWith('#')) return;
+      const hash = line.indexOf('#');
+      assert(
+        hash === -1,
+        `${gi}:${i + 1} has an inline comment: \`${trimmed}\`\n` +
+          '   git treats the whole string as the pattern, so this rule matches NOTHING. Put the ' +
+          'comment on its own line above it.',
+      );
+      checks++;
+    });
+  }
 
   console.log(
     `✅ gitignore-guard: ${checks} checks passed — ${MUST_IGNORE.length} sensitive paths ignored, ` +
