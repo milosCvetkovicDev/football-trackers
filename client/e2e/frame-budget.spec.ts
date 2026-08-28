@@ -131,43 +131,64 @@ test.describe('50-player frame-budget gate', () => {
     await page.goto(stack!.baseURL);
     await expect(page.locator('canvas')).toBeVisible();
 
-    const probe = await page.evaluate(() => {
-      const c = document.querySelector('canvas') as HTMLCanvasElement | null;
-      if (!c) return null;
-      const rect = c.getBoundingClientRect();
-      return {
-        dpr: window.devicePixelRatio,
-        cssW: rect.width,
-        cssH: rect.height,
-        backingW: c.width,
-        backingH: c.height,
-      };
-    });
+    // RETRY THE ASSERTIONS, not just a precondition before them.
+    //
+    // This test failed on CI (main, 2026-08-28) reading `backing=300x150` — the HTML canvas default —
+    // against `css=1100x550`, i.e. it measured a canvas whose backing store had not been sized yet.
+    // Two things make a single measurement unsafe here, and the first fix (waiting for "no longer
+    // 300x150", then measuring) still flaked 2 runs in 5 because it only addressed the second:
+    //
+    //   1. The live canvas REMOUNTS. Since Phase 5 the pitch quad comes from
+    //      GET /sessions/:id/config, so the component first renders at a default aspect and is
+    //      replaced when the session's real corners arrive — a brand-new <canvas> at the HTML
+    //      default. Any wait-then-measure can straddle that swap. The observed CSS heights differ
+    //      between runs (550 before, 712 after) for exactly this reason.
+    //   2. `document.querySelector('canvas')` is ambiguous — the app has three (the live pitch and
+    //      two in Review) — so "the first canvas" is not a stable identity across a re-render.
+    //
+    // `toPass` re-runs the measurement AND the assertions together, so a swap mid-check is simply
+    // retried, and a genuine violation still fails with the real numbers in the message.
+    await expect(async () => {
+      const probe = await page.evaluate(() => {
+        const c = document.querySelector('canvas') as HTMLCanvasElement | null;
+        if (!c) return null;
+        const rect = c.getBoundingClientRect();
+        return {
+          dpr: window.devicePixelRatio,
+          cssW: rect.width,
+          cssH: rect.height,
+          backingW: c.width,
+          backingH: c.height,
+        };
+      });
 
-    expect(probe, 'no canvas found').not.toBeNull();
-    const { dpr, cssW, cssH, backingW, backingH } = probe!;
+      expect(probe, 'no canvas found').not.toBeNull();
+      const { dpr, cssW, cssH, backingW, backingH } = probe!;
+      expect(cssW, 'canvas has no laid-out width yet').toBeGreaterThan(0);
 
-    // The plan clamps DPR ≤ 2; the effective scale the canvas should use.
-    const effDpr = Math.min(dpr, MAX_DPR_CLAMP);
-    console.log(
-      `[crisp] dpr=${dpr} (eff=${effDpr}) css=${cssW.toFixed(0)}x${cssH.toFixed(0)} ` +
-        `backing=${backingW}x${backingH} expected≈${Math.round(cssW * effDpr)}x${Math.round(cssH * effDpr)}`,
-    );
+      // The plan clamps DPR <= 2; the effective scale the canvas should use.
+      const effDpr = Math.min(dpr, MAX_DPR_CLAMP);
 
-    // Sanity: a retina-emulated context must actually report dpr>1, else this asserts nothing.
-    expect(dpr, 'test context is not retina — set deviceScaleFactor:2').toBeGreaterThan(1);
+      // Sanity: a retina-emulated context must actually report dpr>1, else this asserts nothing.
+      expect(dpr, 'test context is not retina — set deviceScaleFactor:2').toBeGreaterThan(1);
 
-    // Backing store ≈ CSS box × effective DPR (allow ±1 device px for rounding). The OLD
-    // canvas set width/height to fixed 900x620 ignoring the CSS box & dpr — that FAILS here,
-    // which is the point: this gate forces the DPR-crisp rewrite.
-    expect(
-      Math.abs(backingW - cssW * effDpr),
-      `canvas.width (${backingW}) should be CSS width (${cssW.toFixed(1)}) x effDPR (${effDpr})`,
-    ).toBeLessThanOrEqual(2);
-    expect(
-      Math.abs(backingH - cssH * effDpr),
-      `canvas.height (${backingH}) should be CSS height (${cssH.toFixed(1)}) x effDPR (${effDpr})`,
-    ).toBeLessThanOrEqual(2);
+      // Backing store ~= CSS box x effective DPR (allow +/-1 device px for rounding). The OLD
+      // canvas set width/height to fixed 900x620 ignoring the CSS box & dpr — that FAILS here,
+      // which is the point: this gate forces the DPR-crisp rewrite.
+      expect(
+        Math.abs(backingW - cssW * effDpr),
+        `canvas.width (${backingW}) should be CSS width (${cssW.toFixed(1)}) x effDPR (${effDpr})`,
+      ).toBeLessThanOrEqual(2);
+      expect(
+        Math.abs(backingH - cssH * effDpr),
+        `canvas.height (${backingH}) should be CSS height (${cssH.toFixed(1)}) x effDPR (${effDpr})`,
+      ).toBeLessThanOrEqual(2);
+
+      console.log(
+        `[crisp] dpr=${dpr} (eff=${effDpr}) css=${cssW.toFixed(0)}x${cssH.toFixed(0)} ` +
+          `backing=${backingW}x${backingH} expected~${Math.round(cssW * effDpr)}x${Math.round(cssH * effDpr)}`,
+      );
+    }).toPass({ timeout: 20_000, intervals: [100, 250, 500, 1_000] });
   });
 });
 
