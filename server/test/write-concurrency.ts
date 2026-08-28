@@ -27,6 +27,42 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+/**
+ * Source with comments blanked out (newlines kept, so any line numbers still line up).
+ *
+ * Necessary, and found the hard way: the first version of the static check below flagged
+ * `readPassword` as a process-exiting function because the comment EXPLAINING why it must not exit
+ * says the words `process.exit()`. A guard that fires on prose describing the rule is a guard the
+ * next person deletes. Strings are not handled — this scans control flow in four known files, not
+ * arbitrary JavaScript, and a `process.exit(` inside a string literal in one of them would be a
+ * false positive worth having.
+ */
+function stripComments(src: string): string {
+  return src
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+    .replace(/\/\/[^\n]*/g, (m) => ' '.repeat(m.length));
+}
+
+/** The text between a `(` and its matching `)` — one call's arguments, inline callbacks included. */
+function parenArgs(src: string, open: number): string {
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '(') depth++;
+    else if (src[i] === ')' && --depth === 0) return src.slice(open, i + 1);
+  }
+  return src.slice(open);
+}
+
+/** The text between a `{` and its matching `}` — enough to scope a callback body. */
+function braceBody(src: string, open: number): string {
+  let depth = 0;
+  for (let i = open; i < src.length; i++) {
+    if (src[i] === '{') depth++;
+    else if (src[i] === '}' && --depth === 0) return src.slice(open, i + 1);
+  }
+  return src.slice(open);
+}
+
 import { writeSecretFile } from '../src/secretFile';
 import { withFileLock } from '../src/fileLock';
 
@@ -207,7 +243,105 @@ try {
     }
   }
 
-  // ── 6. STRESS: the emergent contract, over enough rounds to have caught the original ─────────
+  // ── 6. purge-player.ts: the ERASURE CLI must not orphan the roster lock either ───────────────
+  // It was checked by hand after the auth-user fix and found already correct — and correct by a
+  // STRONGER pattern than the CliError one: every process.exit() sits outside the try, the two
+  // withRosterLock callbacks contain nothing but assignments, and the VACUUM + WAL checkpoint run
+  // in a `finally` so they happen even on the failure paths. This pins that, because "already
+  // correct" is a property, not a permanent fact — auth-user.ts was also correct until Phase 6
+  // moved the lock into it.
+  {
+    const db = join(DIR, 'purge.db');
+    const roster = join(DIR, 'purge-roster.json');
+    const purge = async (args: string[], env: Record<string, string> = {}) => {
+      const proc = Bun.spawn(['bun', 'run', 'purge-player.ts', ...args], {
+        cwd: SERVER_DIR,
+        env: { ...process.env, DB_PATH: db, AUTH_ROSTER_FILE: roster, ...env },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [code] = await Promise.all([
+        proc.exited,
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      return code;
+    };
+
+    for (const [label, args, env] of [
+      ['no playerId (usage, exit 2)', [], {}],
+      ['topic-unsafe playerId (usage, exit 2)', ['bad/id'], {}],
+      ['wrong DB path (permanent, exit 5)', ['07'], { DB_PATH: join(DIR, 'absent.db') }],
+    ] as Array<[string, string[], Record<string, string>]>) {
+      const code = await purge(args, env);
+      assert(code !== 0, `purge-player: "${label}" must exit non-zero, got ${code}`);
+      assert(
+        !existsSync(`${roster}.lock`),
+        `purge-player: "${label}" left ${roster}.lock behind — an exit path has moved inside the ` +
+          'roster lock. Every process.exit() must stay outside the try block.',
+      );
+    }
+    console.log('  ✓ purge-player.ts: no failure path orphans the roster lock');
+  }
+
+  // ── 7. STATIC: no CLI may exit from inside a locked region ───────────────────────────────────
+  // The check that would have caught the original regression at review time. Phase 6 gave
+  // auth-user.ts and session-config.ts the roster's proven lock but not the roster's `fail()`, which
+  // throws precisely so the lock's `finally` runs. Nothing could see that: each file was internally
+  // consistent, and the damage only showed up as a 1-in-5 flake in a different test.
+  //
+  // Indirection is resolved TRANSITIVELY, because the real cases are never a `process.exit()` sitting
+  // next to a lock. They were `fail()`, three lines away — and, found by this check while writing it,
+  // the interactive password prompt: `mutate(cmdAdd)` -> `cmdAdd` -> `readPassword` -> Ctrl-C ->
+  // `process.exit(1)`, three hops down, which meant an operator ABORTING A PASSWORD PROMPT orphaned
+  // the accounts lock. No test types Ctrl-C, so nothing else was ever going to find that.
+  {
+    const CLIS = ['auth-user.ts', 'session-config.ts', 'roster-user.ts', 'purge-player.ts'];
+    for (const cli of CLIS) {
+      const src = stripComments(readFileSync(join(SERVER_DIR, cli), 'utf8'));
+
+      // Every named function body in the file: `function f(...) {...}` and `const f = (...) => {...}`.
+      const bodies = new Map<string, string>();
+      for (const m of src.matchAll(/(?:function\s+(\w+)\s*\(|const\s+(\w+)\s*=\s*(?:async\s*)?(?:function\s*)?\()/g)) {
+        const name = m[1] ?? m[2];
+        const open = src.indexOf('{', m.index! + m[0].length);
+        if (open !== -1) bodies.set(name, braceBody(src, open));
+      }
+
+      // Fixpoint: a function exits if it calls process.exit, or calls something that does.
+      const exits = new Set<string>();
+      for (const [name, body] of bodies) if (/process\.exit\s*\(/.test(body)) exits.add(name);
+      for (let changed = true; changed; ) {
+        changed = false;
+        for (const [name, body] of bodies) {
+          if (exits.has(name)) continue;
+          for (const e of exits) {
+            if (new RegExp(`\\b${e}\\s*\\(`).test(body)) { exits.add(name); changed = true; break; }
+          }
+        }
+      }
+
+      const offenders: string[] = [];
+      for (const m of src.matchAll(/\b(withFileLock|withRosterLock|mutate)\s*\(/g)) {
+        const args = parenArgs(src, m.index! + m[0].length - 1);
+        if (/process\.exit\s*\(/.test(args)) offenders.push(`${m[1]}(…) contains a direct process.exit()`);
+        for (const e of exits) {
+          if (new RegExp(`\\b${e}\\s*[(,)]`).test(args)) {
+            offenders.push(`${m[1]}(…) reaches ${e}(), which terminates the process`);
+          }
+        }
+      }
+      assert(
+        offenders.length === 0,
+        `${cli}: a locked region can terminate the process, which skips the lock's finally and ` +
+          `orphans the lock file:\n    ${[...new Set(offenders)].join('\n    ')}\n  Throw instead, and exit ` +
+          'at the top level once the lock has been released (see roster-user.ts).',
+      );
+    }
+    console.log(`  ✓ no CLI exits from inside a locked region (${CLIS.length} files, indirection resolved transitively)`);
+  }
+
+  // ── 8. STRESS: the emergent contract, over enough rounds to have caught the original ─────────
   // Measured failure rate before the fix: roughly 1 round in 5. ROUNDS=40 makes a surviving bug a
   // ~1-in-10^3 escape rather than a coin toss, and the whole loop costs a few seconds because the
   // argon2id hash is the only slow part and five run at once.
