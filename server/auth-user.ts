@@ -82,7 +82,7 @@ async function readPassword(): Promise<string> {
   process.stderr.write('Password: ');
   process.stdin.setRawMode(true);
   process.stdin.resume();
-  return await new Promise<string>((resolve) => {
+  return await new Promise<string>((resolve, reject) => {
     let pw = '';
     process.stdin.on('data', (buf: Buffer) => {
       for (const ch of buf.toString('utf8')) {
@@ -93,7 +93,18 @@ async function readPassword(): Promise<string> {
           process.stderr.write('\n');
           return resolve(pw);
         }
-        if (code === 3) process.exit(1); // Ctrl-C (ETX)
+        if (code === 3) {
+          // Ctrl-C (ETX). REJECT, do not exit: this prompt runs inside the accounts lock
+          // (`mutate(cmdAdd)` -> withFileLock), and process.exit() runs no `finally`, so aborting a
+          // password prompt would leave <file>.lock on disk with a dead pid — the same orphan that
+          // pushed later writers onto the lock-breaking path and cost an account. Found by the
+          // static check below, not by a failing test: nobody types Ctrl-C in CI.
+          // Restore the terminal first, or the operator's shell is left in raw mode.
+          process.stdin.setRawMode(false);
+          process.stdin.pause();
+          process.stderr.write('\n');
+          return reject(new CliError('cancelled'));
+        }
         else if (code === 127 || code === 8) pw = pw.slice(0, -1); // DEL / Backspace
         else pw += ch;
       }
