@@ -17,6 +17,7 @@
     "test:e2e": "bun run test/e2e.ts",
     "test:auth": "bun run test/auth-e2e.ts",
     "test:auth-cli": "bun run test/auth-cli.ts",
+    "test:write-concurrency": "bun run test/write-concurrency.ts",
     "test:auth-dos": "bun run test/auth-dos.ts",
     "test:auth-loader": "bun run test/auth-loader.ts",
     "test:ws-origin": "bun run test/ws-origin.ts",

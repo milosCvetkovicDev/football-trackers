@@ -16,6 +16,7 @@
  * mode it was created with.
  */
 
+import { randomBytes } from 'node:crypto';
 import { chmodSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 
 /**
@@ -26,7 +27,22 @@ import { chmodSync, renameSync, rmSync, writeFileSync } from 'node:fs';
  * independent of the process umask.
  */
 export function writeSecretFile(path: string, text: string): void {
-  const tmp = `${path}.tmp`;
+  // THE TEMP NAME MUST BE UNIQUE PER CALL, not per path.
+  //
+  // It was `${path}.tmp` — one name shared by every process writing that file. Serialised by the
+  // file lock that is invisible; when the lock failed (see src/fileLock.ts, the stale-decision race)
+  // two `auth-user.ts add`s reached here together and the fixed name turned a lock bug into a data
+  // bug: both wrote the same temp, one renamed it away, and the other's rename raised
+  //   ENOENT: rename '…/auth-accounts.json.tmp' -> '…/auth-accounts.json'
+  // as a raw stack trace, exiting 1 — while the account it had just written WAS on disk, published
+  // under the other process's rename. An operator was told provisioning failed for a coach who
+  // exists, and a different coach who was reported added had been silently overwritten.
+  // The `rmSync` in the catch below made it worse: a failing writer deleted a healthy writer's temp.
+  //
+  // A unique name makes concurrent writers independent: both renames succeed, last write wins, and
+  // nobody is told a lie about their own outcome. It does not by itself stop an update being lost —
+  // that is the lock's job — but it stops a lock failure from becoming a false error report.
+  const tmp = `${path}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
   try {
     writeFileSync(tmp, text, { mode: 0o600 });
     chmodSync(tmp, 0o600);

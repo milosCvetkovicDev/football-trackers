@@ -37,9 +37,23 @@ const flag = (name: string): string | undefined => {
   return i >= 0 && argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : undefined;
 };
 
+/**
+ * Thrown, NOT exited — the file lock must be released by its `finally` before the process ends.
+ *
+ * `process.exit()` runs no `finally` blocks. This CLI's mutating commands run inside
+ * `withFileLock`, so exiting from `fail()` while holding the lock ORPHANED the lock file, leaving a
+ * dead holder's pid behind for the next writer to trip over. Reproduced 2026-08-28: a single
+ * `remove <nonexistent>` left `<file>.lock` on disk, and the next five concurrent writers then all
+ * ran the lock-BREAKING recovery path — which is where the real damage happened (an account written
+ * by one process, silently overwritten by another; the operator told it was added).
+ *
+ * roster-user.ts has always done this correctly, with this same comment. When Phase 6 shared the
+ * roster's proven lock with the other two CLIs, it took the lock and left behind the discipline
+ * that makes the lock safe. The recovery path is for a real crash, not for an ordinary usage error.
+ */
+class CliError extends Error {}
 function fail(msg: string): never {
-  console.error(`❌ ${msg}`);
-  process.exit(1);
+  throw new CliError(msg);
 }
 
 function load(): Account[] {
@@ -154,20 +168,28 @@ const mutate = async (fn: () => void | Promise<void>): Promise<void> => {
   });
 };
 
-switch (cmd) {
-  case 'add':
-    await mutate(cmdAdd);
-    break;
-  case 'remove':
-    await mutate(cmdRemove);
-    break;
-  case 'list':
-    cmdList();
-    break;
-  default:
-    console.error('usage: bun run auth-user.ts <add|remove|list> …');
-    console.error('  add <username> --role <coach|admin> [--sessions a,b,c]   (password via stdin or hidden prompt)');
-    console.error('  remove <username>');
-    console.error('  list');
-    process.exit(cmd ? 1 : 0);
+try {
+  switch (cmd) {
+    case 'add':
+      await mutate(cmdAdd);
+      break;
+    case 'remove':
+      await mutate(cmdRemove);
+      break;
+    case 'list':
+      cmdList();
+      break;
+    default:
+      console.error('usage: bun run auth-user.ts <add|remove|list> …');
+      console.error('  add <username> --role <coach|admin> [--sessions a,b,c]   (password via stdin or hidden prompt)');
+      console.error('  remove <username>');
+      console.error('  list');
+      process.exit(cmd ? 1 : 0);
+  }
+} catch (err) {
+  // CliError messages are the CLI's own error contract; anything else is a lock/IO error, which is
+  // code-only. Either way the lock's `finally` has already run by the time we get here — that is the
+  // whole point of throwing rather than exiting.
+  console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
 }

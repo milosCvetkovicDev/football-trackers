@@ -61,6 +61,7 @@ const SUITES: Array<[file: string, proves: string]> = [
   ['backup.ts', 'VACUUM INTO copies verify row-for-row; rotation is bounded by count AND retention; a purged player is absent from every backup (Phase 6)'],
   // --- spawn a CLI + temp files ---
   ['auth-cli.ts', 'auth-user.ts add/remove/sessions'],
+  ['write-concurrency.ts', "the provisioning CLIs never lie about their own outcome: unique temps, locks released on failure, no lost account under concurrency (2026-08-28)"],
   ['roster-cli.ts', 'roster-user.ts set/remove, 0600 mode'],
   ['session-config-cli.ts', 'session-config.ts set/remove, 0600 mode'],
   ['migrate.ts', 'the user_version schema ladder; a store newer than the build refuses to start (Phase 6)'],

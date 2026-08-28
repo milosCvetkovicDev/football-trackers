@@ -47,9 +47,23 @@ const SESSION_ID_RE = /^[A-Za-z0-9._-]{1,64}$/; // must match PLAYER_ID_RE in sr
 const argv = process.argv.slice(2);
 const cmd = argv[0];
 
+/**
+ * Thrown, NOT exited — the file lock must be released by its `finally` before the process ends.
+ *
+ * `process.exit()` runs no `finally` blocks. This CLI's mutating commands run inside
+ * `withFileLock`, so exiting from `fail()` while holding the lock ORPHANED the lock file, leaving a
+ * dead holder's pid behind for the next writer to trip over. Reproduced 2026-08-28: a single
+ * `remove <nonexistent>` left `<file>.lock` on disk, and the next five concurrent writers then all
+ * ran the lock-BREAKING recovery path — which is where the real damage happened (an account written
+ * by one process, silently overwritten by another; the operator told it was added).
+ *
+ * roster-user.ts has always done this correctly, with this same comment. When Phase 6 shared the
+ * roster's proven lock with the other two CLIs, it took the lock and left behind the discipline
+ * that makes the lock safe. The recovery path is for a real crash, not for an ordinary usage error.
+ */
+class CliError extends Error {}
 function fail(msg: string): never {
-  console.error(`❌ ${msg}`);
-  process.exit(1);
+  throw new CliError(msg);
 }
 
 function isBand(v: string): v is AgeBand {
@@ -242,28 +256,36 @@ const mutate = async (fn: () => void | Promise<void>): Promise<void> => {
   });
 };
 
-switch (cmd) {
-  case 'set':
-    await mutate(cmdSet);
-    break;
-  case 'set-pitch':
-    await mutate(cmdSetPitch);
-    break;
-  case 'clear-pitch':
-    await mutate(cmdClearPitch);
-    break;
-  case 'remove':
-    await mutate(cmdRemove);
-    break;
-  case 'list':
-    cmdList();
-    break;
-  default:
-    console.error('usage: bun run session-config.ts <set|set-pitch|clear-pitch|remove|list> …');
-    console.error(`  set <sessionId> <ageBand>   (ageBand one of ${BANDS.join(', ')})`);
-    console.error('  set-pitch <sessionId> <TL> <TR> <BR> <BL>   (each corner "lat,lon", on-screen order)');
-    console.error('  clear-pitch <sessionId>');
-    console.error('  remove <sessionId>');
-    console.error('  list');
-    process.exit(cmd ? 1 : 0);
+try {
+  switch (cmd) {
+    case 'set':
+      await mutate(cmdSet);
+      break;
+    case 'set-pitch':
+      await mutate(cmdSetPitch);
+      break;
+    case 'clear-pitch':
+      await mutate(cmdClearPitch);
+      break;
+    case 'remove':
+      await mutate(cmdRemove);
+      break;
+    case 'list':
+      cmdList();
+      break;
+    default:
+      console.error('usage: bun run session-config.ts <set|set-pitch|clear-pitch|remove|list> …');
+      console.error(`  set <sessionId> <ageBand>   (ageBand one of ${BANDS.join(', ')})`);
+      console.error('  set-pitch <sessionId> <TL> <TR> <BR> <BL>   (each corner "lat,lon", on-screen order)');
+      console.error('  clear-pitch <sessionId>');
+      console.error('  remove <sessionId>');
+      console.error('  list');
+      process.exit(cmd ? 1 : 0);
+  }
+} catch (err) {
+  // CliError messages are the CLI's own error contract; anything else is a lock/IO error, which is
+  // code-only. Either way the lock's `finally` has already run by the time we get here — that is the
+  // whole point of throwing rather than exiting.
+  console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
 }
