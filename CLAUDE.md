@@ -33,7 +33,7 @@ Server (from `server/`):
 bun install
 bun start          # run; bun --watch for dev (bun run dev)
 bun run typecheck  # bunx tsc --noEmit (Bun does not typecheck at runtime)
-bun run test       # THE GATE: all 31 suites, sequential, ~64 s (test/run-all.ts)
+bun run test       # THE GATE: all 32 suites, sequential, ~64 s (test/run-all.ts)
 bun run test:e2e   # one suite; every suite also has its own test:* script
 bun run test/mosquitto-pub-demo.ts   # the README's literal mosquitto_pub -> WS path
 ```
