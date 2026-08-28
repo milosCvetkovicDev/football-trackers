@@ -11,9 +11,21 @@
 Offline, post-match CV analysis on recorded PUBLIC football video. Built in phases:
 - **v1** — detect + track players, split into 2 anchored teams, draw an annotated video.
 - **v2** — detect the **ball** + a self-grading **homography**, project both teams + ball onto a
-  top-down **radar** (`radar.mp4`).
+  top-down **radar** (`radar.mp4`). **NOT IMPLEMENTED** — see below.
 - **v3** — **analytics**: possession %, per-player distance/speed (noise-floored lower bounds),
   possession-changes (heuristic, opt-in), team shape → `stats.json` + a one-screen `summary.txt`.
+  The analytics themselves are real and tested; the live loop that would feed them is not.
+
+### What v2 and v3 actually do today
+`--ball`, `--radar` and `--stats` **exit non-zero** with a message naming what is missing. They used
+to exit **0** having done nothing: the live loops were written as a bare `...`, which is a legal
+no-op, and each function then returned a well-formed result dict — so a run looked instantaneous and
+successful, and the only symptom was an `out/` directory that never gained a `radar.mp4`. The parts
+exist and are unit-tested (`PitchProjector`, `BallDetector`, `postprocess_ball_track`,
+`write_radar_video`, `build_stats`); nothing joins them into a loop. Joining them is the Task-8
+acceptance integration and needs weights, a calibrated clip and a GPU.
+v3's analytics can be run directly over a stream you already have:
+`run_v3(..., world_states=[...])`.
 
 See [ADR-0023](../docs/decisions/0023-camera-cv-offline-analysis.md) and the plans:
 [v1](../docs/vision/2026-06-19-v1-implementation-plan.md) ·
@@ -65,13 +77,32 @@ youth-with-consent option; it was removed because the value had no downstream ef
 captured no consent evidence, controller, lawful basis or retention date, so it could not discharge
 GDPR Art. 7(1) — a checkbox that unlocked processing children's faces and wrote a word in a log
 (audit §4.3). It returns only through the §14 ADR. Every attestation is logged to
-`out/_attestations.jsonl`. Only **v1** (players + teams + annotated video) runs automatically — v2/v3
-need a pitch calibration step. Verified end-to-end on a public CC adult match (real player boxes,
-e.g. `#37 T1`); detection on amateur/wide footage is sparse — the documented "fine-tune for your
-view" caveat (ADR-0023 §7).
+`var/attestations.jsonl` — deliberately OUTSIDE `out/`, because `out/` is now pruned on a TTL and a
+tool that deletes its own compliance record is worse than one that keeps none. Only **v1** (players
++ teams + annotated video) runs automatically — v2/v3 need a pitch calibration step. Verified
+end-to-end on a public CC adult match (real player boxes, e.g. `#37 T1`); detection on amateur/wide
+footage is sparse — the documented "fine-tune for your view" caveat (ADR-0023 §7).
 
-## Vendored code
-Roboflow `sports` (MIT) is vendored under `footballcv/vendor/sports/` at commit `<RECORD SHA HERE>`.
+**How the server is bounded** (audit V-1, closed in the production-readiness Phase 7):
+
+| | |
+|---|---|
+| **Reachability** | loopback only — `127.0.0.1:8077:8077` in compose, `FT_BIND` inside. There is no login, no token and no origin check, so nothing about this server should be on a network. |
+| **Concurrency** | one job at a time (`FT_MAX_JOBS`). A second POST while one runs gets **429** and a message, instead of a second yt-dlp and a second inference pass fighting for the same CPU. |
+| **Deadlines** | `FT_DOWNLOAD_TIMEOUT_S` (600) and `FT_PIPELINE_TIMEOUT_S` (5400). A hung stage is killed by process GROUP — killing only the child leaves ffmpeg holding the pipe open, and the read never returns. |
+| **What is served** | an allow-list: `annotated.mp4`, `radar.mp4`, `stats.json`, `summary.txt`. Notably **not** `clip.<ext>`, the raw downloaded source, which the UI never linked and the handler used to serve to anyone. |
+| **Retention** | `out/` job directories are removed after `FT_OUT_TTL_HOURS` (24), swept at start-up and before each job. Three short jobs used to leave 51 MB of footage sitting there indefinitely. |
+
+## Third-party code
+`footballcv/vendor/sports/` is **our own code**, not a copy of anything. The plan (ADR §5) was to
+vendor Roboflow `sports` (MIT) at a pinned commit and this README described it that way for months —
+but what was actually written is ~90 lines implementing the two pieces v2 consumes (`ViewTransformer`,
+`SoccerPitchConfiguration`) against that library's public API *shape*. There is therefore no upstream
+commit to record, and inventing one to fill the blank would have been the wrong fix. The accurate
+claim now lives in `footballcv/vendor/sports/PROVENANCE.json`, which the docs guard reads: set
+`copied_code` true there if real upstream source is ever brought in, and the guard will start
+requiring the 40-character SHA and a README that names it.
+
 Ultralytics is AGPL-3.0 — fine while this stays private/undistributed (ADR §5/§12-Q3).
 
 ## v1 acceptance

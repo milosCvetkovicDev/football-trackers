@@ -6,6 +6,7 @@ __pycache__/
 models/
 samples/
 out/
+var/
 *.mp4
 *.mov
 *.360

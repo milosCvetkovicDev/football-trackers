@@ -8,37 +8,71 @@ from pathlib import Path
 import numpy as np
 
 
+class NotImplementedStage(NotImplementedError):
+    """A pipeline level that is declared but not built yet.
+
+    WHY THIS EXISTS RATHER THAN A BARE `...`. `run_v2` and `run_v3`'s live loops were written as
+    `...` — an Ellipsis expression statement, which is a legal no-op. Each function then went on to
+    build and return a well-formed result dict, so `--ball` printed nothing, wrote nothing, took no
+    time, and exited 0. Nothing downstream could tell that apart from a fast successful run: the web
+    UI's `collect_outputs` found no radar.mp4 and reported "obrada je prošla ali nije proizvela
+    izlazni snimak", blaming the encoder for a stage that had never executed.
+    An unbuilt feature has to be distinguishable from a working one at the EXIT CODE, because that
+    is the only thing a script, a cron entry or a CI step ever reads. (audit §6 "Vision".)
+    """
+
+
 def _crop(frame: np.ndarray, xyxy) -> np.ndarray:
-    """Pixel crop of a bbox, clamped to the frame (for the team embedder)."""
+    """Pixel crop of a bbox, clamped to the frame (for the team embedder).
+
+    The `.copy()` is load-bearing, not defensive: numpy slicing returns a VIEW that keeps the whole
+    parent frame alive. One retained crop per track would otherwise pin one full decoded frame per
+    track — which is the very leak `_iter_world_states` was rewritten to remove.
+    """
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = (int(round(v)) for v in xyxy)
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, max(x1 + 1, x2)), min(h, max(y1 + 1, y2))
-    return frame[y1:y2, x1:x2]
+    return np.array(frame[y1:y2, x1:x2], copy=True)
 
 
-def _iter_world_states(frames, *, track_provider, embedder, seed=0):
+def _iter_world_states(frames_factory, *, track_provider, embedder, seed=0, with_frames=True):
     """Two-pass detect+track -> fit-teams-once -> image-space WorldState stream (§7.1).
 
-    `frames`     : iterable of (frame_idx, frame_ts, frame) (decode.iter_frames order).
+    `frames_factory()` : returns a FRESH iterator of (frame_idx, frame_ts, frame), in
+        `decode.iter_frames` order. A factory rather than an iterable because pass 2 re-reads the
+        source: see the memory note below.
     `track_provider(frame, frame_idx) -> sv.Detections` : the swappable detect+track step,
         carrying `tracker_id` + a `class_name` data column. Production wraps Ultralytics
         `model.track(persist=True, tracker=<yaml>)`; tests pass a fake.
     `embedder`   : has `.embed(list[crop]) -> (N, D)`; used once on per-track sample crops.
+    `with_frames`: yield (frame, WorldState) pairs (the injectable-writer seam), or WorldStates
+        alone (the production path, whose writer re-decodes the source itself anyway).
 
-    Returns an iterator of (frame, WorldState). Teams are fit ONCE over a sample crop per
-    track id (anchored, stable per clip), then cached by track id for every frame. GK/referee
-    classes keep their detected `cls`; team is None for referees.
+    MEMORY (audit V-2 — this is the whole reason for the shape). Pass 1 used to append
+    `(frame_idx, frame_ts, frame, det)`, i.e. every decoded frame, and pass 2 read that list. At the
+    stated target — 90 minutes at 720p, sampled at 5 fps — that is 27,000 frames x 1280x720x3 bytes
+    ~= 69.5 GiB resident. Not slow: impossible, and it fails as an OOM kill partway through rather
+    than as anything a user could act on.
+    The frames were dead weight regardless. Production hands `write_smooth_annotated_video` the
+    STATES and lets it re-decode at native fps (boxes carried forward), so pass 1's copies were
+    never the pixels that got encoded. So pass 1 now keeps only detections plus ONE small crop per
+    track id — O(tracks), independent of clip length — and pass 2 re-decodes when, and only when,
+    a caller actually wants frames. Peak: one frame in flight.
+
+    Teams are fit ONCE over the per-track sample crops (anchored, stable per clip), then cached by
+    track id for every frame. GK/referee classes keep their detected `cls`; team is None for referees.
     """
     from footballcv.teams import fit_teams
     from footballcv.types import WorldState, PlayerObs, BallObs
 
-    # --- pass 1: detect+track every sampled frame; keep detections + one crop per track id ---
-    per_frame = []                       # list[(frame_idx, frame_ts, frame, detections)]
+    # --- pass 1: detect+track every sampled frame. Keep detections + one crop per track id. ---
+    # Deliberately NOT the frame: `per_frame` is O(detections), which is what makes a full match fit.
+    per_frame = []                       # list[(frame_idx, frame_ts, detections)]
     sample_crop = {}                     # track_id -> (crop, mean_image_x) for the team fit
-    for frame_idx, frame_ts, frame in frames:
+    for frame_idx, frame_ts, frame in frames_factory():
         det = track_provider(frame, frame_idx)
-        per_frame.append((frame_idx, frame_ts, frame, det))
+        per_frame.append((frame_idx, frame_ts, det))
         names = det.data.get("class_name") if det.data else None
         for i in range(len(det)):
             tid = None if det.tracker_id is None else int(det.tracker_id[i])
@@ -50,6 +84,7 @@ def _iter_world_states(frames, *, track_provider, embedder, seed=0):
             if tid not in sample_crop:
                 x1, _y1, x2, _y2 = det.xyxy[i]
                 sample_crop[tid] = (_crop(frame, det.xyxy[i]), (float(x1) + float(x2)) / 2.0)
+        del frame                        # explicit: nothing above may outlive this iteration
 
     # --- one-shot team fit over the per-track sample crops (anchored to image-x, §7.1) ---
     team_of = {}                         # track_id -> 0 | 1
@@ -61,9 +96,9 @@ def _iter_world_states(frames, *, track_provider, embedder, seed=0):
         fit = fit_teams(embeddings, xs, seed=seed)
         for row, tid in enumerate(tids):
             team_of[tid] = fit.label_of(row)
+    sample_crop.clear()                  # the crops are spent once the fit exists
 
-    # --- pass 2: emit an image-space WorldState per frame (pitch_xy=None in v1) ---
-    for frame_idx, frame_ts, frame, det in per_frame:
+    def _state(frame_idx, frame_ts, det):
         names = det.data.get("class_name") if det.data else None
         players = []
         for i in range(len(det)):
@@ -76,9 +111,29 @@ def _iter_world_states(frames, *, track_provider, embedder, seed=0):
             players.append(PlayerObs(track_id=tid, cls=cls, team=team,
                                      image_bbox=tuple(float(v) for v in det.xyxy[i]),
                                      pitch_xy=None, confidence=conf))
-        ws = WorldState(frame_idx=frame_idx, frame_ts=frame_ts, track_id_space="raw",
-                        players=players, ball=BallObs(None, None, 0.0, False))
-        yield frame, ws
+        return WorldState(frame_idx=frame_idx, frame_ts=frame_ts, track_id_space="raw",
+                          players=players, ball=BallObs(None, None, 0.0, False))
+
+    # --- pass 2a: states only. No second decode at all — the production path. ---
+    if not with_frames:
+        for frame_idx, frame_ts, det in per_frame:
+            yield _state(frame_idx, frame_ts, det)
+        return
+
+    # --- pass 2b: re-decode and pair each frame with its state. One frame alive at a time. ---
+    # The pairing is positional and CHECKED: a decode that does not reproduce pass 1's frame indices
+    # (a truncated file, a non-deterministic source) must be an error, not a silent mis-annotation
+    # that draws frame 900's boxes onto frame 40.
+    states = iter(per_frame)
+    for frame_idx, frame_ts, frame in frames_factory():
+        try:
+            s_idx, s_ts, det = next(states)
+        except StopIteration:
+            break
+        if s_idx != frame_idx:
+            raise RuntimeError(
+                f"decode is not reproducible: pass 1 saw frame {s_idx} where pass 2 saw {frame_idx}")
+        yield frame, _state(s_idx, s_ts, det)
 
 
 def _build_track_provider(weight, tracker_yaml, *, device, imgsz):
@@ -135,19 +190,27 @@ def run_v1(input: str, out_dir: str, *, device="cuda", sample_fps=5.0, imgsz=128
     if embedder is None:
         from footballcv.teams import SiglipEmbedder
         embedder = SiglipEmbedder(device=device)
-    frames = iter_frames(input, sample_fps=sample_fps)
-    pairs = list(_iter_world_states(frames, track_provider=track_provider, embedder=embedder))
+
+    def frames_factory():
+        return iter_frames(input, sample_fps=sample_fps)
 
     if writer is not None:
-        # injected writer (tests): keep the simple per-sampled-frame path
-        out_path = writer(iter(pairs), out_dir, sample_fps)
+        # Injected writer (tests): it wants (frame, WorldState) pairs. Handed the GENERATOR, not a
+        # materialised list — a writer that consumes one pair at a time then holds one frame at a
+        # time, which is the whole point of the rewrite above.
+        out_path = writer(
+            _iter_world_states(frames_factory, track_provider=track_provider, embedder=embedder,
+                               with_frames=True),
+            out_dir, sample_fps)
     else:
         # production: SMOOTH output at the source's NATIVE fps so the video doesn't stutter at the
         # low sample rate (detection ran at sample_fps; boxes are carried forward onto every frame).
+        # The writer re-decodes the source itself, so ask for states alone and skip a decode pass.
         from footballcv.report import write_smooth_annotated_video
         enc = "hevc_nvenc" if device == "cuda" else "libx264"   # no NVENC without an NVIDIA GPU
-        out_path = write_smooth_annotated_video(
-            input, [ws for _f, ws in pairs], out_dir, encoder=enc)
+        states = list(_iter_world_states(frames_factory, track_provider=track_provider,
+                                         embedder=embedder, with_frames=False))
+        out_path = write_smooth_annotated_video(input, states, out_dir, encoder=enc)
 
     return {"provenance": {"detector": manifest["weights"]["players"]["model_version"],
                            "detector_sha256": manifest["weights"]["players"]["sha256"],
@@ -169,33 +232,32 @@ def exclude_gk_from_shape(players):
     return [p for p in players if p.cls != "goalkeeper"]
 
 
+V2_MISSING = (
+    "v2 is NOT IMPLEMENTED: the ball + radar level needs a live detect/track/ball/project loop that "
+    "has never been written. Its parts exist and are unit-tested — PitchProjector (pitch.py), "
+    "BallDetector + best_ball_candidate (detect.py), postprocess_ball_track (ball_postprocess.py), "
+    "write_radar_video (radar.py) — but nothing joins them, so --ball/--radar would produce no "
+    "radar.mp4 and no ball track. Wiring it is the Task-8 acceptance integration and needs real "
+    "weights, a calibrated clip and a GPU. Use v1 (no flags) meanwhile."
+)
+
+V3_MISSING = (
+    "v3 is NOT IMPLEMENTED for a video input: --stats needs the v2 pitch-space WorldState stream, "
+    "which does not exist (see the v2 refusal). The ANALYTICS half is real and tested — call "
+    "run_v3(..., world_states=[...]) directly to run it over a stream you already have."
+)
+
+
 def run_v2(input: str, out_dir: str, *, device="cuda", sample_fps=5.0, imgsz=1280,
            models_dir="models", calibration="config/calibration.yaml",
            ball=True, radar=True) -> dict:
-    from footballcv.models_io import load_manifest, resolve_weight
-    from footballcv.pitch import PitchProjector
-    from footballcv.report import write_annotated_video
-    from footballcv.radar import write_radar_video
+    """The v2 level: ball + self-graded homography + top-down radar.
 
-    manifest = load_manifest(Path(models_dir))
-    resolve_weight("players", Path(models_dir), manifest)            # SHA-verified
-    if ball:
-        resolve_weight("ball", Path(models_dir), manifest)          # second model, SHA-verified
-    projector = PitchProjector.from_calibration_file(calibration)
-    # Build image-space WorldStates as in v1 (detect+track+teams), then for each:
-    #   ws = projector.project_worldstate(ws)        # fills feet + ball pitch_xy
-    #   GK team via gk_team_pitch_space against pitch-space team centroids
-    # The ball stream is gathered per-frame (BallDetector.best_ball_candidate) and run through
-    # ball_postprocess.postprocess_ball_track BEFORE projection (image-space gating + capped fill).
-    # Two encode passes: write_annotated_video(...) then write_radar_video(...). (§10)
-    # Full detect/track loop is the Task 8 acceptance integration (needs weights + a clip).
-    _ = (projector, write_annotated_video, write_radar_video)       # wired at acceptance run
-    ...
-    prov = {"detector": manifest["weights"]["players"]["model_version"],
-            "detector_sha256": manifest["weights"]["players"]["sha256"],
-            "ball_model_sha256": manifest["weights"]["ball"]["sha256"] if ball else None,
-            "device": device, "seed": 0, "sample_fps": sample_fps, "track_id_space": "raw"}
-    return {"provenance": prov, "out": out_dir}
+    REFUSES. The refusal is the FIRST statement on purpose: it must not depend on a manifest, a
+    weight file, a calibration or a GPU, so it is the same deterministic error on the RTX 3060 and
+    on a laptop with an empty models/ — and so it cannot be mistaken for one of those failures.
+    """
+    raise NotImplementedStage(V2_MISSING)
 
 
 def run_v3(input: str, out_dir: str, *, device="cuda", sample_fps=5.0, imgsz=1280,
@@ -207,16 +269,12 @@ def run_v3(input: str, out_dir: str, *, device="cuda", sample_fps=5.0, imgsz=128
     (live detect/track/ball/project loop body is the flagged acceptance stub — needs weights+clip)."""
     from footballcv.analytics import build_stats, write_stats
     if world_states is None:
-        # Build the v2 pitch-space WorldState stream (detect+track+ball+project). The live loop
-        # body is the Task-8/acceptance integration (needs weights + a clip) — flagged stub.
-        from footballcv.models_io import load_manifest
-        manifest = load_manifest(Path(models_dir))
-        prov_detector = manifest["weights"]["players"]["model_version"]
-        prov_sha = manifest["weights"]["players"]["sha256"]
-        ...
-        world_states = []      # replaced by the real stream on the GPU/cpu-run path
-    else:
-        prov_detector, prov_sha = "injected", None
+        # No stream, and no way to build one: v2 is the thing that would build it. Refuse here
+        # rather than run analytics over `world_states = []`, which is what this used to do — it
+        # wrote a complete, schema-valid stats.json in which every metric was legitimately zero.
+        # A zero possession share and a zero distance are indistinguishable from a real answer.
+        raise NotImplementedStage(V3_MISSING)
+    prov_detector, prov_sha = "injected", None
     provenance = {"detector": prov_detector, "detector_sha256": prov_sha, "ball_model_sha256": None,
                   "tracker_config_hash": None, "seed": 0, "device": device, "engine": "pytorch",
                   "vendored_sports_sha": None, "vision_git_sha": None, "fine_tuned": False,
@@ -239,11 +297,15 @@ def _selftest() -> int:
           f"| team_confidence={fit.confidence} | offline_guards=set")
     return 0
 
+EXIT_NOT_IMPLEMENTED = 3     # distinct from argparse's 2 and from a genuine pipeline failure (1)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser("footballcv")
     ap.add_argument("--input"); ap.add_argument("--out", default="out/clip/")
     ap.add_argument("--device", default="cuda"); ap.add_argument("--sample-fps", type=float, default=5.0)
     ap.add_argument("--imgsz", type=int, default=1280)
+    ap.add_argument("--models-dir", default="models")
     ap.add_argument("--ball", action="store_true")
     ap.add_argument("--radar", action="store_true")
     ap.add_argument("--stats", action="store_true")
@@ -253,14 +315,24 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.selftest:
         return _selftest()
-    if args.stats:
-        run_v3(args.input, args.out, device=args.device, sample_fps=args.sample_fps,
-               imgsz=args.imgsz, calibration=args.calibration, passes=args.passes)
-    elif args.ball or args.radar:
-        run_v2(args.input, args.out, device=args.device, sample_fps=args.sample_fps,
-               imgsz=args.imgsz, calibration=args.calibration, ball=args.ball, radar=args.radar)
-    else:
-        run_v1(args.input, args.out, device=args.device, sample_fps=args.sample_fps, imgsz=args.imgsz)
+    # An unbuilt level exits NON-ZERO with the reason on stderr. Before this, `--ball` printed
+    # nothing and exited 0 — see NotImplementedStage. Nothing is created before the refusal, so a
+    # refused run leaves no half-built out/ directory for a caller to read as a finished job.
+    try:
+        if args.stats:
+            run_v3(args.input, args.out, device=args.device, sample_fps=args.sample_fps,
+                   imgsz=args.imgsz, models_dir=args.models_dir, calibration=args.calibration,
+                   passes=args.passes)
+        elif args.ball or args.radar:
+            run_v2(args.input, args.out, device=args.device, sample_fps=args.sample_fps,
+                   imgsz=args.imgsz, models_dir=args.models_dir, calibration=args.calibration,
+                   ball=args.ball, radar=args.radar)
+        else:
+            run_v1(args.input, args.out, device=args.device, sample_fps=args.sample_fps,
+                   imgsz=args.imgsz, models_dir=args.models_dir)
+    except NotImplementedStage as e:
+        print(f"footballcv: not implemented — {e}", file=sys.stderr)
+        return EXIT_NOT_IMPLEMENTED
     return 0
 
 if __name__ == "__main__":

@@ -109,7 +109,7 @@ def _job(tmp, **over):
 def _fake_run_factory(fail_stage=None):
     """A subprocess stand-in: yt-dlp writes clip.mp4, the pipeline writes annotated.mp4.
     fail_stage in {'download','pipeline'} returns non-zero at that stage."""
-    def run(cmd, on_line):
+    def run(cmd, on_line, timeout_s=None):
         on_line(" ".join(cmd[:2]))
         if cmd[0] == "yt-dlp":
             if fail_stage == "download":

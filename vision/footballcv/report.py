@@ -6,6 +6,33 @@ import cv2
 
 TEAM_COLORS = {0: (0, 122, 255), 1: (255, 64, 64), None: (180, 180, 180)}  # BGR; None = referee
 
+
+class EncodeError(RuntimeError):
+    """ffmpeg did not produce the video these writers claim to have written.
+
+    Both writers used to do `proc.stdin.close(); proc.wait()` and return the path they INTENDED to
+    write, discarding the exit status. When ffmpeg fails — a codec the build lacks (hevc_nvenc on a
+    machine with no NVIDIA GPU is this project's own history), a full disk, an unwritable mount —
+    run_v1 still returned a success dict naming a file that is absent or truncated. The web UI then
+    reported "obrada je prošla ali nije proizvela izlazni snimak", blaming the pipeline for a
+    failure the encoder had already announced on stderr. (audit §6 "Vision".)
+    """
+
+
+def _finish_encode(proc, path: str, encoder: str) -> str:
+    """Close the pipe, wait, and REFUSE to claim success on a non-zero exit."""
+    try:
+        proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass                                    # ffmpeg already gone; the wait() below is the truth
+    rc = proc.wait()
+    if rc != 0:
+        raise EncodeError(
+            f"ffmpeg ({encoder}) exited {rc} — {path} was not written. Its stderr is on this "
+            "process's stderr; the usual causes are a missing encoder (hevc_nvenc needs an NVIDIA "
+            "GPU), an unwritable out directory, or a full disk.")
+    return path
+
 def _detections_and_labels(ws):
     if not ws.players:
         return sv.Detections.empty(), []
@@ -50,10 +77,15 @@ def write_annotated_video(frames_and_states, out_dir: str, fps: float, *,
         if proc is None:
             h, w = frame.shape[:2]
             proc = _open_nvenc_writer(str(path), w, h, fps, encoder=encoder)
-        proc.stdin.write(annotate_frame(frame, ws, TEAM_COLORS).tobytes())
-    if proc:
-        proc.stdin.close(); proc.wait()
-    return str(path)
+        try:
+            proc.stdin.write(annotate_frame(frame, ws, TEAM_COLORS).tobytes())
+        except BrokenPipeError:
+            # ffmpeg died mid-stream. Stop feeding a closed pipe and let _finish_encode report the
+            # exit status — a BrokenPipeError traceback names a file descriptor, not the encoder.
+            break
+    if proc is None:
+        raise EncodeError(f"no frames to encode — {path} was not written")
+    return _finish_encode(proc, str(path), encoder)
 
 def _open_nvenc_writer(path, w, h, fps, encoder: str = "libx264"):
     # encoder: "hevc_nvenc" on the RTX 3060 (GPU path), "libx264" on the Mac/CPU (cpu-run) — there
@@ -102,10 +134,13 @@ def write_smooth_annotated_video(input_path, states, out_dir: str, *, encoder: s
                 h, w = frame.shape[:2]
                 proc = _open_nvenc_writer(str(path), w, h, native_fps, encoder=encoder)
             out_frame = annotate_frame(frame, ws, team_colors) if ws is not None else frame
-            proc.stdin.write(out_frame.tobytes())
+            try:
+                proc.stdin.write(out_frame.tobytes())
+            except BrokenPipeError:
+                break                       # see write_annotated_video: the exit status is the truth
             idx += 1
     finally:
         cap.release()
-        if proc:
-            proc.stdin.close(); proc.wait()
-    return str(path)
+    if proc is None:
+        raise EncodeError(f"decoded no frames from {input_path} — {path} was not written")
+    return _finish_encode(proc, str(path), encoder)

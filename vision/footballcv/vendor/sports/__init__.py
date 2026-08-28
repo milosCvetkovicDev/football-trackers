@@ -1,8 +1,13 @@
-"""Placeholder for vendored Roboflow `sports` modules (MIT), to be copied at a pinned
-upstream commit SHA at build time (ADR §5): ViewTransformer, SoccerPitchConfiguration,
-TeamClassifier, radar annotators, resolve_goalkeepers_team_id. v1 does not import these
-at runtime; v2 (radar/pitch) and the teams embedder reuse their patterns. Record the
-upstream SHA in vision/README.md when vendored.
+"""Independent minimal equivalents of the Roboflow `sports` (MIT) API surface this project uses.
+
+NOTHING HERE IS COPIED FROM UPSTREAM — see PROVENANCE.json beside this file. The plan was once to
+vendor `sports` at a pinned commit (ADR §5) and the README described it that way for months, but
+what was actually written is the ~90 lines below, against the upstream API SHAPE. Only the
+methods/attributes v2 needs exist: ViewTransformer and SoccerPitchConfiguration. v1 does not import
+them at runtime; v2 (radar/pitch) and the teams embedder do.
+
+If real upstream source is ever copied in, set `copied_code` true in PROVENANCE.json and record the
+commit — the docs guard then requires both the SHA and a README that names it.
 """
 
 # ---------------------------------------------------------------------------
