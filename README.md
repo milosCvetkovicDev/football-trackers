@@ -3,29 +3,38 @@
 Personal, open DIY system for **real-time** tracking of youth football players.
 Each player wears a small ESP32 + GNSS device that streams position at 10 Hz over
 WiFi to a local broker; a **Bun + Elysia** service ingests, server-stamps, and fans out to a
-live coach view. This is a private hobby project — not connected to any work platform.
+live coach view. A personal hobby project — fully self-contained, built end to end (hardware, firmware, backend, frontend, CV).
 
-## Docs
-Product & business requirements live in [`docs/`](docs/README.md): [vision](docs/product/vision.md),
-[market analysis](docs/product/market-analysis.md), [BRD](docs/requirements/business-requirements.md),
-[functional](docs/requirements/functional-requirements.md) / [non-functional](docs/requirements/non-functional-requirements.md)
-requirements, [metric definitions](docs/requirements/metric-definitions.md), [architecture](docs/architecture/system-architecture.md),
-[observability](docs/architecture/observability.md), [hardware BOM](docs/architecture/hardware-bom.md),
-and [decision records](docs/decisions/README.md).
+[![server CI](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/server-ci.yml/badge.svg)](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/server-ci.yml)
+[![client CI](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/client-ci.yml/badge.svg)](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/client-ci.yml)
+[![firmware CI](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/firmware-ci.yml/badge.svg)](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/firmware-ci.yml)
+[![vision CI](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/vision-ci.yml/badge.svg)](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/vision-ci.yml)
+[![repo guard](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/repo-guard.yml/badge.svg)](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/repo-guard.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Why DIY
-Commercial trackers are either cheap-but-closed (no real-time, no open data) or
-have an API but cost a subscription per player. Goal here: real-time + fully owned.
+![Coach live view — 12 simulated players on the pitch canvas](docs/images/live-view.png)
+*The coach live view rendering a 12-player simulated fleet at 10 Hz — captured from the hardware-free
+e2e stack (`bun run sim --standalone`), which is also how every Playwright spec drives the real pipeline.*
 
 ## Architecture
-
-```
-[10x wearable]                 [field AP / laptop]                 [coach tablet]
-ESP32 + NEO-M8N  --WiFi-->  Mosquitto MQTT  --> Bun/Elysia ingest --WS--> React live view
-   (10 Hz UBX-PVT)            (QoS0)            parse + serverTs        pitch + dots
-                                               + WS fan-out
-                                               + bun:sqlite persist
-                                               (TimescaleDB optional later)
+```mermaid
+flowchart LR
+  subgraph pitch ["on-pitch (10x wearables)"]
+    W["ESP32 + NEO-M8N<br/>10 Hz UBX-PVT<br/>LittleFS backlog on dropout"]
+  end
+  subgraph field ["field AP / laptop"]
+    B["Mosquitto MQTT<br/>auth + per-device ACLs"]
+    S["Bun + Elysia<br/>validate / serverTs / fan-out"]
+    DB[("bun:sqlite<br/>WAL, 30-day retention")]
+    M["Prometheus /metrics<br/>+ JSON logs"]
+  end
+  subgraph tablet ["coach tablet"]
+    C["React live view<br/>canvas + GPS-to-pitch homography"]
+  end
+  W -- "WiFi, MQTT QoS0" --> B --> S
+  S --> DB
+  S -- "WS /live" --> C
+  S -.-> M
 ```
 
 MQTT topics:
@@ -35,8 +44,55 @@ MQTT topics:
 (`ts` = device millis, ordering only; `serverTs` is the authoritative timestamp.)
 The server exposes Prometheus metrics on `/metrics` — see [observability](docs/architecture/observability.md).
 
-## Repo layout
+## Run it in 60 seconds (no hardware)
 
+Two terminals; needs [Bun](https://bun.sh) and `mosquitto` on `PATH` (`brew install mosquitto`).
+
+```bash
+cd server && bun install && bun run sim --standalone --players 10
+```
+
+```bash
+cd client && bun install && VITE_PROXY_TARGET=http://127.0.0.1:3000 bun run dev
+```
+
+Open http://localhost:5173 — the screenshot above is exactly this: a spawned broker + the real
+server + 10 virtual devices publishing the firmware's wire contract at 10 Hz. Fault injection,
+load ramps, record/replay and a `--secure` auth mode are one flag away
+([server/README.md](server/README.md)).
+
+## How this is built
+
+- **Decision discipline** — 25 cross-referenced [ADRs](docs/decisions/README.md) (context,
+  alternatives, consequences, amendment chains) plus a frozen pre-code contract per frontend phase.
+- **Test rigor** — one gate per part: 32 sequential server suites (~64 s) behind a runner that
+  refuses to start if a test file is neither a declared suite nor a declared non-suite (the gate
+  cannot silently shrink); client typecheck + lint + unit + Playwright e2e across five
+  self-contained stacks (real broker, real server, simulated fleet — no mocks); a 177-test
+  CPU-only vision suite; host-compiled firmware logic tests. All five run in CI on every push.
+- **Privacy as mechanism, not policy** — pseudonymous ids on the wire and in the store, real names
+  in one access-controlled file joined at render time only; per-player erasure that also rewrites
+  every backup and proves it by re-count; 30-day retention; static posture guards that fail CI if
+  the dev or production stack drifts (loopback binds, non-root images, authenticated broker).
+- **Audited** — a [2026-08 production-readiness audit](docs/audit/2026-08-03-production-readiness.md)
+  drove 8 hardening phases (graceful shutdown, schema migrations, verified backups, supply-chain
+  pins), each closed by execution-verified acceptance criteria.
+- **Validated on real hardware** — the assembled ESP32+NEO-M8N prototype streamed
+  device -> Wi-Fi -> authenticated broker -> server -> live view end to end (2026-06-17).
+
+## Why DIY
+Commercial trackers are either cheap-but-closed (no real-time, no open data) or
+have an API but cost a subscription per player. Goal here: real-time + fully owned.
+
+## Docs
+Product & business requirements live in [`docs/`](docs/README.md): [vision](docs/product/vision.md),
+[market analysis](docs/product/market-analysis.md), [BRD](docs/requirements/business-requirements.md),
+[functional](docs/requirements/functional-requirements.md) / [non-functional](docs/requirements/non-functional-requirements.md)
+requirements, [metric definitions](docs/requirements/metric-definitions.md), [architecture](docs/architecture/system-architecture.md),
+[observability](docs/architecture/observability.md), [hardware BOM](docs/architecture/hardware-bom.md),
+and [decision records](docs/decisions/README.md).
+
+## Repo layout
 ```
 football-trackers/
   firmware/            ESP32 firmware (PlatformIO / Arduino)
@@ -57,7 +113,7 @@ football-trackers/
   vision/              offline camera/CV analysis — SEPARATE subproject, Python, Docker-only
     footballcv/        decode -> detect+track -> team split -> annotate (v1 works end to end)
     webui/             paste a public YouTube link -> annotated video, behind a privacy gate
-    test/              176 CPU tests; no torch, no weights, no network
+    test/              177 CPU tests; no torch, no weights, no network
   deploy/production/   the real deployment stack (non-root image, no anonymous access)
 ```
 
@@ -101,146 +157,41 @@ and only NVS differs. Full build / enrollment / rotation / flash-encryption runb
 Wiring (Serial2): M8N TX -> GPIO16, M8N RX -> GPIO17, plus 3V3 + GND. First fix: outdoors, 30-60 s cold start.
 
 ## Server
-Bun + Elysia, standalone (no build step). The MQTT ingest runs alongside the
-Elysia HTTP/WS server in one process and fans out over native WS pub/sub.
+Bun + Elysia, standalone (no build step). The MQTT ingest runs alongside the Elysia HTTP/WS server
+in one process and fans out over native WS pub/sub. **Full detail — every env knob, the auth model,
+the suite-by-suite test map, the data-lifecycle CLIs and the simulator's whole flag set — lives in
+[`server/README.md`](server/README.md).**
 ```
 cd server && bun install
-bun start          # PORT=3000 (override w/ PORT), MQTT_URL, DB_PATH env
+bun start          # PORT=3000, MQTT_URL, DB_PATH env — see server/README.md
+bun run test       # THE GATE: all 32 suites, sequential, ~64 s (test/run-all.ts)
 ```
-Env: `PORT` (default 3000; public `/live`), `METRICS_PORT` (default 9464; loopback `/health`+`/metrics`), `MQTT_URL` (default `mqtt://127.0.0.1:1883`),
-`DB_PATH` (default `./telemetry.db`), `LOG_LEVEL` (default `info`), `APP_VERSION` (default `dev`),
-`RETENTION_DAYS` (default 30; raw-fix retention window — `≤0` disables the purge, a malformed value fails safe to 30).
-
-**Auth (Phase 2 — named login → cookie-on-upgrade; [ADR-0015](docs/decisions/0015-frontend-auth-transport.md),
-[ADR-0008](docs/decisions/0008-authentication-access-control.md)).** The bundled shared `LIVE_TOKEN` is **gone**.
-Coaches/admins log in by name; the server mints an HttpOnly session cookie that the browser auto-attaches to the
-same-origin `/live` upgrade, and `/live` authorises the **principal** against the requested session server-side.
-Security env:
-- `AUTH_ACCOUNTS_FILE` (default `./auth-accounts.json`, not committed) — argon2id-hashed accounts, loaded at boot
-  and reloaded every `AUTH_ACCOUNTS_RELOAD_SECONDS` (default 15) so edits/revocations apply without a restart.
-- `AUTH_COOKIE_SECURE` (default `true`; set `false` only on `http://localhost` dev / isolated LAN — emits a loud
-  boot warning), `AUTH_SESSION_TTL_SECONDS` (default 43200 = 12 h, absolute).
-- `ALLOWED_ORIGINS` — **strict** comma-separated browser-Origin allow-list (CSWSH/CSRF defence): an **absent**
-  Origin is now rejected on `/auth` + `/live`; empty + non-anon ⇒ loud boot warning (rejects all browser clients).
-- `ALLOW_ANONYMOUS_LIVE=true` + `ANON_SESSIONS` (comma list) — isolated-LAN bypass only: skips login for the
-  **live pitch**, and only for the listed sessions (never wildcard). It is **not** a general read bypass:
-  `/roster` (names), `/history` (bulk raw location) and `/events` answer **403 `login_required`** to the anon
-  principal — only `/live`, `/sessions`, `/auth/me` and `/config` (one age-band enum) are open. Signing in on
-  such a stack is optional and still works: `currentPrincipal` resolves the cookie first and falls back to the
-  anon principal, so a coach who logs in gets their real identity and is named in the audit log. Loud boot
-  warning + `ft_anon_mode_active=1`.
-- `PUBLIC_HOST` — the bind interface. Defaults to `0.0.0.0`, but to **`127.0.0.1` whenever
-  `ALLOW_ANONYMOUS_LIVE=true`**: a feed that needs no login must not also be LAN-reachable, and an Origin
-  allow-list cannot substitute (it is CSWSH defence, and an absent Origin — what every non-browser client sends
-  — can't be authenticated). Override it where something else confines the port, such as a container whose
-  published port is pinned to loopback; that combination logs a loud warning.
-- Login DoS controls: `AUTH_LOGIN_BURST` (5) / `AUTH_LOGIN_WINDOW_S` (30) per-IP bucket, `MAX_INFLIGHT_LOGINS` (4)
-  concurrent-hash cap, `AUTH_MAX_SESSIONS_PER_USER` (8) per-account session cap (so one principal can't evict
-  another's sessions), `AUTH_MAX_SESSIONS` (1000) global backstop. The per-username failure soft-lock is
-  detect-don't-deny (signals `429` on repeated wrong attempts + a WARN log, but never refuses the correct
-  password) — so it can't be abused to lock a coach out of a live match.
-- `TRUST_PROXY` (default `false`) — the login rate-limiter keys on the **socket peer** (unspoofable) by default.
-  Set `true` **only** behind a single trusted reverse proxy (Caddy) that appends the real client to
-  `X-Forwarded-For`; the server then uses the rightmost XFF hop. Leaving it false anywhere a client can reach
-  the port directly prevents an attacker spoofing `X-Forwarded-For` to dodge the per-IP login throttle.
-- `MQTT_USERNAME`/`MQTT_PASSWORD` (the broker runs `allow_anonymous false` + per-device ACLs — see
-  [`server/mosquitto/`](server/mosquitto/README.md)).
-
-Provision a coach (the running server picks it up within `AUTH_ACCOUNTS_RELOAD_SECONDS`; password via stdin or a
-hidden TTY prompt — never a process argument):
-```
-bun run auth-user.ts add coach --role coach --sessions test   # also: remove <user> | list
-```
-
-Login flow: `POST /auth/login {username,password}` (present allow-listed `Origin` required) → `Set-Cookie` +
-`{username,role,sessions,wildcard,anonymous,csrf}` (no token in the body) → the client opens `/live?sessionId=…`
-**same-origin** and the cookie rides the upgrade. The client must therefore be served from the relay origin —
-**Vite proxy in dev, Caddy in prod** (cookie-on-upgrade is same-origin-only). `POST /auth/logout` (header
-`X-CSRF-Token`) deletes the token server-side, so a replayed cookie is rejected.
-Endpoints: `/live` (WS, cookie-authed), `/auth/login`, `/auth/logout`, `/auth/me`, `/sessions` on `PORT`;
-`/health` (readiness) + `/metrics` (Prometheus) on `METRICS_PORT`, **bound to 127.0.0.1**. Logs are structured JSON.
+Auth (Phase 2): named login (argon2id) -> HttpOnly cookie -> same-origin `/live` upgrade; the
+principal is authorised against the requested session server-side
+([ADR-0015](docs/decisions/0015-frontend-auth-transport.md),
+[ADR-0008](docs/decisions/0008-authentication-access-control.md)). Provision a coach:
+`bun run auth-user.ts add coach --role coach --sessions test`.
 
 Quick end-to-end test (no hardware) — start a broker + the server, then:
 ```
 mosquitto_pub -t 'football-trackers/session/test/player/01/telemetry' \
-  -m '{"id":"trk-01","pl":"01","ts":1,"lat":44.8125,"lon":20.4612,"spd":3.2,"hdg":90,"fix":3,"sats":11,"pdop":1.2}'
+  -m '{"id":"trk-01","pl":"01","ts":1,"lat":44.8297,"lon":20.4007,"spd":3.2,"hdg":90,"fix":3,"sats":11,"pdop":1.2}'
 ```
-Connect a WS client to `/live?sessionId=test` and watch for `{event:"telemetry"}`
-frames. Or run the fully self-contained version (spawns its own broker+server).
-
-**All of the suites below run in one command** — `bun run test` from `server/` (~20 s, sequential).
-That is the gate CI runs; the individual commands are for working on one area at a time.
-```
-bun run test/e2e.ts              # asserts fan-out, fix<2 drop, sqlite persist
-bun run test/mosquitto-pub-demo.ts   # the literal mosquitto_pub path above
-bun run test/retention.ts        # 30-day purge, per-player erasure, byte-level secure_delete
-```
-Auth & access control (Phase 2 — see [the contract](docs/frontend/phase-2-auth-contract.md), [ADR-0015](docs/decisions/0015-frontend-auth-transport.md)):
-```
-bun run test/auth-e2e.ts         # cookie login → session-bound /live authz, logout revocation, reload revocation
-bun run test/ws-origin.ts        # CSWSH: forged/absent Origin rejected, allow-listed Origin + cookie admitted
-bun run test/auth-loader.ts      # accounts-file fail-closed loader (malformed/oversize/dup-username/bad-hash)
-bun run test/auth-dos.ts         # /auth/login DoS guards: 415 / 413 / 429 / 503
-bun run test/auth-cli.ts         # auth-user.ts add/remove/list (mode 0600, argon2id verify, no plaintext leak)
-```
-Identity, device-health & review/replay (Phase 3 — names, a second `/live` health envelope, off-loop history;
-see [the contract](docs/frontend/phase-3-contract.md), [ADR-0016](docs/decisions/0016-player-name-roster.md),
-[ADR-0017](docs/decisions/0017-review-replay-data-source.md)):
-```
-bun run test/roster-loader.ts    # fail-closed roster loader (missing/oversize/malformed/dup-id), no name in any log
-bun run test/roster-cli.ts       # roster-user.ts set/remove/list (mode 0600, no name leaked on a validation error)
-bun run test/roster-e2e.ts       # GET /sessions/:id/roster authz matrix + per-principal 429 + no-store + no name leak
-bun run test/erasure-e2e.ts      # right-to-erasure: roster set -> purge-player -> rosterEntriesErased + DB rows + file
-bun run test/erasure-audit.ts    # the five audit-2026-08-03 §4.5 erasure defects stay fixed (WAL residue, dup id, collateral, bad file, missing DB)
-bun run test/boundary.ts         # Phase 3: wire fields coerced, env knobs fall back loudly, metrics never non-finite, labels capped
-bun run test/history.ts          # GET /sessions/:id/history: aggregate/raw correctness, composite cursor, DoS gates, SLO
-bun run test/history-e2e.ts      # live history endpoint: authz, rate-limit/inflight caps, opaque errors, no-store
-bun run test/device-health-e2e.ts # a .../status frame -> minimised {event:'status'} on /live (no heap/up/pub/stash/name)
-bun run test/session-config-loader.ts # fail-closed age-band config loader (missing/oversize/malformed/bad-band)
-bun run test/session-config-cli.ts # session-config.ts set/remove/list (mode 0600, bad band can't corrupt the file)
-bun run test/config-e2e.ts       # GET /sessions/:id/config authz + {ageBand,thresholds}; unconfigured -> U14 default
-```
-Phase 4 (coaching metrics — [ADR-0019](docs/decisions/0019-age-banded-zones-session-config.md)) adds youth
-age-banded speed zones (live colour + review breakdown), live distance/min, an isolated-player cue, and
-server-side sprint + accel/decel effort aggregates; `test/history.ts` covers the sprint/accel correctness.
-Set a session's age band: `bun run session-config.ts set <sessionId> <U12|U14|U16|U19>`.
-Tactical event detection (Track A — [ADR-0020](docs/decisions/0020-tactical-event-detection.md),
-[contract](docs/frontend/event-detection-contract.md)) adds an off-loop `GET /sessions/:id/events`: a bucketed
-team-shape series (centroid/compactness/hull) + heuristic phase events (high-tempo / transition / stoppage),
-rendered as a review-mode timeline. Movement-derived, **never** confirmed ball events (passes/shots need new
-sensing — see the status list). The inflight cap is **shared** with `/history` (one global off-loop-scan slot):
-```
-bun run test/events.ts           # detectors (boundaries + geometry) + readEvents (bucketing, player cap, final flush, adaptive bucketing)
-bun run test/events-e2e.ts       # endpoint authz (no id oracle) + no-store + opaque 400 + the off-loop SLO under concurrent scans + shared cap (503)
-bun run test/scan-load.ts        # the off-loop inflight cap is genuinely SHARED across /history + /events (both directions)
-```
-Erase one player's raw location (GDPR / lost device — see [ADR-0010](docs/decisions/0010-location-data-retention.md)):
-```
-bun run purge-player.ts <playerId> [sessionId]   # exit 0 + JSON receipt; 3 = transient, re-run; 4 = rebuild incomplete, re-run; 5 = permanent (wrong file/path/permissions/disk), fix first
-```
+Connect a WS client to `/live?sessionId=test` and watch for `{event:"telemetry"}` frames — or skip
+the broker entirely and run the simulator.
 
 ### Simulate a device fleet (no hardware)
-While the real wearables are in transit, [`test/simulate.ts`](server/test/simulate.ts) is a virtual fleet:
-N MQTT clients publishing the **exact** firmware wire contract (10 Hz telemetry + 5 s status) with
-believable movement around the pitch, so the real server + coach view run unchanged.
+[`test/simulate.ts`](server/test/simulate.ts) is a virtual fleet: N MQTT clients publishing the
+**exact** firmware wire contract (10 Hz telemetry + 5 s status) with believable movement, plus
+fault injection (bad fixes / out-of-range / id-mismatch / rate bursts / dropout -> backlog ->
+replay), load ramps with per-stage p99 reports, deterministic `--record`/`--replay`, and a
+`--secure` mode that provisions per-player broker ACLs + a real coach login. Turnkey:
 ```
-bun run sim                                          # attach to a broker+server you already run
-bun run sim --standalone --players 10                # turnkey: spawn its own broker + server
-bun run sim --standalone --players 8 --faults --duration 30   # inject bad fixes / OOR / id-mismatch / rate bursts / dropouts
-bun run sim --standalone --ramp 10,30,50 --stage-seconds 15   # load ramp; prints ingest p99 + drop rate per stage
-bun run sim --standalone --secure --players 10 --faults       # + auth: per-player MQTT creds + %u ACLs + a named coach login (argon2id)
-bun run sim --standalone --faults --duration 20 --record /tmp/run.ndjson   # capture the published stream
-bun run sim --standalone --replay /tmp/run.ndjson             # re-publish it with the original timing (deterministic)
+cd server && bun run sim --standalone --players 10
 ```
-In `--standalone` it prints the exact same-origin `VITE_PROXY_TARGET=… bun run dev` to open the coach view
-against the spawned stack. On stop it scrapes `/metrics` and reports what the server actually saw (received /
-published / drops-by-reason / p99 / RSS). `--secure` provisions per-player MQTT accounts (username ==
-`playerId`) + topic ACLs exactly like the e2e (confirming the broker blocks cross-player spoofing) **and** a
-named coach login so the coach view exercises the real Phase-2 cookie auth; otherwise `/live` runs in the
-isolated-LAN anonymous posture scoped to `ANON_SESSIONS` (dev only, no login). The coach account
-(`coach` / `sim-coach-pw`, assigned to the run session) is provisioned in **both** postures — under `--secure`
-it is the only way in; in the anonymous posture it is optional and buys names + Review, which the anon
-principal no longer receives. `--record`/`--replay` reproduce an identical run for repeatable debugging.
+Erase one player's raw location (GDPR / lost device): `bun run purge-player.ts <playerId>` — erases
+the live store **and every backup**, and proves it by re-count
+([ADR-0010](docs/decisions/0010-location-data-retention.md)).
 
 ## Client (coach live view)
 Bun + Vite + React. Connects a plain WebSocket to `/live?sessionId=...`, keeps the
@@ -312,3 +263,8 @@ cd client && VITE_PROXY_TARGET=http://127.0.0.1:3007 bun run dev   # coach view 
 - [x] Operability (**audit Phase 6**, 2026-08-27, [ADR-0025](docs/decisions/0025-operability-lifecycle.md)): `docker stop` went from **exit 137 (SIGKILL) in 1.3 s** to **exit 0 in ~0.2 s** — an ordered teardown (drain → abort scans → broker → listeners → hand over sessions → checkpoint) on a process that can finally receive the signal (`exec` + `init: true`), with a hard deadline so a wedged step cannot hand the kill back to Docker; `uncaughtException` exits 1 through the same path, `unhandledRejection` is counted and does not; a `PRAGMA user_version` migration ladder that **refuses to start** against a store newer than the build; verified `VACUUM INTO` backups whose rotation is bounded by **both** `BACKUP_KEEP` and `RETENTION_DAYS` — and which `purge-player.ts` now erases from, per file, with a proof-by-recount (a backup is a complete copy of children's location); a compose healthcheck on `/health` (broker down → unhealthy in 45 s, back in 10) plus capped logs; server-side scan cancellation (`request.signal` + a 25 s budget — the item Phase 5 deferred); `mode: 0o600` that is no longer a no-op on an existing file; WS fan-out drops counted as drops rather than sends; coaches staying logged in across a restart (a 0600 file of `sha256(token)` verifiers, consumed on read); and a real production stack — [`deploy/production/`](deploy/production/README.md), non-root image with no roster/accounts/store in any layer, no anonymous access, nothing on `0.0.0.0`, guarded by 37 static checks in `test/deploy-posture.ts`. TLS for the field box is the one piece deliberately left open (it needs an internal-CA decision, not a guessed Caddyfile)
 - [ ] Persistence at scale: TimescaleDB hypertable (sqlite is fine for now)
 - [ ] Football events — **Track B** (passes/shots/tackles): **not** derivable from GPS one-team positions — needs a calf IMU @200-500 Hz + ML, or one elevated 4K camera + CV. Scoped but deferred in [ADR-0020](docs/decisions/0020-tactical-event-detection.md) §6. **The camera route is part-built**: [`vision/`](vision/README.md) ([ADR-0023](docs/decisions/0023-camera-cv-offline-analysis.md)) detects + tracks players and splits teams on *public adult* footage today (v1, verified end to end 2026-06-20; v2 ball/radar and v3 analytics-over-video are **not** implemented and refuse rather than no-op). What blocks it for THIS project is unchanged and is not an engineering problem: pointing it at the children needs the DPIA / consent / lawful-basis gate ADR-0023 §14 defers
+
+## Contributing & security
+
+A personal project — issues are welcome, PRs by prior discussion, and anything exploitable goes
+through [SECURITY.md](SECURITY.md) (private reporting, please). Licensed [MIT](LICENSE).

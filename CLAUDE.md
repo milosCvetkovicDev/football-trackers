@@ -7,8 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A DIY real-time tracking system for youth football players. Each player wears an
 **ESP32 + u-blox NEO-M8N** device that streams GNSS position at **10 Hz** over WiFi →
 **Mosquitto MQTT** → a **Bun + Elysia** ingest service that server-stamps, persists, and
-fans out to a live coach view over WebSocket. Private hobby project; not wired to any
-work platform.
+fans out to a live coach view over WebSocket. Personal hobby project; fully self-contained.
 
 Four independently-scoped parts:
 
@@ -38,6 +37,7 @@ bun run test:e2e   # one suite; every suite also has its own test:* script
 bun run test/mosquitto-pub-demo.ts   # the README's literal mosquitto_pub -> WS path
 ```
 bun run backup     # backup-db.ts: one verified VACUUM INTO copy + rotation (--list, --no-rotate)
+Deep server docs (env knobs, auth model, suite map, CLIs, simulator flags): [server/README.md](server/README.md).
 `bun run test` is `test/run-all.ts`, not bare `bun test`. It refuses to start if any file in
 `test/` is neither a declared suite nor a declared non-suite — so adding a test file without
 wiring it in fails loudly instead of quietly shrinking the gate.
@@ -75,7 +75,7 @@ sign in.
 
 Vision (from `vision/`) — **everything runs in Docker; never python/pytest on the host**:
 ```
-docker compose run --rm test       # the CPU test suite (176 tests, no torch/weights/network)
+docker compose run --rm test       # the CPU test suite (177 tests, no torch/weights/network)
 docker compose run --rm selftest   # pipeline --selftest: asserts the offline guards are armed
 docker compose up webui            # http://127.0.0.1:8077 (loopback only, one job at a time)
 docker compose --profile gpu run --rm run   # the real pipeline — RTX 3060 desktop ONLY
