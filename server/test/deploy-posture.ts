@@ -270,6 +270,56 @@ if (existsSync(DOCKERIGNORE)) {
   }
 }
 
+// ── 9. The vision images inherit the same posture (the gpu target used to run as ROOT) ──────────
+// vision/ is the subproject that feeds attacker-influenced input (an arbitrary YouTube download)
+// through yt-dlp + ffmpeg + torch — and until this section existed, nothing guarded its Dockerfile
+// at all: the `gpu` target ran as root while the server image was held to non-root. Vision images
+// DO `COPY . .` by design (the runtime services bind-mount the source over it anyway), so the
+// context is bounded by .dockerignore instead — which makes .dockerignore load-bearing and pinned
+// here the same way server/.dockerignore is above.
+const VISION_DF = join(REPO, 'vision', 'Dockerfile');
+const VISION_DI = join(REPO, 'vision', '.dockerignore');
+const VISION_COMPOSE = join(REPO, 'vision', 'docker-compose.yml');
+check('vision/Dockerfile exists', existsSync(VISION_DF), `${VISION_DF} is missing`);
+if (existsSync(VISION_DF)) {
+  const vdf = readFileSync(VISION_DF, 'utf8');
+  check('vision images pin their base tags (no :latest)', !/^FROM\s+\S+:latest/m.test(vdf), `${VISION_DF} must not use a :latest base image`);
+  // Every build stage must drop root. Split the file into stages on FROM and require USER app in
+  // each — a stage-scoped check, because `USER` in one stage says nothing about the next.
+  const stages = vdf.split(/^FROM\s+/m).slice(1);
+  for (const stage of stages) {
+    const name = (stage.match(/AS\s+(\S+)/)?.[1] ?? stage.split(/\s/)[0]).trim();
+    check(
+      `vision Dockerfile stage '${name}' runs as a non-root USER`,
+      /^USER\s+app\s*$/m.test(stage),
+      `the '${name}' stage of ${VISION_DF} has no \`USER app\` — it runs yt-dlp/ffmpeg/torch over downloaded input as root`,
+    );
+  }
+}
+check('vision/.dockerignore exists', existsSync(VISION_DI), `${VISION_DI} is missing — vision images COPY the whole context, so this file is the only thing keeping footage/weights out of layers`);
+if (existsSync(VISION_DI)) {
+  const vdi = directives(VISION_DI);
+  // Footage, weights, artifacts, the attestation ledger, git history: none may enter an image layer.
+  for (const must of ['models/', 'samples/', 'out/', 'var/', '*.mp4', '*.pt', '.git/']) {
+    check(
+      `vision/.dockerignore excludes ${must}`,
+      vdi.includes(must),
+      `${VISION_DI} must list ${must} — vision images COPY the whole context, and a layer survives every later deletion`,
+    );
+  }
+}
+check('vision/docker-compose.yml exists', existsSync(VISION_COMPOSE), `${VISION_COMPOSE} is missing`);
+if (existsSync(VISION_COMPOSE)) {
+  // The web UI has no authentication and serves derived footage; every published port must be
+  // loopback-pinned (same §4.1 argument as the server port above, with fewer excuses).
+  const vPorts = directives(VISION_COMPOSE).filter((l) => /^-\s*"?[\d.]*:?\d+:\d+"?$/.test(l));
+  check(
+    'every vision published port is pinned to 127.0.0.1',
+    vPorts.length > 0 && vPorts.every((l) => /"127\.0\.0\.1:\d+:\d+"/.test(l)),
+    `vision/docker-compose.yml publishes a port on every interface: ${vPorts.filter((l) => !/127\.0\.0\.1/.test(l)).join(' | ') || '(no port entries found — the check pattern may need updating)'}`,
+  );
+}
+
 if (failures.length) {
   console.error(`\n❌ deploy-posture: ${failures.length} of ${checks} checks FAILED:\n`);
   for (const f of failures) console.error(`   • ${f}\n`);
