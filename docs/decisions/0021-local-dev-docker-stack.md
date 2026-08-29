@@ -15,7 +15,7 @@ time is error-prone, and the broker must be reachable from the device over Wi-Fi
 stack that mirrors production's shape without its security (field AP + Caddy + real auth).
 
 Two constraints surfaced during the first bring-up:
-- **The host already runs other Docker stacks** that hold ports 3000–3003, so our server can't
+- **The host already runs other local Docker stacks** that hold ports 3000–3003, so our server can't
   publish on 3000.
 - **Vite's `/live` WebSocket proxy does not reliably relay the upgrade when Vite runs inside a container** — the
   server accepts the upgrade (logs `ws open`) but the browser hangs at "connecting". A direct WS to the server

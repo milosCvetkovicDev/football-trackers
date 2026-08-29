@@ -74,9 +74,9 @@ Mount high (tripod/pole 4–6 m) — height is the biggest quality factor. Proce
 > Cheapest: AliExpress (slow). Original + fast in EU: TME (Poland). Local same-day: Elektromodul et al.
 
 ## What was ordered (prototype, ×2 for a spare + a two-dot test)
-- **Elektromodul ** — ~8,000 RSD: 2× WEMOS Lite, 2× NEO-M8N, jumper
+- **Elektromodul** — ~8,000 RSD: 2× WEMOS Lite, 2× NEO-M8N, jumper
   set, 4× pin headers.
-- **Interhit ** — ~4,000 RSD: 3× LP-503759CL.
+- **Interhit** — ~4,000 RSD: 3× LP-503759CL.
 
 > ⚠️ The LiPo's red connector is often RCY/2.5 mm, while WEMOS Lite uses JST PH 2.0 mm — and polarity
 > may be reversed. **Measure with a multimeter before connecting**, or cut the connector and solder

@@ -44,11 +44,18 @@ WORKDIR /app
 # Installs from requirements.lock (pinned, cu121). Nothing consumed that file before, which is how
 # it came to contain placeholder text and to be missing `lapx` entirely — see its header.
 COPY requirements.txt requirements.lock ./
-RUN pip install --no-cache-dir -r requirements.lock gdown yt-dlp
+RUN pip install --no-cache-dir -r requirements.lock gdown==6.1.0 yt-dlp==2026.8.19
+# Non-root, same uid-1001 `app` user as the cpu/cpurun targets. This was the ONE target that ran as
+# root — and it is the one that feeds attacker-influenced input (an arbitrary YouTube download)
+# through yt-dlp + ffmpeg + torch. NOTE for the 3060 desktop (raw Linux, unlike Docker Desktop's
+# transparent uid mapping): the bind-mounted out/ models/ var/ must be writable by uid 1001 —
+# `chmod -R a+rwX out models var` once, or run the service with `user: "$(id -u)"`.
+RUN useradd -m -u 1001 app && chown app /app
+USER app
 # HF_HOME under bind-mounted, gitignored models/ so SigLIP (pre-fetched by fetch_models.py at
 # setup) persists across container runs and the OFFLINE runtime finds it locally.
-ENV PYTHONPATH=/app PYTHONDONTWRITEBYTECODE=1 HF_HOME=/app/models/hf
-COPY . .
+ENV PYTHONPATH=/app PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX=/tmp/pyc HF_HOME=/app/models/hf
+COPY --chown=app:app . .
 # Default: the offline selftest; the compose `run` service overrides with the real pipeline.
 CMD ["python", "-m", "footballcv.pipeline", "--selftest"]
 
@@ -76,7 +83,7 @@ RUN pip install --no-cache-dir torch torchvision \
 # the +cu121 builds. Deliberately the one image that installs from ranges — it is a smoke-test
 # image for the Mac, never an acceptance or deployment target, and the README says so.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt gdown yt-dlp
+RUN pip install --no-cache-dir -r requirements.txt gdown==6.1.0 yt-dlp==2026.8.19
 RUN useradd -m -u 1001 app && chown app /app
 USER app
 # HF_HOME under bind-mounted, gitignored models/ so SigLIP (pre-fetched by fetch_models.py at

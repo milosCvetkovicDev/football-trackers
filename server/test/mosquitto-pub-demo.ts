@@ -13,7 +13,7 @@ const MQTT_URL = 'mqtt://127.0.0.1:1883';
 const DB_PATH = '/tmp/ft-demo.db';
 const TOPIC = 'football-trackers/session/test/player/01/telemetry';
 const PAYLOAD =
-  '{"id":"trk-01","pl":"01","ts":1,"lat":44.8125,"lon":20.4612,"spd":3.2,"hdg":90,"fix":3,"sats":11,"pdop":1.2}';
+  '{"id":"trk-01","pl":"01","ts":1,"lat":44.8297,"lon":20.4007,"spd":3.2,"hdg":90,"fix":3,"sats":11,"pdop":1.2}';
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const children: { kill: () => void }[] = [];

@@ -185,7 +185,7 @@ two you are currently looking at.
   if you want to watch it for longer.
 - **Real moving dot:** take the laptop + device **outside** (or to a window) with sky view; ~30–60 s for the first
   cold fix; the dot then tracks the real position. Out of Wi-Fi range, the device buffers fixes to LittleFS and
-  replays them on reconnect (no data lost).
+  replays them on reconnect (bounded loss: the bench target preserves ≥ 92 % of a 60 s outage — the replay drill below measures it).
 
 ---
 

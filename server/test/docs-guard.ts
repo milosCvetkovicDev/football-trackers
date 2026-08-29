@@ -42,15 +42,22 @@ function check(label: string, cond: boolean, detail: string) {
 const read = (p: string) => readFileSync(p, 'utf8');
 const readme = read(README);
 const claudemd = read(CLAUDEMD);
+// server/README.md holds the deep server detail the root README links to; its links resolve
+// relative to server/, so it carries its own base directory below.
+const serverReadme = read(join(REPO, 'server', 'README.md'));
 
 console.log('\ndocs guard — the repo entry points against the repo\n');
 
 // ── 1. Every relative link in an entry point must resolve ────────────────────────────────────────
 // A dead link in the file people are told to start from is the cheapest possible way to lose a
 // reader, and the easiest thing in the world to leave behind after a rename.
-for (const [name, body] of [['README.md', readme], ['CLAUDE.md', claudemd]] as const) {
+for (const [name, body, base] of [
+  ['README.md', readme, REPO],
+  ['CLAUDE.md', claudemd, REPO],
+  ['server/README.md', serverReadme, join(REPO, 'server')],
+] as const) {
   const links = [...body.matchAll(/\]\((?!https?:|mailto:|#)([^)#]+)(?:#[^)]*)?\)/g)].map((m) => m[1]);
-  const dead = [...new Set(links)].filter((rel) => !existsSync(join(REPO, rel.split(':')[0])));
+  const dead = [...new Set(links)].filter((rel) => !existsSync(join(base, rel.split(':')[0])));
   check(
     `${name}: every relative link resolves (${links.length} checked)`,
     dead.length === 0,
@@ -72,7 +79,7 @@ for (const [name, body] of [['README.md', readme], ['CLAUDE.md', claudemd]] as c
     for (const s of Object.keys(pkg.scripts ?? {})) scripts.add(s);
   }
   const named = new Set<string>();
-  for (const body of [readme, claudemd]) {
+  for (const body of [readme, claudemd, serverReadme]) {
     for (const m of body.matchAll(/\bbun run ([a-z][\w.:-]*)/g)) named.add(m[1]);
   }
   const unknown = [...named].filter((s) => !scripts.has(s) && !s.endsWith('.ts'));
