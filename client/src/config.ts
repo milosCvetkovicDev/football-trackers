@@ -37,14 +37,16 @@ export const DEFAULT_SESSION = import.meta.env.VITE_DEFAULT_SESSION ?? 'test';
  * pitch: before Phase 5 it was the ONLY source, which meant every real pitch mapped to
  * the wrong box until someone edited this file and rebuilt the bundle.
  *
- * The values below are a ~105x68 m rectangle over the bench-test location in Belgrade
- * (2026-06-18) — a deliberate placeholder, not anyone's pitch.
+ * The values below are a ~105x68 m rectangle at deliberately ROUND synthetic coordinates —
+ * not anyone's pitch, home, or training ground. They are also intentionally a few km away
+ * from the quad the tests/simulator use, so a session without measured corners keeps the
+ * off-pitch fallback path honestly exercised (reliability spec §6 depends on that distance).
  */
 export const PITCH_CORNERS: LatLon[] = [
-  { lat: 44.812806, lon: 20.460535 }, // TL
-  { lat: 44.812806, lon: 20.461865 }, // TR
-  { lat: 44.812194, lon: 20.461865 }, // BR
-  { lat: 44.812194, lon: 20.460535 }, // BL
+  { lat: 44.830000, lon: 20.400000 }, // TL
+  { lat: 44.830000, lon: 20.401332 }, // TR
+  { lat: 44.829388, lon: 20.401332 }, // BR
+  { lat: 44.829388, lon: 20.400000 }, // BL
 ];
 
 // --- Render / liveness tuning (shared by the canvas and the accessible mirror) ---

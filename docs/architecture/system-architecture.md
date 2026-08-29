@@ -18,7 +18,7 @@ ESP32 + GNSS (+IMU)  ->  WiFi 2.4 GHz  ->  Mosquitto MQTT ->  ingest + metrics  
 - GNSS raised from 9600/1 Hz/NMEA to 115200/10 Hz/**UBX-PVT** (one compact binary message).
 - Publishes telemetry over MQTT (QoS 0).
 - **Flash backup**: on WiFi/MQTT loss, each fix is appended to LittleFS (newline-delimited JSON,
-  capped 256 KB) and replayed on reconnect — a field dropout never loses the session.
+  capped 256 KB) and replayed on reconnect — a dropout loses at most the fixes arriving during the short bounded connect attempts (bench target: ≥ 92 % of a 60 s outage preserved; hardware drill pending, runbook §7).
 - Per-device config: WiFi creds, MQTT host, unique `PLAYER_ID`.
 
 ### 2. Wire contract

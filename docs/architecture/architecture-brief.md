@@ -177,8 +177,7 @@ right-sized alternative or justify the exception against the drivers.
 - **Field resilience:** two-file LittleFS backlog (2×128 KB, drop-oldest when full) + paced, cursor-resumable
   replay deduped by `sq` server-side ([NFR-RES-1]) — a dropout loses at most the fixes arriving during the
   short bounded connect attempts (bench target: ≥ 92 % of a 60 s outage preserved).
-- Stack: **Bun + Elysia** server, **ESP32/Arduino** firmware, **React + Vite** client. Private project; **no**
-  coupling to any work platform.
+- Stack: **Bun + Elysia** server, **ESP32/Arduino** firmware, **React + Vite** client. Personal project; fully self-contained.
 
 ---
 

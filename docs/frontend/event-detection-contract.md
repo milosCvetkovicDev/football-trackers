@@ -2,7 +2,7 @@
 
 **Status:** Frozen (pre-code) · **Date:** 2026-06-16 · **ADR:** [0020](../decisions/0020-tactical-event-detection.md)
 · **Initiative:** football-event detection, **Track A** (GPS-only collective/tactical *movement* events).
-Built the [house way](../../../.claude): frozen contract → adversarial pre-mortem → parallel disjoint-file
+Built the house way: frozen contract → adversarial pre-mortem → parallel disjoint-file
 slices → integration → post-build security/correctness review.
 
 > **Scope reality (read first).** The system tracks **only our own team's player positions** at 10 Hz — no
