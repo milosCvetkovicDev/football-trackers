@@ -29,6 +29,10 @@
 
   The crop below is the solid-green bounding box of live-view.png (2880×1680),
   found by scanning for saturated-green rows/columns: x 340→2539, y 230→1653.
+
+  The footer's last line is the docs site, which doubles as the attribution — the handle
+  is the host, so one line carries both "where to read it" and "who built it". Keep
+  white-space:nowrap on it: the left column is 540px and the URL only just fits.
 -->
 <html><head><meta charset="utf-8">
 <style>
@@ -75,8 +79,13 @@
   }
   .tag{font-family:"JetBrains Mono",monospace;font-size:17px;color:#8b949e}
   .tag b{color:#adbac7;font-weight:500}
-  .who{font-size:17px;color:#6e7781}
-  .who b{color:#adbac7;font-weight:600}
+  /* The site URL doubles as the attribution — the handle is the host — so one line
+     carries both "where to read it" and "who built it". */
+  .site{
+    font-family:"JetBrains Mono",monospace;font-size:16px;color:#6e7781;
+    letter-spacing:-.2px;white-space:nowrap;
+  }
+  .site b{color:#3fb950;font-weight:600}
 
   .right{flex:1;position:relative;display:flex;align-items:center;padding:0 40px 0 26px;z-index:1}
   /* Crop window: 2199x1423 of the 2880x1680 source, offset (340,230). */
@@ -117,7 +126,7 @@
     </div>
     <div class="foot">
       <div class="tag">privacy-first · <b>hardware-free e2e</b> · CI-gated</div>
-      <div class="who">github.com/<b>milosCvetkovicDev</b></div>
+      <div class="site"><b>miloscvetkovicdev.github.io</b>/football-trackers</div>
     </div>
   </div>
   <div class="right">

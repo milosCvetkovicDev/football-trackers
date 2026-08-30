@@ -5,6 +5,7 @@ Each player wears a small ESP32 + GNSS device that streams position at 10 Hz ove
 WiFi to a local broker; a **Bun + Elysia** service ingests, server-stamps, and fans out to a
 live coach view. A personal hobby project — fully self-contained, built end to end (hardware, firmware, backend, frontend, CV).
 
+[![Read the docs](https://img.shields.io/badge/docs-read%20online-3fb950.svg)](https://miloscvetkovicdev.github.io/football-trackers/)
 [![server CI](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/server-ci.yml/badge.svg)](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/server-ci.yml)
 [![client CI](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/client-ci.yml/badge.svg)](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/client-ci.yml)
 [![firmware CI](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/firmware-ci.yml/badge.svg)](https://github.com/milosCvetkovicDev/football-trackers/actions/workflows/firmware-ci.yml)
@@ -91,6 +92,10 @@ Commercial trackers are either cheap-but-closed (no real-time, no open data) or
 have an API but cost a subscription per player. Goal here: real-time + fully owned.
 
 ## Docs
+
+**Read them online:** <https://miloscvetkovicdev.github.io/football-trackers/> — all 52 documents
+and 25 ADRs, searchable, with the subproject READMEs alongside them.
+
 Product & business requirements live in [`docs/`](docs/README.md): [vision](docs/product/vision.md),
 [market analysis](docs/product/market-analysis.md), [BRD](docs/requirements/business-requirements.md),
 [functional](docs/requirements/functional-requirements.md) / [non-functional](docs/requirements/non-functional-requirements.md)
