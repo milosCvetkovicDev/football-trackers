@@ -1,0 +1,125 @@
+<!doctype html>
+<!--
+  Source for docs/images/social-preview.png — the repo's GitHub social preview card
+  (Settings → Social preview). 1280×640, GitHub's recommended size.
+
+  It crops the pitch out of live-view.png in CSS rather than committing a second
+  cropped image, so the card and the README hero stay the same screenshot: re-shoot
+  live-view.png and this card follows.
+
+  Regenerate (needs the client's Playwright install):
+
+    cat > client/shot.cjs <<'EOF'
+    const { chromium } = require('playwright');
+    (async () => {
+      const b = await chromium.launch();
+      const p = await b.newPage({ viewport: { width: 1280, height: 640 }, deviceScaleFactor: 2 });
+      await p.goto('file://' + process.cwd() + '/../docs/images/social-preview.html');
+      await p.waitForLoadState('networkidle');
+      await p.evaluate(() => document.fonts.ready);
+      await p.waitForTimeout(1200);
+      await p.screenshot({ path: '../docs/images/social-preview.png' });
+      await b.close();
+    })();
+    EOF
+    (cd client && node shot.cjs && rm shot.cjs)
+    # then downscale the 2x shot to 1280x640:
+    python3 -c "from PIL import Image; p='docs/images/social-preview.png'; \
+      Image.open(p).resize((1280,640), Image.LANCZOS).save(p, optimize=True)"
+
+  The crop below is the solid-green bounding box of live-view.png (2880×1680),
+  found by scanning for saturated-green rows/columns: x 340→2539, y 230→1653.
+-->
+<html><head><meta charset="utf-8">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500;600;700&display=swap');
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:1280px;height:640px;overflow:hidden}
+  body{
+    background:#0b0f14;color:#e6edf3;
+    font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    display:flex;position:relative;
+  }
+  body::before{
+    content:"";position:absolute;top:-220px;left:-160px;width:760px;height:560px;
+    background:radial-gradient(closest-side, rgba(45,168,88,.15), transparent 70%);
+    pointer-events:none;z-index:0;
+  }
+  .left{
+    width:540px;flex:none;padding:56px 0 48px 60px;
+    display:flex;flex-direction:column;position:relative;z-index:1;
+  }
+  .top{display:flex;align-items:center;gap:15px;margin-bottom:24px}
+  .mark{
+    width:44px;height:44px;border-radius:11px;flex:none;
+    background:linear-gradient(150deg,#3fb950,#238636);
+    display:flex;align-items:center;justify-content:center;font-size:24px;
+  }
+  h1{
+    font-family:"JetBrains Mono",monospace;font-size:38px;font-weight:700;
+    letter-spacing:-1.4px;line-height:1;
+  }
+  .body{flex:1;display:flex;flex-direction:column;justify-content:center;padding-bottom:6px}
+  .lede{font-size:23px;line-height:1.44;color:#c9d1d9;margin-bottom:30px}
+  .lede b{color:#f0f6fc;font-weight:600}
+  .chips{display:flex;flex-wrap:wrap;gap:9px}
+  .chip{
+    font-family:"JetBrains Mono",monospace;font-size:16px;font-weight:500;
+    background:#161b22;border:1px solid #2d333b;border-radius:8px;
+    padding:8px 12px;color:#adbac7;
+  }
+  .chip b{color:#3fb950;font-weight:700}
+  .foot{
+    border-top:1px solid #1f262e;padding-top:20px;margin-top:26px;
+    display:flex;flex-direction:column;gap:7px;
+  }
+  .tag{font-family:"JetBrains Mono",monospace;font-size:17px;color:#8b949e}
+  .tag b{color:#adbac7;font-weight:500}
+  .who{font-size:17px;color:#6e7781}
+  .who b{color:#adbac7;font-weight:600}
+
+  .right{flex:1;position:relative;display:flex;align-items:center;padding:0 40px 0 26px;z-index:1}
+  /* Crop window: 2199x1423 of the 2880x1680 source, offset (340,230). */
+  .shot{
+    width:100%;aspect-ratio:2199/1423;overflow:hidden;position:relative;
+    border-radius:14px;border:1px solid #2d333b;
+    box-shadow:0 22px 60px rgba(0,0,0,.55);
+  }
+  .shot img{
+    position:absolute;
+    width:calc(100% * 2880 / 2199);
+    left:calc(-100% * 340 / 2199);
+    top:calc(-1 * (100% * 2199 / 1423) * 230 / 2199);
+    display:block;
+  }
+</style></head>
+<body>
+  <div class="left">
+    <div class="top">
+      <div class="mark">⚽</div>
+      <h1>football-trackers</h1>
+    </div>
+    <div class="body">
+      <p class="lede">
+        Real-time GPS tracking for youth football, built <b>end to end</b> —
+        wearable firmware, broker, ingest, and a live coach view.
+      </p>
+      <div class="chips">
+        <span class="chip">ESP32 + <b>NEO-M8N</b></span>
+        <span class="chip"><b>10 Hz</b> telemetry</span>
+        <span class="chip">MQTT + ACLs</span>
+        <span class="chip">Bun + Elysia</span>
+        <span class="chip">React canvas</span>
+        <span class="chip"><b>25</b> ADRs</span>
+        <span class="chip">offline CV</span>
+      </div>
+    </div>
+    <div class="foot">
+      <div class="tag">privacy-first · <b>hardware-free e2e</b> · CI-gated</div>
+      <div class="who">github.com/<b>milosCvetkovicDev</b></div>
+    </div>
+  </div>
+  <div class="right">
+    <div class="shot"><img src="live-view.png" alt="Coach live view: 12 tracked players on the pitch canvas"></div>
+  </div>
+</body></html>
