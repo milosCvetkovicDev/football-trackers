@@ -1103,7 +1103,7 @@ def test_lockfile_pins_torch_cuda_index():
 
 ## What it is
 v1: detect + track players, split into 2 anchored teams, draw an annotated video. See
-[ADR-0023](../docs/decisions/0023-camera-cv-offline-analysis.md).
+[ADR-0023](../decisions/0023-camera-cv-offline-analysis.md).
 
 ## Setup
 1. `python -m venv .venv && source .venv/bin/activate`

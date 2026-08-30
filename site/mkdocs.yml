@@ -1,0 +1,159 @@
+# mkdocs config for the documentation site.
+#
+# docs_dir points at _build/docs, which site/build.py stages — nothing in the repository
+# moves to satisfy the site generator. See that script's header for why (the docs guard
+# asserts links between the subproject READMEs where they sit).
+site_name: football-trackers
+site_description: >-
+  Real-time GPS tracking for youth football, built end to end — ESP32 firmware,
+  MQTT, a Bun/Elysia ingest service and a live coach view. 25 ADRs, a production
+  readiness audit, and a privacy posture enforced by CI.
+site_url: https://miloscvetkovicdev.github.io/football-trackers/
+repo_url: https://github.com/milosCvetkovicDev/football-trackers
+repo_name: milosCvetkovicDev/football-trackers
+edit_uri: ""
+
+docs_dir: _build/docs
+site_dir: _build/site
+
+theme:
+  name: material
+  language: en
+  icon:
+    repo: fontawesome/brands/github
+  font:
+    text: Inter
+    code: JetBrains Mono
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: green
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: black
+      accent: green
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        # Class `diagram`, not `mermaid`: Material's own integration claims `.mermaid`,
+        # empties the element and renders with a copy it fetches from unpkg at a floating
+        # major version. Rendering is left to assets/mermaid-init.js and the pinned build.
+        - name: mermaid
+          class: diagram
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+plugins:
+  - search
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/milosCvetkovicDev
+      name: milosCvetkovicDev on GitHub
+  generator: false
+
+extra_css:
+  - assets/extra.css
+
+extra_javascript:
+  - assets/mermaid.min.js
+  - assets/mermaid-init.js
+
+nav:
+  - Overview: index.md
+  - Components:
+      - Server (Bun + Elysia): components/server.md
+      - Firmware (ESP32): components/firmware.md
+      - Vision (offline CV): components/vision.md
+      - Deploy: components/deploy.md
+      - Production stack: components/production.md
+  - Architecture:
+      - System architecture: docs/architecture/system-architecture.md
+      - Architecture brief: docs/architecture/architecture-brief.md
+      - Target architecture: docs/architecture/target-architecture.md
+      - Observability: docs/architecture/observability.md
+      - Hardware BOM: docs/architecture/hardware-bom.md
+      - Board reviews:
+          - 2026-06-14 · Architecture board: docs/architecture/reviews/2026-06-14-architecture-board-review.md
+          - 2026-06-19 · CV track board: docs/architecture/reviews/2026-06-19-cv-track-board-review.md
+  - Decisions (ADRs):
+      - Index: docs/decisions/README.md
+      - 0001 · Build vs buy: docs/decisions/0001-build-vs-buy.md
+      - 0002 · WiFi, not BLE: docs/decisions/0002-wifi-vs-ble-transport.md
+      - 0003 · Real-time streaming: docs/decisions/0003-realtime-vs-store-and-sync.md
+      - 0004 · Wearable hardware baseline: docs/decisions/0004-wearable-hardware-baseline.md
+      - 0005 · Sensor strategy for technical metrics: docs/decisions/0005-technical-metrics-sensor-strategy.md
+      - 0006 · Local core, cloud relay: docs/decisions/0006-local-core-cloud-relay.md
+      - 0007 · MQTT security: docs/decisions/0007-mqtt-security.md
+      - 0008 · Authentication & access control: docs/decisions/0008-authentication-access-control.md
+      - 0009 · TLS edge (Caddy): docs/decisions/0009-tls-edge-caddy.md
+      - 0010 · Retention & erasure for minors: docs/decisions/0010-location-data-retention.md
+      - 0011 · Persistence engine threshold: docs/decisions/0011-persistence-engine-threshold.md
+      - 0012 · Overlay network for remote access: docs/decisions/0012-overlay-network-for-remote-access.md
+      - 0013 · Field network security: docs/decisions/0013-field-network-security.md
+      - 0014 · Firmware secret provisioning: docs/decisions/0014-firmware-secret-provisioning.md
+      - 0015 · Frontend auth transport: docs/decisions/0015-frontend-auth-transport.md
+      - 0016 · Player-name roster: docs/decisions/0016-player-name-roster.md
+      - 0017 · Review & replay data source: docs/decisions/0017-review-replay-data-source.md
+      - 0018 · Smoothing & the honesty rule: docs/decisions/0018-live-position-smoothing-honesty.md
+      - 0019 · Age-banded zones: docs/decisions/0019-age-banded-zones-session-config.md
+      - 0020 · Tactical event detection: docs/decisions/0020-tactical-event-detection.md
+      - 0021 · Local dev Docker stack: docs/decisions/0021-local-dev-docker-stack.md
+      - 0022 · Dynamic provisioning: docs/decisions/0022-dynamic-provisioning.md
+      - 0023 · Offline camera/CV analysis: docs/decisions/0023-camera-cv-offline-analysis.md
+      - 0024 · Client reliability signals: docs/decisions/0024-client-reliability-signals.md
+      - 0025 · Operability lifecycle: docs/decisions/0025-operability-lifecycle.md
+  - Requirements:
+      - Business requirements: docs/requirements/business-requirements.md
+      - Functional requirements: docs/requirements/functional-requirements.md
+      - Non-functional requirements: docs/requirements/non-functional-requirements.md
+      - Metric definitions: docs/requirements/metric-definitions.md
+  - Frontend contracts:
+      - Improvement plan: docs/frontend/improvement-plan.md
+      - Phase 2 · auth: docs/frontend/phase-2-auth-contract.md
+      - Phase 3: docs/frontend/phase-3-contract.md
+      - Phase 4: docs/frontend/phase-4-contract.md
+      - Event-detection contract: docs/frontend/event-detection-contract.md
+  - Vision (offline CV):
+      - v1 implementation plan: docs/vision/2026-06-19-v1-implementation-plan.md
+      - v1 acceptance runbook: docs/vision/v1-acceptance-runbook.md
+      - v2 implementation plan: docs/vision/2026-06-19-v2-implementation-plan.md
+      - v3 implementation plan: docs/vision/2026-06-20-v3-implementation-plan.md
+  - Operations:
+      - Local bench runbook: docs/dev/local-bench-runbook.md
+      - Production readiness audit: docs/audit/2026-08-03-production-readiness.md
+      - Security policy: security.md
+  - Product:
+      - Vision: docs/product/vision.md
+      - Roadmap: docs/product/roadmap.md
+      - Market analysis: docs/product/market-analysis.md
+      - Docs index: docs/README.md

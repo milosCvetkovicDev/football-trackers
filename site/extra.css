@@ -1,0 +1,51 @@
+/* Reading-oriented type for a docs site that is mostly prose and tables. */
+
+:root {
+  --md-text-font: "Inter";
+  --md-code-font: "JetBrains Mono";
+}
+
+.md-typeset {
+  font-size: 0.78rem;
+  line-height: 1.72;
+}
+
+.md-grid {
+  max-width: 62rem;
+}
+
+.md-typeset h1 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.md-typeset h2 {
+  margin-top: 2.2em;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+/* Diagrams are rendered by assets/mermaid-init.js into .diagram-rendered — Material's own
+   .mermaid integration is deliberately not used (it fetches a floating CDN version).
+   Block, not flex: mermaid emits width with a viewBox and no height, and inside a flex
+   container that resolves to a zero-height box. */
+.md-typeset .diagram-rendered {
+  display: block;
+  margin: 1.8em auto;
+  overflow-x: auto;
+  text-align: center;
+}
+
+.md-typeset .diagram-rendered svg {
+  height: auto;
+  max-width: none; /* natural size; the container scrolls rather than shrinking labels */
+}
+
+.md-typeset pre.diagram {
+  overflow-x: auto;
+}
+
+/* The ADR set and the requirements docs lean on wide tables. */
+.md-typeset table:not([class]) {
+  font-size: 0.72rem;
+}

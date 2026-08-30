@@ -1,0 +1,83 @@
+# pages — build and deploy the documentation site.
+#
+# PATH-FILTERED, unlike repo-guard. That contrast is deliberate and worth stating, because
+# the two workflows exist for opposite reasons: repo-guard has NO filter because a guard
+# must run on the commit nobody predicted (that is the whole argument in its header). A
+# site build has the opposite character — rebuilding for a commit that touches no published
+# page produces an identical artifact and a pointless deploy. Its failure mode is "the site
+# is briefly stale", not "a leak shipped".
+#
+# The build never mutates the repository. site/build.py STAGES the docs into a scratch
+# directory and rewrites links that would dangle there; the subproject READMEs stay next to
+# their code, where docs-guard asserts them.
+name: pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'README.md'
+      - 'SECURITY.md'
+      - 'server/README.md'
+      - 'firmware/README.md'
+      - 'vision/README.md'
+      - 'deploy/README.md'
+      - 'deploy/production/README.md'
+      - 'site/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          filter: tree:0
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install mkdocs-material
+        run: pip install --disable-pip-version-check 'mkdocs-material==9.7.7'
+
+      - name: Stage the docs
+        # --check fails the build if a link dangles inside the staged site. It has already
+        # earned its place: the first run surfaced two links that were broken in the
+        # repository itself and that docs-guard does not cover (it sweeps the entry-point
+        # READMEs, not docs/** or deploy/production/).
+        run: python3 site/build.py --check
+
+      - name: Build
+        working-directory: site
+        run: mkdocs build --strict
+
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: site/_build/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

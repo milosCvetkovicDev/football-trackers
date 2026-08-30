@@ -138,7 +138,7 @@ no ACME reachability, so terminating TLS means choosing an internal CA or a self
 getting it trusted on the coaches' tablets — a decision to make with the person who owns those tablets,
 not a config file to guess at. Until it is made:
 
-- run the coaches' tablets on the same physically isolated LAN as the box (Profile A, [ADR-0008](../../docs/decisions/0008-auth-and-access-control.md));
+- run the coaches' tablets on the same physically isolated LAN as the box (Profile A, [ADR-0008](../../docs/decisions/0008-authentication-access-control.md));
 - keep the server on `127.0.0.1` and reach it through an SSH tunnel or a local proxy on the box;
 - `AUTH_COOKIE_SECURE=true` stays set — over plain HTTP the browser will simply not store the cookie,
   which is the failure you want (a loud one) rather than a session cookie crossing the LAN in the clear.
