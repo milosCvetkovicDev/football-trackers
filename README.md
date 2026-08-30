@@ -80,6 +80,12 @@ load ramps, record/replay and a `--secure` auth mode are one flag away
 - **Validated on real hardware** — the assembled ESP32+NEO-M8N prototype streamed
   device -> Wi-Fi -> authenticated broker -> server -> live view end to end (2026-06-17).
 
+The working method behind those habits — the agent configuration, the maker ≠ checker
+review discipline, the PM ceremony that turns "done" into a machine-checkable claim — is
+published separately as
+[**claude-code-monorepo**](https://github.com/milosCvetkovicDev/claude-code-monorepo),
+a 13-chapter book on the setup this project was built with.
+
 ## Why DIY
 Commercial trackers are either cheap-but-closed (no real-time, no open data) or
 have an API but cost a subscription per player. Goal here: real-time + fully owned.
